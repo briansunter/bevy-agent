@@ -33,6 +33,34 @@ Run the sample agent:
 cargo run -p sample_platformer --example agent_play
 ```
 
+Start a local HTTP/WebSocket remote server:
+
+```sh
+cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
+```
+
+Drive it with the CLI:
+
+```sh
+cargo run -p agentctl -- info
+cargo run -p agentctl -- reset --seed 42
+cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
+cargo run -p agentctl -- snapshot
+cargo run -p agentctl -- replay-export replay.json
+```
+
+Or drive it from Python:
+
+```python
+from bevy_agent_client import AgentClient
+
+env = AgentClient("http://127.0.0.1:4000/rpc")
+obs = env.reset(seed=42)
+step = env.step({"type": "Move", "x": 1.0, "y": 0.0})
+snapshot = env.snapshot()
+env.restore(snapshot["snapshot_id"])
+```
+
 Run the tests:
 
 ```sh
@@ -60,6 +88,15 @@ cargo check --workspace --all-features
 ```
 
 The bridge currently provides an in-process/stdio JSON-RPC handler. It is deliberately transport-light so it can be embedded into tests, CLIs, or a Bevy Remote Protocol transport without changing the simulation API.
+
+The sample also includes:
+
+- `remote_stdio`: JSON-RPC over newline-delimited stdin/stdout.
+- `remote_http`: HTTP `POST /rpc`, `GET /health`, and WebSocket JSON-RPC at `GET /ws`.
+- `agentctl`: a small HTTP client for common commands.
+- `python/bevy_agent_client.py`: a stdlib Python wrapper.
+- `docs/controllable-game.md`: integration checklist for games.
+- `docs/codex-interaction.md`: command examples for agents.
 
 ## Determinism Contract
 

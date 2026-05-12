@@ -2,6 +2,7 @@ use bevy_agent_core::{AgentAction, LastStepResponse, Observation};
 use bevy_agent_remote::JsonRpcBridge;
 use bevy_agent_replay::Timeline;
 use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions};
+use std::path::PathBuf;
 
 fn make_env() -> AgentApp {
     AgentApp::new(sample_platformer::build_headless_app)
@@ -247,4 +248,76 @@ fn remote_step_returns_valid_schema() {
     assert_eq!(value["result"]["done"], false);
     assert!(value["result"]["observation"].is_object());
     assert!(value["result"]["checksum"]["hash"].is_u64());
+}
+
+#[test]
+fn remote_action_and_observation_spaces_include_json_schema() {
+    let mut env = make_env();
+    let bridge = JsonRpcBridge::default();
+
+    let action_response = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.action_space","params":{}}"#,
+    );
+    let action: serde_json::Value = serde_json::from_str(&action_response).unwrap();
+    assert_eq!(action["result"]["type"], "json_schema");
+    assert!(action["result"]["schema"]["oneOf"].is_array());
+
+    let observation_response = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.observation_space","params":{}}"#,
+    );
+    let observation: serde_json::Value = serde_json::from_str(&observation_response).unwrap();
+    assert_eq!(observation["result"]["default"], "Hybrid");
+    assert!(observation["result"]["schema"]["$defs"]["player"].is_object());
+}
+
+#[test]
+fn remote_replay_export_and_load_round_trip() {
+    let mut env = make_env();
+    let bridge = JsonRpcBridge::default();
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.reset","params":{"options":{"seed":7,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,
+    );
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.step_many","params":{"actions":[{"type":"Move","x":1.0,"y":0.0},{"type":"Jump"}],"return_observations":"last"}}"#,
+    );
+
+    let path = replay_temp_path();
+    let export_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "agent.replay.export",
+        "params": { "path": path }
+    });
+    let export_response = bridge.handle_json(&mut env, &export_request.to_string());
+    let export: serde_json::Value = serde_json::from_str(&export_response).unwrap();
+    assert_eq!(export["result"]["records"], 2);
+
+    let load_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "agent.replay.load",
+        "params": { "path": export["result"]["path"].as_str().unwrap() }
+    });
+    let load_response = bridge.handle_json(&mut env, &load_request.to_string());
+    let load: serde_json::Value = serde_json::from_str(&load_response).unwrap();
+    assert_eq!(load["result"]["records"], 2);
+
+    let _ = std::fs::remove_file(export["result"]["path"].as_str().unwrap());
+}
+
+fn replay_temp_path() -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "bevy-agent-replay-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    path
 }
