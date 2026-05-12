@@ -1,3 +1,9 @@
+//! Gameplay snapshot and restore support for Bevy agent simulations.
+//!
+//! Snapshots are intentionally gameplay-focused: only entities marked with
+//! [`SnapshotEntity`](bevy_agent_core::SnapshotEntity) and registered
+//! resources/components are serialized and restored.
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
@@ -582,5 +588,163 @@ fn prune_checkpoints(world: &mut World, keep_last_n: usize) {
             store.snapshots.remove(&oldest);
             store.labels.retain(|_, snapshot_id| *snapshot_id != oldest);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_agent_core::{AgentControlPlugin, AgentTick};
+
+    #[derive(Component, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    struct TestComponent {
+        value: i32,
+    }
+
+    #[derive(Resource, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    struct TestResource {
+        value: String,
+    }
+
+    fn app_with_snapshot() -> App {
+        let mut app = App::new();
+        app.add_plugins(AgentControlPlugin::deterministic())
+            .add_plugins(AgentSnapshotPlugin)
+            .register_snapshot_component::<TestComponent>()
+            .register_snapshot_resource::<TestResource>()
+            .insert_resource(TestResource {
+                value: "initial".to_string(),
+            });
+        app.finish();
+        app.cleanup();
+        app
+    }
+
+    #[test]
+    fn registry_schema_hash_is_stable_regardless_of_registration_order() {
+        let mut a = SnapshotRegistry::default();
+        a.register_component::<StableEntityId>();
+        a.register_resource::<SimClock>();
+
+        let mut b = SnapshotRegistry::default();
+        b.register_resource::<SimClock>();
+        b.register_component::<StableEntityId>();
+
+        assert_eq!(a.schema_hash(), b.schema_hash());
+    }
+
+    #[test]
+    fn create_snapshot_stores_label_and_updates_control_state() {
+        let mut app = app_with_snapshot();
+        app.world_mut().spawn((
+            SnapshotEntity,
+            StableEntityId(10),
+            TestComponent { value: 5 },
+        ));
+
+        let result = create_snapshot(app.world_mut(), Some("before".to_string())).unwrap();
+
+        assert_eq!(result.tick, 0);
+        assert_eq!(
+            lookup_snapshot_by_label(app.world(), "before"),
+            Some(result.snapshot_id)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<AgentControlState>()
+                .last_snapshot_created,
+            Some(result.snapshot_id)
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_replaces_snapshot_entities_and_resources() {
+        let mut app = app_with_snapshot();
+        app.world_mut().spawn((
+            SnapshotEntity,
+            StableEntityId(10),
+            TestComponent { value: 5 },
+        ));
+        let snapshot = create_snapshot(app.world_mut(), Some("point".to_string())).unwrap();
+
+        app.world_mut().resource_mut::<TestResource>().value = "changed".to_string();
+        {
+            let mut query = app.world_mut().query::<&mut TestComponent>();
+            for mut component in query.iter_mut(app.world_mut()) {
+                component.value = 99;
+            }
+        }
+        app.world_mut().spawn((
+            SnapshotEntity,
+            StableEntityId(20),
+            TestComponent { value: 20 },
+        ));
+
+        restore_snapshot(app.world_mut(), snapshot.snapshot_id).unwrap();
+
+        assert_eq!(
+            app.world().resource::<TestResource>().value,
+            "initial".to_string()
+        );
+        let mut query = app.world_mut().query::<(&StableEntityId, &TestComponent)>();
+        let mut rows = query
+            .iter(app.world())
+            .map(|(id, component)| (id.0, component.value))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(10, 5)]);
+    }
+
+    #[test]
+    fn snapshot_policy_prunes_old_checkpoints_and_labels() {
+        let mut app = app_with_snapshot();
+        app.world_mut()
+            .resource_mut::<SnapshotPolicy>()
+            .keep_last_n_checkpoints = 1;
+        app.world_mut().spawn((
+            SnapshotEntity,
+            StableEntityId(10),
+            TestComponent { value: 5 },
+        ));
+
+        let old = create_snapshot(app.world_mut(), Some("old".to_string())).unwrap();
+        app.world_mut().resource_mut::<SimClock>().tick = 1;
+        let new = create_snapshot(app.world_mut(), Some("new".to_string())).unwrap();
+
+        let store = app.world().resource::<SnapshotStore>();
+        assert!(!store.snapshots.contains_key(&old.snapshot_id));
+        assert!(store.snapshots.contains_key(&new.snapshot_id));
+        assert_eq!(store.labels.get("old"), None);
+        assert_eq!(store.labels.get("new"), Some(&new.snapshot_id));
+    }
+
+    #[test]
+    fn maybe_take_snapshot_respects_interval() {
+        let mut app = app_with_snapshot();
+        app.world_mut()
+            .resource_mut::<SnapshotPolicy>()
+            .checkpoint_every_ticks = 2;
+
+        app.world_mut().run_schedule(AgentTick);
+        assert!(
+            app.world()
+                .resource::<SnapshotStore>()
+                .checkpoints
+                .is_empty()
+        );
+
+        app.world_mut().run_schedule(AgentTick);
+        assert_eq!(app.world().resource::<SnapshotStore>().checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn capture_snapshot_fails_for_snapshot_entity_without_stable_id() {
+        let mut app = app_with_snapshot();
+        app.world_mut()
+            .spawn((SnapshotEntity, TestComponent { value: 5 }));
+
+        let error = capture_snapshot(app.world_mut(), None).unwrap_err();
+
+        assert!(error.to_string().contains("missing StableEntityId"));
     }
 }

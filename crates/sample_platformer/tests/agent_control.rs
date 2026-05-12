@@ -1,5 +1,5 @@
 use bevy_agent_core::{AgentAction, LastStepResponse, Observation};
-use bevy_agent_remote::JsonRpcBridge;
+use bevy_agent_remote::{AgentCapability, JsonRpcBridge, RemoteSecurity};
 use bevy_agent_replay::Timeline;
 use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions};
 use std::path::PathBuf;
@@ -307,6 +307,305 @@ fn remote_replay_export_and_load_round_trip() {
     assert_eq!(load["result"]["records"], 2);
 
     let _ = std::fs::remove_file(export["result"]["path"].as_str().unwrap());
+}
+
+#[test]
+fn fast_forward_advances_noop_ticks_and_errors_on_zero() {
+    let mut env = make_env();
+    env.reset(ResetOptions::default()).unwrap();
+
+    let response = env.fast_forward(3).unwrap();
+    assert_eq!(response.tick, 3);
+
+    let error = env.fast_forward(0).unwrap_err();
+    assert!(error.to_string().contains("zero ticks"));
+}
+
+#[test]
+fn remote_snapshot_list_and_delete_update_store() {
+    let mut env = make_env();
+    let bridge = JsonRpcBridge::default();
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.reset","params":{"options":{"seed":1,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,
+    );
+    let snapshot_response = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.snapshot.create","params":{}}"#,
+    );
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot_response).unwrap();
+    let snapshot_id = snapshot["result"]["snapshot_id"].clone();
+
+    let list_response = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":3,"method":"agent.snapshot.list","params":{}}"#,
+    );
+    let list: serde_json::Value = serde_json::from_str(&list_response).unwrap();
+    assert!(list["result"].as_array().unwrap().len() >= 2);
+
+    let delete_response = bridge.handle_json(
+        &mut env,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "agent.snapshot.delete",
+            "params": { "snapshot_id": snapshot_id }
+        })
+        .to_string(),
+    );
+    let delete: serde_json::Value = serde_json::from_str(&delete_response).unwrap();
+    assert!(delete["result"].is_null());
+}
+
+#[test]
+fn remote_rejects_missing_token_and_missing_capability() {
+    let mut env = make_env();
+    let token_bridge = JsonRpcBridge::new(RemoteSecurity {
+        session_token: Some("secret".to_string()),
+        ..Default::default()
+    });
+    let token_response = token_bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.step","params":{"action":{"type":"Noop"}}}"#,
+    );
+    let token_error: serde_json::Value = serde_json::from_str(&token_response).unwrap();
+    assert!(
+        token_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("session token")
+    );
+
+    let capability_bridge = JsonRpcBridge::new(RemoteSecurity {
+        capabilities: AgentCapability::OBSERVE_PLAYER,
+        ..Default::default()
+    });
+    let capability_response = capability_bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.step","params":{"action":{"type":"Noop"}}}"#,
+    );
+    let capability_error: serde_json::Value = serde_json::from_str(&capability_response).unwrap();
+    assert!(
+        capability_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing remote capability")
+    );
+}
+
+#[test]
+fn remote_control_pause_resume_and_set_mode_update_control_state() {
+    let mut env = make_env();
+    let bridge = JsonRpcBridge::default();
+
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.control.pause","params":{}}"#,
+    );
+    assert!(matches!(
+        env.world()
+            .resource::<bevy_agent_core::AgentControlState>()
+            .mode,
+        bevy_agent_core::ControlMode::Paused
+    ));
+
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.control.resume","params":{}}"#,
+    );
+    assert!(matches!(
+        env.world()
+            .resource::<bevy_agent_core::AgentControlState>()
+            .mode,
+        bevy_agent_core::ControlMode::Agent
+    ));
+
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":3,"method":"agent.control.set_mode","params":{"mode":"InspectOnly"}}"#,
+    );
+    assert!(matches!(
+        env.world()
+            .resource::<bevy_agent_core::AgentControlState>()
+            .mode,
+        bevy_agent_core::ControlMode::InspectOnly
+    ));
+}
+
+#[test]
+fn remote_replay_start_and_stop_reset_recording_log() {
+    let mut env = make_env();
+    let bridge = JsonRpcBridge::default();
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.reset","params":{"options":{"seed":1,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,
+    );
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.step","params":{"action":{"type":"Move","x":1.0,"y":0.0}}}"#,
+    );
+
+    let start = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":3,"method":"agent.replay.start","params":{}}"#,
+    );
+    let start_value: serde_json::Value = serde_json::from_str(&start).unwrap();
+    assert_eq!(start_value["result"]["recording"], true);
+
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":4,"method":"agent.step","params":{"action":{"type":"Jump"}}}"#,
+    );
+    let stop = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":5,"method":"agent.replay.stop","params":{}}"#,
+    );
+    let stop_value: serde_json::Value = serde_json::from_str(&stop).unwrap();
+    assert_eq!(stop_value["result"]["recording"], false);
+    assert_eq!(stop_value["result"]["records"], 1);
+}
+
+#[test]
+fn remote_misc_methods_cover_info_schema_observe_fast_forward_and_errors() {
+    let mut env = make_env();
+    let bridge = JsonRpcBridge::default();
+
+    let parse_error = bridge.handle_json(&mut env, "{not-json");
+    let parse_error: serde_json::Value = serde_json::from_str(&parse_error).unwrap();
+    assert_eq!(parse_error["error"]["code"], -32700);
+
+    let unknown = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.unknown","params":{}}"#,
+    );
+    let unknown: serde_json::Value = serde_json::from_str(&unknown).unwrap();
+    assert!(
+        unknown["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown method")
+    );
+
+    let info = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.info","params":{}}"#,
+    );
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["result"]["name"], "bevy_agent_control");
+
+    let schema = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":3,"method":"agent.schema","params":{}}"#,
+    );
+    let schema: serde_json::Value = serde_json::from_str(&schema).unwrap();
+    assert_eq!(schema["result"]["step_response"]["title"], "StepResponse");
+
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":4,"method":"agent.reset","params":{"options":{"seed":1,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,
+    );
+    let observe = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":5,"method":"agent.observe","params":{"observation_mode":"PlayerKnowledge"}}"#,
+    );
+    let observe: serde_json::Value = serde_json::from_str(&observe).unwrap();
+    assert_eq!(observe["result"]["kind"], "Symbolic");
+
+    let fast_forward = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":6,"method":"agent.fast_forward","params":{"ticks":2}}"#,
+    );
+    let fast_forward: serde_json::Value = serde_json::from_str(&fast_forward).unwrap();
+    assert_eq!(fast_forward["result"]["tick"], 2);
+
+    let current = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":7,"method":"agent.timeline.current","params":{}}"#,
+    );
+    let current: serde_json::Value = serde_json::from_str(&current).unwrap();
+    assert_eq!(current["result"]["tick"], 2);
+}
+
+#[test]
+fn remote_step_many_return_modes_and_restore_tick_work() {
+    let mut env = make_env();
+    let bridge = JsonRpcBridge::default();
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.reset","params":{"options":{"seed":1,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,
+    );
+
+    let all = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.step_many","params":{"actions":[{"type":"Noop"},{"type":"Noop"}],"return_observations":"all"}}"#,
+    );
+    let all: serde_json::Value = serde_json::from_str(&all).unwrap();
+    assert!(all["result"]["observation"].as_array().unwrap().len() == 2);
+
+    let none = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":3,"method":"agent.step_many","params":{"actions":[{"type":"Noop"}],"return_observations":"none"}}"#,
+    );
+    let none: serde_json::Value = serde_json::from_str(&none).unwrap();
+    assert!(none["result"]["observation"].is_null());
+
+    let restore = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":4,"method":"agent.timeline.restore_tick","params":{"tick":1}}"#,
+    );
+    let restore: serde_json::Value = serde_json::from_str(&restore).unwrap();
+    assert_eq!(restore["result"]["current_tick"], 1);
+}
+
+#[test]
+fn remote_snapshot_restore_and_replay_load_inline_log_work() {
+    let mut env = make_env();
+    let bridge = JsonRpcBridge::default();
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.reset","params":{"options":{"seed":1,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,
+    );
+    let snapshot = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.snapshot.create","params":{}}"#,
+    );
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+    let snapshot_id = snapshot["result"]["snapshot_id"].clone();
+
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":3,"method":"agent.step","params":{"action":{"type":"Move","x":1.0,"y":0.0}}}"#,
+    );
+    let restore = bridge.handle_json(
+        &mut env,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "agent.snapshot.restore",
+            "params": { "snapshot_id": snapshot_id }
+        })
+        .to_string(),
+    );
+    let restore: serde_json::Value = serde_json::from_str(&restore).unwrap();
+    assert!(restore["result"].is_null());
+
+    let export = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":5,"method":"agent.replay.export","params":{}}"#,
+    );
+    let export: serde_json::Value = serde_json::from_str(&export).unwrap();
+    let load = bridge.handle_json(
+        &mut env,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "agent.replay.load",
+            "params": { "log": export["result"]["log"].clone() }
+        })
+        .to_string(),
+    );
+    let load: serde_json::Value = serde_json::from_str(&load).unwrap();
+    assert!(load["result"]["records"].as_u64().unwrap() >= 1);
 }
 
 fn replay_temp_path() -> PathBuf {

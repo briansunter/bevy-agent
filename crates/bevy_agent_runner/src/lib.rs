@@ -1,3 +1,5 @@
+//! Runner API for manually stepping Bevy apps through agent simulation ticks.
+
 use anyhow::{Result, anyhow};
 use bevy::prelude::*;
 use bevy_agent_core::{
@@ -361,4 +363,90 @@ pub fn clear_episode(world: &mut World) {
     *world.resource_mut::<EpisodeState>() = EpisodeState::default();
     *world.resource_mut::<RewardState>() = RewardState::default();
     world.resource_mut::<CurrentInputFrame>().actions.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_agent_core::AgentControlPlugin;
+
+    fn core_only_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AgentControlPlugin::deterministic());
+        app
+    }
+
+    #[test]
+    fn reset_without_snapshot_plugin_returns_observation() {
+        let mut env = AgentApp::new(core_only_app);
+
+        let observation = env
+            .reset(ResetOptions {
+                create_initial_snapshot: false,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(env.current_tick(), 0);
+        assert!(matches!(observation, Observation::Hybrid { .. }));
+    }
+
+    #[test]
+    fn step_auto_resets_before_first_tick() {
+        let mut env = AgentApp::new(core_only_app);
+
+        let response = env.step(AgentAction::Noop).unwrap();
+
+        assert_eq!(response.tick, 1);
+        assert_eq!(response.info.actions_applied, 1);
+    }
+
+    #[test]
+    fn fast_forward_zero_returns_error() {
+        let mut env = AgentApp::new(core_only_app);
+
+        let error = env.fast_forward(0).unwrap_err();
+
+        assert!(error.to_string().contains("zero ticks"));
+    }
+
+    #[test]
+    fn snapshot_without_snapshot_plugin_returns_error() {
+        let mut env = AgentApp::new(core_only_app);
+
+        let error = env.snapshot().unwrap_err();
+
+        assert!(error.to_string().contains("AgentSnapshotPlugin"));
+    }
+
+    #[test]
+    fn episode_helpers_update_world_resources() {
+        let mut env = AgentApp::new(core_only_app);
+        env.reset(ResetOptions {
+            create_initial_snapshot: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        set_episode_done(env.world_mut(), "done");
+        assert!(env.world().resource::<EpisodeState>().done);
+        assert_eq!(
+            env.world().resource::<EpisodeState>().reason.as_deref(),
+            Some("done")
+        );
+
+        env.world_mut()
+            .resource_mut::<CurrentInputFrame>()
+            .actions
+            .push(AgentAction::Jump);
+        clear_episode(env.world_mut());
+        assert!(!env.world().resource::<EpisodeState>().done);
+        assert!(
+            env.world()
+                .resource::<CurrentInputFrame>()
+                .actions
+                .is_empty()
+        );
+    }
 }

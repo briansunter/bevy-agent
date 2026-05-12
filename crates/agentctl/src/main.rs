@@ -228,3 +228,166 @@ fn print_usage() {
            replay-start | replay-stop | replay-export [path] | replay-load <path>"
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn endpoint_parse_defaults_path_and_port() {
+        let endpoint = HttpEndpoint::parse("http://localhost").unwrap();
+
+        assert_eq!(endpoint.host, "localhost");
+        assert_eq!(endpoint.port, 80);
+        assert_eq!(endpoint.path, "/rpc");
+    }
+
+    #[test]
+    fn endpoint_parse_reads_host_port_and_path() {
+        let endpoint = HttpEndpoint::parse("http://127.0.0.1:4010/rpc").unwrap();
+
+        assert_eq!(endpoint.host, "127.0.0.1");
+        assert_eq!(endpoint.port, 4010);
+        assert_eq!(endpoint.path, "/rpc");
+    }
+
+    #[test]
+    fn take_option_removes_option_and_value() {
+        let mut args = vec![
+            "reset".to_string(),
+            "--seed".to_string(),
+            "42".to_string(),
+            "--mode".to_string(),
+            "Hybrid".to_string(),
+        ];
+
+        assert_eq!(take_option(&mut args, "--seed"), Some("42".to_string()));
+        assert_eq!(args, vec!["reset", "--mode", "Hybrid"]);
+    }
+
+    #[test]
+    fn has_flag_removes_present_flag() {
+        let mut args = vec!["step-many".to_string(), "--no-stop-on-done".to_string()];
+
+        assert!(has_flag(&mut args, "--no-stop-on-done"));
+        assert_eq!(args, vec!["step-many"]);
+        assert!(!has_flag(&mut args, "--missing"));
+    }
+
+    #[test]
+    fn build_request_creates_step_many_payload() {
+        let mut args = vec![
+            r#"[{"type":"Noop"}]"#.to_string(),
+            "--return".to_string(),
+            "none".to_string(),
+        ];
+
+        let (method, params) = build_request("step-many", &mut args).unwrap();
+
+        assert_eq!(method, "agent.step_many");
+        assert_eq!(params["return_observations"], "none");
+        assert_eq!(params["actions"][0]["type"], "Noop");
+    }
+
+    #[test]
+    fn build_request_reports_missing_required_arg() {
+        let mut args = Vec::new();
+
+        let error = build_request("restore", &mut args).unwrap_err();
+
+        assert!(error.to_string().contains("snapshot id"));
+    }
+
+    #[test]
+    fn build_request_covers_common_commands() {
+        let cases = [
+            ("info", vec![], "agent.info"),
+            ("schema", vec![], "agent.schema"),
+            ("action-space", vec![], "agent.action_space"),
+            ("observation-space", vec![], "agent.observation_space"),
+            ("observe", vec!["--mode", "FullDebugState"], "agent.observe"),
+            ("fast-forward", vec!["5"], "agent.fast_forward"),
+            ("snapshot", vec![], "agent.snapshot.create"),
+            ("snapshots", vec![], "agent.snapshot.list"),
+            ("restore", vec!["snapshot-id"], "agent.snapshot.restore"),
+            ("restore-tick", vec!["9"], "agent.timeline.restore_tick"),
+            ("replay-start", vec![], "agent.replay.start"),
+            ("replay-stop", vec![], "agent.replay.stop"),
+            ("replay-export", vec!["replay.json"], "agent.replay.export"),
+            ("replay-load", vec!["replay.json"], "agent.replay.load"),
+        ];
+
+        for (command, args, expected_method) in cases {
+            let mut args = args.into_iter().map(ToOwned::to_owned).collect::<Vec<_>>();
+            let (method, _) = build_request(command, &mut args).unwrap();
+            assert_eq!(method, expected_method);
+        }
+    }
+
+    #[test]
+    fn build_request_covers_reset_step_and_branch_options() {
+        let mut reset = vec![
+            "--seed".to_string(),
+            "12".to_string(),
+            "--mode".to_string(),
+            "PlayerKnowledge".to_string(),
+        ];
+        let (_, reset_params) = build_request("reset", &mut reset).unwrap();
+        assert_eq!(reset_params["options"]["seed"], 12);
+        assert_eq!(
+            reset_params["options"]["observation_mode"],
+            "PlayerKnowledge"
+        );
+
+        let mut step = vec![
+            r#"{"type":"Move","x":1.0,"y":0.0}"#.to_string(),
+            "--mode".to_string(),
+            "Hybrid".to_string(),
+        ];
+        let (_, step_params) = build_request("step", &mut step).unwrap();
+        assert_eq!(step_params["action"]["type"], "Move");
+        assert_eq!(step_params["observation_mode"], "Hybrid");
+
+        let mut branch = vec![
+            "--from-tick".to_string(),
+            "42".to_string(),
+            "--label".to_string(),
+            "try-alt".to_string(),
+        ];
+        let (_, branch_params) = build_request("branch", &mut branch).unwrap();
+        assert_eq!(branch_params["from_tick"], 42);
+        assert_eq!(branch_params["label"], "try-alt");
+    }
+
+    #[test]
+    fn post_json_rpc_sends_request_and_parses_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 1024];
+            let read = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]);
+            assert!(request.contains("POST /rpc HTTP/1.1"));
+            assert!(request.contains(r#""method":"agent.info""#));
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let value = post_json_rpc(
+            &format!("http://{addr}/rpc"),
+            &json!({"jsonrpc":"2.0","id":1,"method":"agent.info","params":{}}),
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(value["result"]["ok"], true);
+    }
+}

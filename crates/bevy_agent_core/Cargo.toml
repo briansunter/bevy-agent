@@ -4,6 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Core schedules, actions, observations, deterministic clock, and plugin types for controllable Bevy simulations."
+readme.workspace = true
+documentation = "https://docs.rs/bevy_agent_core"
+keywords = ["bevy", "gamedev", "agent", "simulation"]
+categories = ["game-development", "simulation"]
 
 [dependencies]
 bevy.workspace = true

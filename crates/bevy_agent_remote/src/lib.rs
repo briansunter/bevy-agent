@@ -1,3 +1,5 @@
+//! JSON-RPC, HTTP, WebSocket, and stdio remote-control bridge for agent apps.
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -918,4 +920,187 @@ fn write_websocket_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> 
     stream.write_all(&frame)?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn token_check_accepts_missing_token_when_no_token_is_configured() {
+        let bridge = JsonRpcBridge::default();
+
+        assert!(bridge.check_token(None).is_ok());
+    }
+
+    #[test]
+    fn token_check_rejects_missing_or_wrong_token_when_configured() {
+        let bridge = JsonRpcBridge::new(RemoteSecurity {
+            session_token: Some("secret".to_string()),
+            ..Default::default()
+        });
+
+        assert!(bridge.check_token(None).is_err());
+        assert!(bridge.check_token(Some("wrong")).is_err());
+        assert!(bridge.check_token(Some("secret")).is_ok());
+    }
+
+    #[test]
+    fn capability_check_rejects_missing_capability() {
+        let bridge = JsonRpcBridge::new(RemoteSecurity {
+            capabilities: AgentCapability::STEP,
+            ..Default::default()
+        });
+
+        assert!(bridge.require_capability(AgentCapability::STEP).is_ok());
+        assert!(
+            bridge
+                .require_capability(AgentCapability::SNAPSHOT)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_helpers_expose_required_shapes() {
+        let action = agent_action_schema();
+        let observation = observation_schema();
+        let step = step_response_schema();
+
+        assert_eq!(action["title"], "AgentAction");
+        assert!(action["oneOf"].as_array().unwrap().len() >= 10);
+        assert_eq!(observation["title"], "Observation");
+        assert!(observation["$defs"]["player"].is_object());
+        assert_eq!(step["title"], "StepResponse");
+    }
+
+    #[test]
+    fn token_from_params_extracts_string_token_only() {
+        assert_eq!(
+            token_from_params(&serde_json::json!({ "session_token": "abc" })),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            token_from_params(&serde_json::json!({ "session_token": 123 })),
+            None
+        );
+    }
+
+    #[test]
+    fn websocket_accept_key_matches_rfc_example() {
+        assert_eq!(
+            websocket_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn read_http_request_parses_headers_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .write_all(
+                    b"POST /rpc HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\n\r\n{\"x\":1}",
+                )
+                .unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let request = read_http_request(&mut stream).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/rpc");
+        assert_eq!(request.header("host"), Some("localhost"));
+        assert_eq!(request.body, "{\"x\":1}");
+    }
+
+    #[test]
+    fn write_http_response_writes_status_headers_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        write_http_response(&mut stream, 200, "OK", "application/json", r#"{"ok":true}"#).unwrap();
+        drop(stream);
+        let response = handle.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("Content-Type: application/json"));
+        assert!(response.ends_with(r#"{"ok":true}"#));
+    }
+
+    #[test]
+    fn websocket_read_decodes_masked_text_ping_and_close_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.write_all(&masked_ws_frame(0x1, b"hello")).unwrap();
+            stream.write_all(&masked_ws_frame(0x9, b"ping")).unwrap();
+            stream.write_all(&masked_ws_frame(0x8, b"")).unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        match read_websocket_text(&mut stream).unwrap() {
+            WebSocketMessage::Text(text) => assert_eq!(text, "hello"),
+            _ => panic!("expected text websocket message"),
+        }
+        match read_websocket_text(&mut stream).unwrap() {
+            WebSocketMessage::Ping(payload) => assert_eq!(payload, b"ping"),
+            _ => panic!("expected ping websocket message"),
+        }
+        assert!(matches!(
+            read_websocket_text(&mut stream).unwrap(),
+            WebSocketMessage::Close
+        ));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn websocket_write_encodes_unmasked_server_text_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let mut frame = [0; 7];
+            stream.read_exact(&mut frame).unwrap();
+            frame
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        write_websocket_text(&mut stream, "hello").unwrap();
+        let frame = handle.join().unwrap();
+
+        assert_eq!(frame[0], 0x81);
+        assert_eq!(frame[1], 5);
+        assert_eq!(&frame[2..], b"hello");
+    }
+
+    #[test]
+    fn find_header_end_detects_http_header_separator() {
+        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\nbody"), Some(14));
+        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n"), None);
+    }
+
+    fn masked_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mask = [1, 2, 3, 4];
+        let mut frame = vec![0x80 | opcode, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+        );
+        frame
+    }
 }

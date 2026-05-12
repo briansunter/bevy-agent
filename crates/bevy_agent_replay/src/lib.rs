@@ -1,3 +1,5 @@
+//! Replay logs and timeline branches for deterministic agent-controlled games.
+
 use std::collections::{BTreeMap, HashMap};
 
 use bevy::prelude::*;
@@ -195,4 +197,84 @@ pub fn stop_recording(world: &mut World) -> ReplayLog {
     let mut recorder = world.resource_mut::<ReplayRecorder>();
     recorder.recording = false;
     recorder.log.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(tick: u64, action: AgentAction) -> ActionRecord {
+        ActionRecord {
+            tick,
+            source: ActionSource::Agent,
+            action,
+        }
+    }
+
+    #[test]
+    fn replay_log_filters_actions_between_ticks() {
+        let log = ReplayLog {
+            records: vec![
+                record(1, AgentAction::Noop),
+                record(2, AgentAction::Jump),
+                record(3, AgentAction::Interact),
+            ],
+            ..Default::default()
+        };
+
+        let actions = log.actions_between(1, 3);
+
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].tick, 2);
+        assert_eq!(actions[1].tick, 3);
+    }
+
+    #[test]
+    fn replay_log_finds_nearest_checkpoint_at_or_before_tick() {
+        let first = SnapshotId::new();
+        let second = SnapshotId::new();
+        let log = ReplayLog {
+            checkpoints: [(10, first), (20, second)].into_iter().collect(),
+            ..Default::default()
+        };
+
+        assert_eq!(log.nearest_checkpoint_at_or_before(9), None);
+        assert_eq!(log.nearest_checkpoint_at_or_before(10), Some((10, first)));
+        assert_eq!(log.nearest_checkpoint_at_or_before(25), Some((20, second)));
+    }
+
+    #[test]
+    fn timeline_create_branch_tracks_parent_and_switches_current_branch() {
+        let mut timeline = Timeline::default();
+        let parent = timeline.current_branch;
+        let snapshot = SnapshotId::new();
+
+        let child = timeline.create_branch(42, Some(snapshot), Some("try-alt".to_string()));
+
+        assert_ne!(child, parent);
+        assert_eq!(timeline.current_branch, child);
+        let branch = timeline.branches.get(&child).unwrap();
+        assert_eq!(branch.parent_branch, Some(parent));
+        assert_eq!(branch.fork_tick, 42);
+        assert_eq!(branch.fork_snapshot, Some(snapshot));
+        assert_eq!(branch.label.as_deref(), Some("try-alt"));
+    }
+
+    #[test]
+    fn start_and_stop_recording_resets_and_returns_log() {
+        let mut world = World::new();
+        world.insert_resource(ReplayRecorder::default());
+        let snapshot = SnapshotId::new();
+
+        start_recording(&mut world, Some(snapshot));
+        {
+            let mut recorder = world.resource_mut::<ReplayRecorder>();
+            recorder.log.records.push(record(1, AgentAction::Jump));
+        }
+        let log = stop_recording(&mut world);
+
+        assert!(!world.resource::<ReplayRecorder>().recording);
+        assert_eq!(log.initial_snapshot, Some(snapshot));
+        assert_eq!(log.records.len(), 1);
+    }
 }

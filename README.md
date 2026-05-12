@@ -97,6 +97,7 @@ The sample also includes:
 - `python/bevy_agent_client.py`: a stdlib Python wrapper.
 - `docs/controllable-game.md`: integration checklist for games.
 - `docs/codex-interaction.md`: command examples for agents.
+- `docs/publishing.md`: crate publishing checklist.
 
 ## Determinism Contract
 

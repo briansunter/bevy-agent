@@ -4,6 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Sample headless platformer demonstrating bevy_agent_control integration."
+readme.workspace = true
+documentation = "https://docs.rs/sample_platformer"
+keywords = ["bevy", "gamedev", "platformer", "agent"]
+categories = ["game-development", "simulation"]
 
 [features]
 default = []

@@ -1,3 +1,5 @@
+//! Headless sample platformer demonstrating `bevy_agent_control` integration.
+
 use std::hash::{Hash, Hasher};
 
 use bevy::prelude::*;
@@ -491,5 +493,45 @@ fn platformer_checksum(world: &mut World) -> StateChecksum {
     StateChecksum {
         tick: clock.tick,
         hash: hasher.finish(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platformer_config_default_sets_episode_limits() {
+        let config = PlatformerConfig::default();
+
+        assert_eq!(config.max_ticks, 900);
+        assert_eq!(config.death_y, -8.0);
+    }
+
+    #[test]
+    fn aabb_overlap_detects_touching_and_separated_boxes() {
+        assert!(aabb_overlap(
+            Vec3::ZERO,
+            Vec2::splat(1.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec2::splat(1.0),
+        ));
+        assert!(!aabb_overlap(
+            Vec3::ZERO,
+            Vec2::splat(1.0),
+            Vec3::new(2.1, 0.0, 0.0),
+            Vec2::splat(1.0),
+        ));
+    }
+
+    #[test]
+    fn headless_app_contains_agent_resources_after_startup() {
+        let mut app = build_headless_app();
+        app.finish();
+        app.cleanup();
+
+        assert!(app.world().contains_resource::<SimClock>());
+        assert!(app.world().contains_resource::<GameScore>());
+        assert!(app.world().contains_resource::<PlatformerState>());
     }
 }

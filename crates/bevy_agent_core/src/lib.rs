@@ -1,3 +1,9 @@
+//! Core Bevy plugin primitives for controllable agent-driven simulations.
+//!
+//! This crate owns the deterministic tick schedules, action queue, input frame,
+//! simulation clock, observation types, reward/episode state, and extension
+//! traits used by the runner, snapshot, replay, and remote crates.
+
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
@@ -762,5 +768,154 @@ pub fn default_checksum(world: &World) -> StateChecksum {
     StateChecksum {
         tick: clock.tick,
         hash: hasher.finish(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_with_core() -> App {
+        let mut app = App::new();
+        app.add_plugins(AgentControlPlugin::deterministic());
+        app.finish();
+        app.cleanup();
+        app
+    }
+
+    #[test]
+    fn stable_id_allocator_allocates_monotonic_ids() {
+        let mut allocator = StableIdAllocator::default();
+
+        assert_eq!(allocator.allocate(), StableEntityId(1));
+        assert_eq!(allocator.allocate(), StableEntityId(2));
+        assert_eq!(allocator.next, 3);
+    }
+
+    #[test]
+    fn sim_clock_advance_preserves_fixed_dt() {
+        let mut clock = SimClock::new(20);
+
+        clock.advance_one_tick();
+        clock.advance_one_tick();
+
+        assert_eq!(clock.tick, 2);
+        assert_eq!(clock.dt_seconds, 0.05);
+        assert!((clock.elapsed_seconds - 0.1).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn action_queue_schedules_and_clears_actions() {
+        let mut queue = AgentActionQueue::default();
+
+        queue.schedule(7, ActionSource::Test, AgentAction::Jump);
+        assert_eq!(queue.pending.len(), 1);
+
+        queue.clear();
+        assert!(queue.pending.is_empty());
+    }
+
+    #[test]
+    fn core_tick_drains_only_current_actions_and_preserves_future_actions() {
+        let mut app = app_with_core();
+        app.world_mut().resource_mut::<AgentActionQueue>().schedule(
+            1,
+            ActionSource::Agent,
+            AgentAction::Jump,
+        );
+        app.world_mut().resource_mut::<AgentActionQueue>().schedule(
+            3,
+            ActionSource::Script,
+            AgentAction::Interact,
+        );
+
+        app.world_mut().run_schedule(AgentTick);
+
+        let input = app.world().resource::<CurrentInputFrame>();
+        assert_eq!(input.tick, 1);
+        assert_eq!(input.actions, vec![AgentAction::Jump]);
+        assert_eq!(input.sources, vec![ActionSource::Agent]);
+        assert_eq!(app.world().resource::<AgentActionQueue>().pending.len(), 1);
+        assert_eq!(
+            app.world()
+                .resource::<AgentControlState>()
+                .last_action_count,
+            1
+        );
+    }
+
+    #[test]
+    fn reset_core_clears_episode_reward_input_and_preserves_tick_dt_and_rng_seed() {
+        let mut app = app_with_core();
+        {
+            let world = app.world_mut();
+            world.resource_mut::<SimClock>().tick = 99;
+            world.resource_mut::<SimClock>().dt_seconds = 0.25;
+            world.resource_mut::<RewardState>().current_reward = 10.0;
+            world.resource_mut::<EpisodeState>().done = true;
+            world
+                .resource_mut::<CurrentInputFrame>()
+                .actions
+                .push(AgentAction::Jump);
+            world.resource_mut::<DeterministicRng>().seed = 123;
+            world.resource_mut::<AgentActionQueue>().schedule(
+                100,
+                ActionSource::Agent,
+                AgentAction::Noop,
+            );
+        }
+
+        app.world_mut().run_schedule(AgentReset);
+
+        assert_eq!(app.world().resource::<SimClock>().tick, 0);
+        assert_eq!(app.world().resource::<SimClock>().dt_seconds, 0.25);
+        assert_eq!(app.world().resource::<RewardState>().current_reward, 0.0);
+        assert!(!app.world().resource::<EpisodeState>().done);
+        assert!(
+            app.world()
+                .resource::<CurrentInputFrame>()
+                .actions
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<AgentActionQueue>()
+                .pending
+                .is_empty()
+        );
+        assert_eq!(app.world().resource::<DeterministicRng>().seed, 123);
+    }
+
+    #[test]
+    fn observation_and_checksum_extractors_override_defaults() {
+        let mut app = App::new();
+        app.add_plugins(AgentControlPlugin::deterministic())
+            .insert_observation_extractor(|world, mode| {
+                assert!(matches!(mode, ObservationMode::FullDebugState));
+                Observation::FullState(serde_json::json!({
+                    "tick": world.resource::<SimClock>().tick
+                }))
+            })
+            .insert_checksum_extractor(|world| StateChecksum {
+                tick: world.resource::<SimClock>().tick,
+                hash: 42,
+            });
+        app.finish();
+        app.cleanup();
+        app.world_mut().resource_mut::<ObservationConfig>().mode = ObservationMode::FullDebugState;
+
+        app.world_mut().run_schedule(AgentTick);
+
+        let response = app
+            .world()
+            .resource::<LastStepResponse>()
+            .0
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            response.observation,
+            Observation::FullState(serde_json::json!({ "tick": 1 }))
+        );
+        assert_eq!(response.checksum, Some(StateChecksum { tick: 1, hash: 42 }));
     }
 }
