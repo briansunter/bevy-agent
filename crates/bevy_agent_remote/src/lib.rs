@@ -2,6 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -14,6 +15,10 @@ use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
+
+const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 8 * 1024 * 1024;
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +219,7 @@ fn return_all() -> String {
 }
 
 impl JsonRpcBridge {
+    #[must_use] 
     pub fn new(security: RemoteSecurity) -> Self {
         Self { security }
     }
@@ -398,9 +404,15 @@ impl JsonRpcBridge {
                 self.require_capability(AgentCapability::SNAPSHOT)?;
                 self.check_token(token_from_params(&request.params).as_deref())?;
                 let store = env.world().resource::<SnapshotStore>();
-                let snapshots = store
-                    .snapshots
-                    .values()
+                let mut snapshots = store.snapshots.values().collect::<Vec<_>>();
+                snapshots.sort_by(|a, b| {
+                    a.manifest
+                        .tick
+                        .cmp(&b.manifest.tick)
+                        .then_with(|| a.manifest.snapshot_id.cmp(&b.manifest.snapshot_id))
+                });
+                let snapshots = snapshots
+                    .into_iter()
                     .map(|snapshot| {
                         json!({
                             "snapshot_id": snapshot.manifest.snapshot_id,
@@ -534,10 +546,11 @@ impl JsonRpcBridge {
     }
 
     fn check_token(&self, token: Option<&str>) -> Result<()> {
-        if let Some(expected) = &self.security.session_token
-            && token != Some(expected.as_str())
-        {
-            return Err(anyhow!("invalid or missing session token"));
+        if let Some(expected) = &self.security.session_token {
+            let provided = token.unwrap_or("");
+            if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+                return Err(anyhow!("invalid or missing session token"));
+            }
         }
         Ok(())
     }
@@ -550,6 +563,17 @@ impl JsonRpcBridge {
     }
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn token_from_params(params: &Value) -> Option<String> {
     params
         .get("session_token")
@@ -557,6 +581,7 @@ fn token_from_params(params: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[must_use] 
 pub fn agent_action_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -577,6 +602,7 @@ pub fn agent_action_schema() -> Value {
     })
 }
 
+#[must_use] 
 pub fn observation_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -646,6 +672,7 @@ pub fn observation_schema() -> Value {
     })
 }
 
+#[must_use] 
 pub fn step_response_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -664,6 +691,7 @@ pub fn step_response_schema() -> Value {
     })
 }
 
+#[must_use] 
 pub fn visual_capture_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -803,6 +831,8 @@ impl HttpRequest {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
+    let _ = stream.set_read_timeout(Some(HTTP_READ_TIMEOUT));
+
     let mut bytes = Vec::new();
     let header_end;
     loop {
@@ -815,6 +845,11 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         if let Some(index) = find_header_end(&bytes) {
             header_end = index;
             break;
+        }
+        if bytes.len() > MAX_HTTP_HEADER_BYTES {
+            return Err(anyhow!(
+                "HTTP request headers exceed {MAX_HTTP_HEADER_BYTES} bytes"
+            ));
         }
     }
 
@@ -846,6 +881,11 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.parse::<usize>().ok())
         .unwrap_or(0);
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return Err(anyhow!(
+            "HTTP request body of {content_length} bytes exceeds limit of {MAX_HTTP_BODY_BYTES}"
+        ));
+    }
     let body_start = header_end + 4;
     while bytes.len() < body_start + content_length {
         let mut buf = [0; 1024];
@@ -857,7 +897,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     }
     let body_bytes = bytes
         .get(body_start..body_start + content_length)
-        .unwrap_or_default();
+        .ok_or_else(|| anyhow!("HTTP body shorter than declared Content-Length"))?;
     let body = String::from_utf8(body_bytes.to_vec())?;
 
     Ok(HttpRequest {
@@ -1140,6 +1180,52 @@ mod tests {
     fn find_header_end_detects_http_header_separator() {
         assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\nbody"), Some(14));
         assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n"), None);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_equal_inputs_only() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secrex"));
+        assert!(!constant_time_eq(b"secret", b"secret-extra"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn read_http_request_rejects_oversized_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            // Stream junk that never contains \r\n\r\n; server must abort once cap is hit.
+            let chunk = vec![b'x'; 4096];
+            for _ in 0..16 {
+                if stream.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let err = read_http_request(&mut stream).unwrap_err();
+        assert!(err.to_string().contains("exceed"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn read_http_request_rejects_oversized_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let req = format!(
+                "POST /rpc HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                MAX_HTTP_BODY_BYTES + 1
+            );
+            let _ = stream.write_all(req.as_bytes());
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let err = read_http_request(&mut stream).unwrap_err();
+        let _ = handle.join();
+        assert!(err.to_string().contains("exceeds limit"), "unexpected error: {err}");
     }
 
     fn masked_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {

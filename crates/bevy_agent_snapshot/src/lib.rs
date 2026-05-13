@@ -230,6 +230,7 @@ impl SnapshotRegistry {
         );
     }
 
+    #[must_use] 
     pub fn schema_hash(&self) -> String {
         let mut names: Vec<_> = self
             .component_serializers

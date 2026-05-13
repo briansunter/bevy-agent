@@ -63,6 +63,7 @@ pub enum AgentSet {
 pub struct StableEntityId(pub u128);
 
 impl StableEntityId {
+    #[must_use] 
     pub const fn from_u64(value: u64) -> Self {
         Self(value as u128)
     }
@@ -90,10 +91,11 @@ impl StableIdAllocator {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SnapshotId(pub Uuid);
 
 impl SnapshotId {
+    #[must_use] 
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -109,6 +111,7 @@ impl Default for SnapshotId {
 pub struct TimelineId(pub Uuid);
 
 impl TimelineId {
+    #[must_use] 
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -124,6 +127,7 @@ impl Default for TimelineId {
 pub struct BranchId(pub Uuid);
 
 impl BranchId {
+    #[must_use] 
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -143,6 +147,7 @@ pub struct SimClock {
 }
 
 impl SimClock {
+    #[must_use] 
     pub fn new(tick_hz: u32) -> Self {
         Self {
             tick: 0,
@@ -170,6 +175,7 @@ pub struct DeterministicRng {
 }
 
 impl DeterministicRng {
+    #[must_use] 
     pub fn seeded(seed: u64) -> Self {
         Self {
             seed,
@@ -373,6 +379,7 @@ pub enum Observation {
 }
 
 impl Observation {
+    #[must_use] 
     pub fn default_for_tick(tick: u64) -> Self {
         let symbolic = SymbolicObservation {
             tick,
@@ -555,6 +562,7 @@ pub struct AgentControlPlugin {
 }
 
 impl AgentControlPlugin {
+    #[must_use] 
     pub fn deterministic() -> Self {
         Self {
             mode: AgentPluginMode::Deterministic,
@@ -563,6 +571,7 @@ impl AgentControlPlugin {
         }
     }
 
+    #[must_use] 
     pub fn visual_debug() -> Self {
         Self {
             mode: AgentPluginMode::VisualDebug,
@@ -571,6 +580,7 @@ impl AgentControlPlugin {
         }
     }
 
+    #[must_use] 
     pub fn remote() -> Self {
         Self {
             mode: AgentPluginMode::Remote,

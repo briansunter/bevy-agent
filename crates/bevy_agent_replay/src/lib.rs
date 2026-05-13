@@ -44,6 +44,7 @@ pub struct ReplayLog {
 }
 
 impl ReplayLog {
+    #[must_use] 
     pub fn actions_between(&self, start_exclusive: u64, end_inclusive: u64) -> Vec<ActionRecord> {
         self.records
             .iter()
@@ -52,6 +53,7 @@ impl ReplayLog {
             .collect()
     }
 
+    #[must_use] 
     pub fn nearest_checkpoint_at_or_before(&self, tick: u64) -> Option<(u64, SnapshotId)> {
         self.checkpoints
             .range(..=tick)

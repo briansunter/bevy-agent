@@ -109,6 +109,7 @@ impl VisualCaptureAppExt for App {
     }
 }
 
+#[must_use] 
 pub fn sanitized_capture_label(label: Option<&str>) -> String {
     let label = label.unwrap_or("capture");
     let mut sanitized = String::new();
