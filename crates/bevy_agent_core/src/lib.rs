@@ -4,7 +4,7 @@
 //! simulation clock, observation types, reward/episode state, and extension
 //! traits used by the runner, snapshot, replay, and remote crates.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use bevy::ecs::schedule::ScheduleLabel;
@@ -63,7 +63,7 @@ pub enum AgentSet {
 pub struct StableEntityId(pub u128);
 
 impl StableEntityId {
-    #[must_use] 
+    #[must_use]
     pub const fn from_u64(value: u64) -> Self {
         Self(value as u128)
     }
@@ -95,7 +95,7 @@ impl StableIdAllocator {
 pub struct SnapshotId(pub Uuid);
 
 impl SnapshotId {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -111,7 +111,7 @@ impl Default for SnapshotId {
 pub struct TimelineId(pub Uuid);
 
 impl TimelineId {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -127,7 +127,7 @@ impl Default for TimelineId {
 pub struct BranchId(pub Uuid);
 
 impl BranchId {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -147,7 +147,7 @@ pub struct SimClock {
 }
 
 impl SimClock {
-    #[must_use] 
+    #[must_use]
     pub fn new(tick_hz: u32) -> Self {
         Self {
             tick: 0,
@@ -175,7 +175,7 @@ pub struct DeterministicRng {
 }
 
 impl DeterministicRng {
-    #[must_use] 
+    #[must_use]
     pub fn seeded(seed: u64) -> Self {
         Self {
             seed,
@@ -217,6 +217,29 @@ pub enum AgentAction {
     Custom {
         value: serde_json::Value,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CustomActionSchema {
+    pub name: String,
+    pub schema: serde_json::Value,
+}
+
+#[derive(Resource, Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentActionCatalog {
+    pub custom_actions: BTreeMap<String, CustomActionSchema>,
+}
+
+impl AgentActionCatalog {
+    pub fn register_custom_action_schema(
+        &mut self,
+        name: impl Into<String>,
+        schema: serde_json::Value,
+    ) {
+        let name = name.into();
+        self.custom_actions
+            .insert(name.clone(), CustomActionSchema { name, schema });
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -379,7 +402,7 @@ pub enum Observation {
 }
 
 impl Observation {
-    #[must_use] 
+    #[must_use]
     pub fn default_for_tick(tick: u64) -> Self {
         let symbolic = SymbolicObservation {
             tick,
@@ -529,6 +552,12 @@ pub trait AgentControlAppExt {
     fn insert_checksum_extractor<F>(&mut self, extract: F) -> &mut Self
     where
         F: Fn(&mut World) -> StateChecksum + Send + Sync + 'static;
+
+    fn register_custom_action_schema(
+        &mut self,
+        name: impl Into<String>,
+        schema: serde_json::Value,
+    ) -> &mut Self;
 }
 
 impl AgentControlAppExt for App {
@@ -545,6 +574,20 @@ impl AgentControlAppExt for App {
     {
         self.insert_resource(AgentChecksumExtractor::new(extract))
     }
+
+    fn register_custom_action_schema(
+        &mut self,
+        name: impl Into<String>,
+        schema: serde_json::Value,
+    ) -> &mut Self {
+        if !self.world().contains_resource::<AgentActionCatalog>() {
+            self.init_resource::<AgentActionCatalog>();
+        }
+        self.world_mut()
+            .resource_mut::<AgentActionCatalog>()
+            .register_custom_action_schema(name, schema);
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -558,34 +601,30 @@ pub enum AgentPluginMode {
 pub struct AgentControlPlugin {
     pub mode: AgentPluginMode,
     pub tick_hz: u32,
-    pub snapshot_interval: Option<u64>,
 }
 
 impl AgentControlPlugin {
-    #[must_use] 
+    #[must_use]
     pub fn deterministic() -> Self {
         Self {
             mode: AgentPluginMode::Deterministic,
             tick_hz: 60,
-            snapshot_interval: Some(120),
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn visual_debug() -> Self {
         Self {
             mode: AgentPluginMode::VisualDebug,
             tick_hz: 60,
-            snapshot_interval: Some(120),
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn remote() -> Self {
         Self {
             mode: AgentPluginMode::Remote,
             tick_hz: 60,
-            snapshot_interval: Some(120),
         }
     }
 }
@@ -602,6 +641,7 @@ impl Plugin for AgentControlPlugin {
             .init_resource::<AgentControlState>()
             .init_resource::<AgentActionQueue>()
             .init_resource::<CurrentInputFrame>()
+            .init_resource::<AgentActionCatalog>()
             .init_resource::<ObservationConfig>()
             .init_resource::<RewardState>()
             .init_resource::<EpisodeState>()
@@ -763,7 +803,7 @@ pub fn default_checksum(world: &World) -> StateChecksum {
     let episode = world.resource::<EpisodeState>();
     let input = world.resource::<CurrentInputFrame>();
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = StableHasher::new();
     clock.tick.hash(&mut hasher);
     clock.dt_seconds.to_bits().hash(&mut hasher);
     clock.elapsed_seconds.to_bits().hash(&mut hasher);
@@ -777,7 +817,115 @@ pub fn default_checksum(world: &World) -> StateChecksum {
 
     StateChecksum {
         tick: clock.tick,
-        hash: hasher.finish(),
+        hash: hasher.finish_hash(),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StableHasher {
+    state: u64,
+}
+
+impl StableHasher {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            state: Self::OFFSET,
+        }
+    }
+
+    pub fn write_stable_bytes(&mut self, bytes: &[u8]) {
+        self.write_u64(bytes.len() as u64);
+        self.write(bytes);
+    }
+
+    pub fn write_string(&mut self, value: &str) {
+        self.write_stable_bytes(value.as_bytes());
+    }
+
+    pub fn write_bool_value(&mut self, value: bool) {
+        self.write_u8(u8::from(value));
+    }
+
+    pub fn write_f32_value(&mut self, value: f32) {
+        self.write_u32(value.to_bits());
+    }
+
+    pub fn write_f64_value(&mut self, value: f64) {
+        self.write_u64(value.to_bits());
+    }
+
+    pub fn write_json(&mut self, value: &serde_json::Value) {
+        hash_json_into(value, self);
+    }
+
+    #[must_use]
+    pub const fn finish_hash(&self) -> u64 {
+        self.state
+    }
+}
+
+impl Default for StableHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Hasher for StableHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.state ^= u64::from(*byte);
+            self.state = self.state.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.finish_hash()
+    }
+}
+
+#[must_use]
+pub fn stable_hash_json(value: &serde_json::Value) -> u64 {
+    let mut hasher = StableHasher::new();
+    hasher.write_json(value);
+    hasher.finish_hash()
+}
+
+fn hash_json_into(value: &serde_json::Value, hasher: &mut StableHasher) {
+    match value {
+        serde_json::Value::Null => hasher.write_u8(0),
+        serde_json::Value::Bool(value) => {
+            hasher.write_u8(1);
+            hasher.write_bool_value(*value);
+        }
+        serde_json::Value::Number(value) => {
+            hasher.write_u8(2);
+            hasher.write_string(&value.to_string());
+        }
+        serde_json::Value::String(value) => {
+            hasher.write_u8(3);
+            hasher.write_string(value);
+        }
+        serde_json::Value::Array(values) => {
+            hasher.write_u8(4);
+            hasher.write_u64(values.len() as u64);
+            for value in values {
+                hash_json_into(value, hasher);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            hasher.write_u8(5);
+            hasher.write_u64(values.len() as u64);
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys {
+                hasher.write_string(key);
+                hash_json_into(&values[key], hasher);
+            }
+        }
     }
 }
 
@@ -823,6 +971,36 @@ mod tests {
 
         queue.clear();
         assert!(queue.pending.is_empty());
+    }
+
+    #[test]
+    fn custom_action_schemas_register_in_catalog() {
+        let mut app = App::new();
+        app.register_custom_action_schema(
+            "Input",
+            serde_json::json!({
+                "type": "object",
+                "required": ["type"],
+                "properties": { "type": { "const": "Input" } }
+            }),
+        );
+
+        let catalog = app.world().resource::<AgentActionCatalog>();
+        assert!(catalog.custom_actions.contains_key("Input"));
+        assert_eq!(
+            catalog.custom_actions["Input"].schema["properties"]["type"]["const"],
+            "Input"
+        );
+    }
+
+    #[test]
+    fn stable_json_hash_sorts_object_keys() {
+        let a = serde_json::json!({ "b": 2, "a": [true, null] });
+        let b = serde_json::json!({ "a": [true, null], "b": 2 });
+        let c = serde_json::json!({ "a": [true, null], "b": 3 });
+
+        assert_eq!(stable_hash_json(&a), stable_hash_json(&b));
+        assert_ne!(stable_hash_json(&a), stable_hash_json(&c));
     }
 
     #[test]

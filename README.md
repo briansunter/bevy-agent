@@ -5,7 +5,7 @@ A Bevy 0.18.1 workspace for driving a game as a deterministic simulation that an
 The implementation is split into small crates:
 
 - `bevy_agent_core`: schedules, `SimClock`, domain actions, input frames, observations, rewards, terminal state, checksums.
-- `bevy_agent_runner`: owns `App` and exposes `reset`, `step`, `step_many`, `fast_forward`, `snapshot`, `restore`, `restore_tick`, `branch`, and visual capture hooks.
+- `bevy_agent_runner`: owns `App`, provides `AgentControlPlugins`, and exposes `reset`, `step`, `step_many`, `fast_forward`, `snapshot`, `restore`, `restore_tick`, `branch`, and visual capture hooks.
 - `bevy_agent_snapshot`: tier-1 gameplay snapshots with registered resources/components and `StableEntityId`.
 - `bevy_agent_replay`: action logs, checkpoint indexes, and timeline branches.
 - `bevy_agent_remote`: local JSON-RPC bridge with capability and session-token checks.
@@ -25,6 +25,15 @@ env.step(AgentAction::Jump)?;
 env.restore(snapshot.snapshot_id)?;
 let alternate = env.step(AgentAction::Noop)?;
 # anyhow::Ok(())
+```
+
+Install the standard Bevy agent stack with a plugin group:
+
+```rust
+use bevy_agent_runner::AgentControlPlugins;
+
+app.add_plugins(AgentControlPlugins::deterministic())
+    .add_plugins(GamePlugin);
 ```
 
 Run the sample agent:
@@ -129,7 +138,8 @@ Gameplay systems that need replayable behavior should:
 - read `SimClock`, not wall-clock `Time`;
 - consume `CurrentInputFrame<AgentAction>`, not keyboard/mouse state directly;
 - use stable IDs for semantic entity identity;
-- register all gameplay state with `SnapshotAppExt`;
+- register all gameplay state with `SnapshotAppExt` or the snapshot registration macros;
+- use `StableHasher` or an equivalent deterministic checksum path for replay validation;
 - keep rendering/UI systems read-only with respect to authoritative simulation state.
 
 The sample platformer follows this contract: movement, gravity, collision, coin pickup, reward, terminal checks, observation extraction, snapshots, replay, and branches all run headlessly under explicit agent control.

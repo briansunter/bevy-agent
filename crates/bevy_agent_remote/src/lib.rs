@@ -1,13 +1,13 @@
 //! JSON-RPC, HTTP, WebSocket, and stdio remote-control bridge for agent apps.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use bevy_agent_core::{AgentAction, ControlMode, ObservationMode, SnapshotId};
+use bevy_agent_core::{AgentAction, AgentActionCatalog, ControlMode, ObservationMode, SnapshotId};
 use bevy_agent_replay::{ReplayLog, ReplayRecorder, start_recording, stop_recording};
 use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions, VisualCaptureOptions};
 use bevy_agent_snapshot::SnapshotStore;
@@ -49,7 +49,6 @@ impl Default for AgentCapability {
 
 #[derive(Clone, Debug)]
 pub struct RemoteSecurity {
-    pub bind_host: String,
     pub session_token: Option<String>,
     pub capabilities: AgentCapability,
 }
@@ -57,7 +56,6 @@ pub struct RemoteSecurity {
 impl Default for RemoteSecurity {
     fn default() -> Self {
         Self {
-            bind_host: "127.0.0.1".to_string(),
             session_token: None,
             capabilities: AgentCapability::default(),
         }
@@ -219,7 +217,7 @@ fn return_all() -> String {
 }
 
 impl JsonRpcBridge {
-    #[must_use] 
+    #[must_use]
     pub fn new(security: RemoteSecurity) -> Self {
         Self { security }
     }
@@ -281,22 +279,30 @@ impl JsonRpcBridge {
                 "tick": env.current_tick(),
                 "capabilities": self.security.capabilities.bits(),
             })),
-            "agent.action_space" => Ok(json!({
-                "type": "json_schema",
-                "actions": ["Noop", "Move", "Look", "Jump", "Crouch", "Sprint", "Interact", "Attack", "UseItem", "Dodge", "Custom"],
-                "schema": agent_action_schema()
-            })),
+            "agent.action_space" => {
+                let catalog = env.world().get_resource::<AgentActionCatalog>();
+                Ok(json!({
+                    "type": "json_schema",
+                    "actions": ["Noop", "Move", "Look", "Jump", "Crouch", "Sprint", "Interact", "Attack", "UseItem", "Dodge", "Custom"],
+                    "schema": agent_action_schema_with_custom_actions(catalog),
+                    "custom_actions": custom_action_schema_map(catalog),
+                }))
+            }
             "agent.observation_space" => Ok(json!({
                 "modes": ["PlayerKnowledge", "FullDebugState", "DiffSinceLastTick", "PixelFrame", "Hybrid"],
                 "default": "Hybrid",
                 "schema": observation_schema()
             })),
-            "agent.schema" => Ok(json!({
-                "action": agent_action_schema(),
-                "observation": observation_schema(),
-                "step_response": step_response_schema(),
-                "visual_capture": visual_capture_schema(),
-            })),
+            "agent.schema" => {
+                let catalog = env.world().get_resource::<AgentActionCatalog>();
+                Ok(json!({
+                    "action": agent_action_schema_with_custom_actions(catalog),
+                    "custom_actions": custom_action_schema_map(catalog),
+                    "observation": observation_schema(),
+                    "step_response": step_response_schema(),
+                    "visual_capture": visual_capture_schema(),
+                }))
+            }
             "agent.reset" => {
                 self.require_capability(AgentCapability::STEP)?;
                 let params: ResetParams = serde_json::from_value(request.params)?;
@@ -581,8 +587,14 @@ fn token_from_params(params: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-#[must_use] 
+#[must_use]
 pub fn agent_action_schema() -> Value {
+    agent_action_schema_with_custom_actions(None)
+}
+
+#[must_use]
+pub fn agent_action_schema_with_custom_actions(catalog: Option<&AgentActionCatalog>) -> Value {
+    let custom_value_schema = custom_action_value_schema(catalog);
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "AgentAction",
@@ -597,12 +609,39 @@ pub fn agent_action_schema() -> Value {
             { "type": "object", "required": ["type"], "properties": { "type": { "const": "Attack" }, "target": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] } }, "additionalProperties": false },
             { "type": "object", "required": ["type", "slot"], "properties": { "type": { "const": "UseItem" }, "slot": { "type": "integer", "minimum": 0, "maximum": 255 } }, "additionalProperties": false },
             { "type": "object", "required": ["type"], "properties": { "type": { "const": "Dodge" } }, "additionalProperties": false },
-            { "type": "object", "required": ["type", "value"], "properties": { "type": { "const": "Custom" }, "value": true }, "additionalProperties": false }
+            { "type": "object", "required": ["type", "value"], "properties": { "type": { "const": "Custom" }, "value": custom_value_schema }, "additionalProperties": false }
         ]
     })
 }
 
-#[must_use] 
+#[must_use]
+pub fn custom_action_schema_map(catalog: Option<&AgentActionCatalog>) -> Value {
+    let mut map = serde_json::Map::new();
+    if let Some(catalog) = catalog {
+        for (name, schema) in &catalog.custom_actions {
+            map.insert(name.clone(), schema.schema.clone());
+        }
+    }
+    Value::Object(map)
+}
+
+fn custom_action_value_schema(catalog: Option<&AgentActionCatalog>) -> Value {
+    let Some(catalog) = catalog else {
+        return Value::Bool(true);
+    };
+    if catalog.custom_actions.is_empty() {
+        return Value::Bool(true);
+    }
+    json!({
+        "oneOf": catalog
+            .custom_actions
+            .values()
+            .map(|schema| schema.schema.clone())
+            .collect::<Vec<_>>()
+    })
+}
+
+#[must_use]
 pub fn observation_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -610,6 +649,9 @@ pub fn observation_schema() -> Value {
         "oneOf": [
             { "$ref": "#/$defs/symbolicObservationEnvelope" },
             { "$ref": "#/$defs/hybridObservation" },
+            { "$ref": "#/$defs/fullStateObservation" },
+            { "$ref": "#/$defs/deltaObservation" },
+            { "$ref": "#/$defs/pixelObservation" },
             { "type": "object", "required": ["kind", "message"], "properties": { "kind": { "const": "Error" }, "message": { "type": "string" } } }
         ],
         "$defs": {
@@ -633,6 +675,33 @@ pub fn observation_schema() -> Value {
                     "symbolic": { "$ref": "#/$defs/symbolic" },
                     "pixels": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
                     "debug": { "anyOf": [{ "type": "object" }, { "type": "null" }] }
+                }
+            },
+            "fullStateObservation": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {
+                    "kind": { "const": "FullState" }
+                },
+                "additionalProperties": true
+            },
+            "deltaObservation": {
+                "type": "object",
+                "required": ["kind", "tick", "changes"],
+                "properties": {
+                    "kind": { "const": "Delta" },
+                    "tick": { "type": "integer", "minimum": 0 },
+                    "changes": true
+                }
+            },
+            "pixelObservation": {
+                "type": "object",
+                "required": ["kind", "width", "height", "rgba"],
+                "properties": {
+                    "kind": { "const": "Pixels" },
+                    "width": { "type": "integer", "minimum": 1 },
+                    "height": { "type": "integer", "minimum": 1 },
+                    "rgba": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } }
                 }
             },
             "symbolic": {
@@ -672,7 +741,7 @@ pub fn observation_schema() -> Value {
     })
 }
 
-#[must_use] 
+#[must_use]
 pub fn step_response_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -691,7 +760,7 @@ pub fn step_response_schema() -> Value {
     })
 }
 
-#[must_use] 
+#[must_use]
 pub fn visual_capture_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -726,6 +795,10 @@ impl HttpRemoteServer {
     pub fn serve(&self, env: &mut AgentApp) -> Result<()> {
         let listener = TcpListener::bind(&self.bind_addr)
             .with_context(|| format!("binding {}", self.bind_addr))?;
+        let local_addr = listener
+            .local_addr()
+            .with_context(|| format!("reading bound address for {}", self.bind_addr))?;
+        require_safe_bind(local_addr, &self.bridge.security)?;
         eprintln!(
             "bevy_agent_remote listening on http://{}/rpc",
             self.bind_addr
@@ -811,6 +884,16 @@ impl HttpRemoteServer {
             }
         }
     }
+}
+
+fn require_safe_bind(local_addr: SocketAddr, security: &RemoteSecurity) -> Result<()> {
+    if security.session_token.is_none() && !local_addr.ip().is_loopback() {
+        return Err(anyhow!(
+            "refusing unauthenticated remote control on non-loopback bind {}; set a session token",
+            local_addr
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1060,9 +1143,56 @@ mod tests {
         assert!(action["oneOf"].as_array().unwrap().len() >= 10);
         assert_eq!(observation["title"], "Observation");
         assert!(observation["$defs"]["player"].is_object());
+        assert!(observation["$defs"]["pixelObservation"].is_object());
+        assert!(observation["$defs"]["deltaObservation"].is_object());
+        assert!(observation["$defs"]["fullStateObservation"].is_object());
         assert_eq!(step["title"], "StepResponse");
         assert_eq!(visual["title"], "VisualCapture");
         assert_eq!(visual["properties"]["format"]["const"], "png");
+    }
+
+    #[test]
+    fn action_schema_includes_registered_custom_actions() {
+        let mut catalog = AgentActionCatalog::default();
+        catalog.register_custom_action_schema(
+            "Input",
+            serde_json::json!({
+                "type": "object",
+                "required": ["type"],
+                "properties": { "type": { "const": "Input" } }
+            }),
+        );
+
+        let action = agent_action_schema_with_custom_actions(Some(&catalog));
+        let custom_actions = custom_action_schema_map(Some(&catalog));
+
+        assert_eq!(
+            custom_actions["Input"]["properties"]["type"]["const"],
+            "Input"
+        );
+        assert_eq!(
+            action["oneOf"][10]["properties"]["value"]["oneOf"][0]["properties"]["type"]["const"],
+            "Input"
+        );
+    }
+
+    #[test]
+    fn unauthenticated_public_bind_is_rejected() {
+        let public: SocketAddr = "0.0.0.0:4000".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+
+        assert!(require_safe_bind(public, &RemoteSecurity::default()).is_err());
+        assert!(require_safe_bind(loopback, &RemoteSecurity::default()).is_ok());
+        assert!(
+            require_safe_bind(
+                public,
+                &RemoteSecurity {
+                    session_token: Some("secret".to_string()),
+                    ..Default::default()
+                },
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1207,7 +1337,10 @@ mod tests {
         });
         let (mut stream, _) = listener.accept().unwrap();
         let err = read_http_request(&mut stream).unwrap_err();
-        assert!(err.to_string().contains("exceed"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("exceed"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1225,7 +1358,10 @@ mod tests {
         let (mut stream, _) = listener.accept().unwrap();
         let err = read_http_request(&mut stream).unwrap_err();
         let _ = handle.join();
-        assert!(err.to_string().contains("exceeds limit"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("exceeds limit"),
+            "unexpected error: {err}"
+        );
     }
 
     fn masked_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {

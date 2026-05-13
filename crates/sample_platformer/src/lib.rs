@@ -1,20 +1,23 @@
 //! Headless sample platformer demonstrating `bevy_agent_control` integration.
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
 use anyhow::Result;
 use bevy::prelude::*;
 use bevy_agent_core::{
-    AgentAction, AgentControlAppExt, AgentControlPlugin, AgentControlState, AgentReset,
-    AgentResetSet, AgentSet, CurrentInputFrame, EntityObservation, EpisodeState,
-    ObjectiveObservation, Observation, ObservationMode, PlayerObservation, RewardState, SimClock,
-    SnapshotEntity, StableEntityId, StableIdAllocator, StateChecksum, SymbolicObservation,
+    AgentAction, AgentControlAppExt, AgentControlState, AgentReset, AgentResetSet, AgentSet,
+    CurrentInputFrame, EntityObservation, EpisodeState, ObjectiveObservation, Observation,
+    ObservationMode, PlayerObservation, RewardState, SimClock, SnapshotEntity, StableEntityId,
+    StableHasher, StableIdAllocator, StateChecksum, SymbolicObservation,
 };
-use bevy_agent_replay::AgentReplayPlugin;
 use bevy_agent_runner::{
-    VisualCaptureAppExt, VisualCaptureOptions, VisualCaptureResult, visual_capture_path,
+    AgentControlPlugins, VisualCaptureAppExt, VisualCaptureOptions, VisualCaptureResult,
+    visual_capture_path,
 };
-use bevy_agent_snapshot::{AgentSnapshotPlugin, SnapshotAppExt, clear_snapshot_entities};
+use bevy_agent_snapshot::{
+    SnapshotAppExt, clear_snapshot_entities, register_snapshot_components,
+    register_snapshot_resources,
+};
 use image::{Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 
@@ -88,20 +91,21 @@ impl Plugin for PlatformerPlugin {
         app.init_resource::<PlatformerConfig>()
             .init_resource::<GameScore>()
             .init_resource::<PlatformerState>()
-            .set_snapshot_metadata("sample_platformer", env!("CARGO_PKG_VERSION"))
-            .register_snapshot_component::<StableEntityId>()
-            .register_snapshot_component::<Transform>()
-            .register_snapshot_component::<Player>()
-            .register_snapshot_component::<Velocity>()
-            .register_snapshot_component::<Collider>()
-            .register_snapshot_component::<OnGround>()
-            .register_snapshot_component::<Platform>()
-            .register_snapshot_component::<Goal>()
-            .register_snapshot_component::<Coin>()
-            .register_snapshot_resource::<GameScore>()
-            .register_snapshot_resource::<PlatformerState>()
-            .register_snapshot_resource::<PlatformerConfig>()
-            .insert_observation_extractor(platformer_observation)
+            .set_snapshot_metadata("sample_platformer", env!("CARGO_PKG_VERSION"));
+        register_snapshot_components!(
+            app,
+            StableEntityId,
+            Transform,
+            Player,
+            Velocity,
+            Collider,
+            OnGround,
+            Platform,
+            Goal,
+            Coin,
+        );
+        register_snapshot_resources!(app, GameScore, PlatformerState, PlatformerConfig);
+        app.insert_observation_extractor(platformer_observation)
             .insert_checksum_extractor(platformer_checksum)
             .insert_visual_capture_renderer(platformer_visual_capture)
             .add_systems(AgentReset, reset_level.in_set(AgentResetSet::Game))
@@ -126,9 +130,7 @@ impl Plugin for PlatformerPlugin {
 pub fn build_headless_app() -> App {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
-        .add_plugins(AgentControlPlugin::deterministic())
-        .add_plugins(AgentSnapshotPlugin)
-        .add_plugins(AgentReplayPlugin)
+        .add_plugins(AgentControlPlugins::deterministic())
         .add_plugins(PlatformerPlugin);
     app
 }
@@ -149,9 +151,7 @@ pub fn build_visual_app() -> App {
             .set(ImagePlugin::default_nearest()),
     )
     .insert_resource(ClearColor(Color::srgb(0.08, 0.11, 0.16)))
-    .add_plugins(AgentControlPlugin::visual_debug())
-    .add_plugins(AgentSnapshotPlugin)
-    .add_plugins(AgentReplayPlugin)
+    .add_plugins(AgentControlPlugins::visual_debug())
     .add_plugins(PlatformerPlugin)
     .add_plugins(PlatformerVisualPlugin);
     app
@@ -676,7 +676,7 @@ fn platformer_checksum(world: &mut World) -> StateChecksum {
     let score = world.resource::<GameScore>().clone();
     let state = world.resource::<PlatformerState>().clone();
     let episode = world.resource::<EpisodeState>().clone();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = StableHasher::new();
 
     clock.tick.hash(&mut hasher);
     clock.dt_seconds.to_bits().hash(&mut hasher);
@@ -723,7 +723,7 @@ fn platformer_checksum(world: &mut World) -> StateChecksum {
 
     StateChecksum {
         tick: clock.tick,
-        hash: hasher.finish(),
+        hash: hasher.finish_hash(),
     }
 }
 

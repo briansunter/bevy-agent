@@ -5,14 +5,14 @@
 //! resources/components are serialized and restored.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
 use anyhow::{Context, Result, anyhow};
 use bevy::ecs::world::{EntityRef, EntityWorldMut};
 use bevy::prelude::*;
 use bevy_agent_core::{
     AgentAction, AgentActionQueue, AgentControlState, AgentSet, ScheduledAction, SimClock,
-    SnapshotEntity, SnapshotId, StableEntityId, StateChecksum, TimelineId,
+    SnapshotEntity, SnapshotId, StableEntityId, StableHasher, StateChecksum, TimelineId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -156,6 +156,26 @@ pub trait SnapshotAppExt {
     ) -> &mut Self;
 }
 
+#[macro_export]
+macro_rules! register_snapshot_components {
+    ($app:expr $(, $component:ty)+ $(,)?) => {{
+        use $crate::SnapshotAppExt as _;
+        $(
+            $app.register_snapshot_component::<$component>();
+        )+
+    }};
+}
+
+#[macro_export]
+macro_rules! register_snapshot_resources {
+    ($app:expr $(, $resource:ty)+ $(,)?) => {{
+        use $crate::SnapshotAppExt as _;
+        $(
+            $app.register_snapshot_resource::<$resource>();
+        )+
+    }};
+}
+
 impl SnapshotAppExt for App {
     fn register_snapshot_component<T>(&mut self) -> &mut Self
     where
@@ -230,7 +250,7 @@ impl SnapshotRegistry {
         );
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn schema_hash(&self) -> String {
         let mut names: Vec<_> = self
             .component_serializers
@@ -240,11 +260,11 @@ impl SnapshotRegistry {
             .collect();
         names.sort_unstable();
 
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = StableHasher::new();
         for name in names {
             name.hash(&mut hasher);
         }
-        format!("{:016x}", hasher.finish())
+        format!("{:016x}", hasher.finish_hash())
     }
 }
 
@@ -522,29 +542,29 @@ pub fn lookup_snapshot_by_label(world: &World, label: &str) -> Option<SnapshotId
 }
 
 pub fn checksum_snapshot(snapshot: &Snapshot) -> Result<StateChecksum> {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = StableHasher::new();
     snapshot.clock.tick.hash(&mut hasher);
     snapshot.clock.dt_seconds.to_bits().hash(&mut hasher);
     snapshot.clock.elapsed_seconds.to_bits().hash(&mut hasher);
 
     for resource in &snapshot.resources {
         resource.type_name.hash(&mut hasher);
-        serde_json::to_string(&resource.value)?.hash(&mut hasher);
+        hasher.write_json(&resource.value);
     }
     for entity in &snapshot.entities {
         entity.stable_id.hash(&mut hasher);
         for component in &entity.components {
             component.type_name.hash(&mut hasher);
-            serde_json::to_string(&component.value)?.hash(&mut hasher);
+            hasher.write_json(&component.value);
         }
     }
     for action in &snapshot.action_queue {
-        serde_json::to_string(action)?.hash(&mut hasher);
+        hasher.write_json(&serde_json::to_value(action)?);
     }
 
     Ok(StateChecksum {
         tick: snapshot.clock.tick,
-        hash: hasher.finish(),
+        hash: hasher.finish_hash(),
     })
 }
 
@@ -611,11 +631,11 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(AgentControlPlugin::deterministic())
             .add_plugins(AgentSnapshotPlugin)
-            .register_snapshot_component::<TestComponent>()
-            .register_snapshot_resource::<TestResource>()
             .insert_resource(TestResource {
                 value: "initial".to_string(),
             });
+        register_snapshot_components!(app, TestComponent);
+        register_snapshot_resources!(app, TestResource);
         app.finish();
         app.cleanup();
         app
@@ -632,6 +652,28 @@ mod tests {
         b.register_component::<StableEntityId>();
 
         assert_eq!(a.schema_hash(), b.schema_hash());
+    }
+
+    #[test]
+    fn snapshot_registration_macros_register_types() {
+        let mut app = App::new();
+        app.add_plugins(AgentControlPlugin::deterministic())
+            .add_plugins(AgentSnapshotPlugin);
+
+        register_snapshot_components!(app, TestComponent);
+        register_snapshot_resources!(app, TestResource);
+
+        let registry = app.world().resource::<SnapshotRegistry>();
+        assert!(
+            registry
+                .component_serializers
+                .contains_key(std::any::type_name::<TestComponent>())
+        );
+        assert!(
+            registry
+                .resource_serializers
+                .contains_key(std::any::type_name::<TestResource>())
+        );
     }
 
     #[test]

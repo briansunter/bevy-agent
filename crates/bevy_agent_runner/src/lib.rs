@@ -3,16 +3,108 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
+use bevy::app::{PluginGroup, PluginGroupBuilder};
 use bevy::prelude::*;
 use bevy_agent_core::{
-    ActionSource, AgentAction, AgentActionQueue, AgentControlState, AgentPostTick, AgentPreTick,
-    AgentReset, AgentTick, ControlMode, CurrentInputFrame, DeterministicRng, EpisodeState,
-    LastStepResponse, Observation, ObservationConfig, ObservationMode, RewardState, SimClock,
-    SnapshotId, StepResponse, collect_observation,
+    ActionSource, AgentAction, AgentActionQueue, AgentControlPlugin, AgentControlState,
+    AgentPostTick, AgentPreTick, AgentReset, AgentTick, ControlMode, CurrentInputFrame,
+    DeterministicRng, EpisodeState, LastStepResponse, Observation, ObservationConfig,
+    ObservationMode, RewardState, SimClock, SnapshotId, StepResponse, collect_observation,
 };
-use bevy_agent_replay::{ReplayLog, ReplayRecorder, Timeline};
-use bevy_agent_snapshot::{SnapshotCreateResult, SnapshotStore, create_snapshot, restore_snapshot};
+use bevy_agent_replay::{AgentReplayPlugin, ReplayLog, ReplayRecorder, Timeline};
+use bevy_agent_snapshot::{
+    AgentSnapshotPlugin, SnapshotCreateResult, SnapshotPolicy, SnapshotStore, create_snapshot,
+    restore_snapshot,
+};
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug)]
+pub struct AgentControlPlugins {
+    control: AgentControlPlugin,
+    snapshots: bool,
+    replay: bool,
+    snapshot_policy: Option<SnapshotPolicy>,
+}
+
+impl AgentControlPlugins {
+    #[must_use]
+    pub fn deterministic() -> Self {
+        Self {
+            control: AgentControlPlugin::deterministic(),
+            snapshots: true,
+            replay: true,
+            snapshot_policy: None,
+        }
+    }
+
+    #[must_use]
+    pub fn visual_debug() -> Self {
+        Self {
+            control: AgentControlPlugin::visual_debug(),
+            snapshots: true,
+            replay: true,
+            snapshot_policy: None,
+        }
+    }
+
+    #[must_use]
+    pub fn remote() -> Self {
+        Self {
+            control: AgentControlPlugin::remote(),
+            snapshots: true,
+            replay: true,
+            snapshot_policy: None,
+        }
+    }
+
+    #[must_use]
+    pub fn without_snapshots(mut self) -> Self {
+        self.snapshots = false;
+        self
+    }
+
+    #[must_use]
+    pub fn without_replay(mut self) -> Self {
+        self.replay = false;
+        self
+    }
+
+    #[must_use]
+    pub fn with_snapshot_policy(mut self, policy: SnapshotPolicy) -> Self {
+        self.snapshot_policy = Some(policy);
+        self
+    }
+}
+
+impl Default for AgentControlPlugins {
+    fn default() -> Self {
+        Self::deterministic()
+    }
+}
+
+impl PluginGroup for AgentControlPlugins {
+    fn build(self) -> PluginGroupBuilder {
+        let mut builder = PluginGroupBuilder::start::<Self>().add(self.control);
+        if self.snapshots {
+            builder = builder.add(AgentSnapshotPlugin);
+            if let Some(policy) = self.snapshot_policy {
+                builder = builder.add(AgentSnapshotPolicyPlugin(policy));
+            }
+        }
+        if self.replay {
+            builder = builder.add(AgentReplayPlugin);
+        }
+        builder
+    }
+}
+
+struct AgentSnapshotPolicyPlugin(SnapshotPolicy);
+
+impl Plugin for AgentSnapshotPolicyPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(self.0.clone());
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResetOptions {
@@ -109,7 +201,7 @@ impl VisualCaptureAppExt for App {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn sanitized_capture_label(label: Option<&str>) -> String {
     let label = label.unwrap_or("capture");
     let mut sanitized = String::new();
@@ -615,6 +707,17 @@ mod tests {
         app
     }
 
+    fn grouped_agent_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins).add_plugins(
+            AgentControlPlugins::deterministic().with_snapshot_policy(SnapshotPolicy {
+                checkpoint_every_ticks: 7,
+                ..Default::default()
+            }),
+        );
+        app
+    }
+
     #[test]
     fn reset_without_snapshot_plugin_returns_observation() {
         let mut env = AgentApp::new(core_only_app);
@@ -638,6 +741,21 @@ mod tests {
 
         assert_eq!(response.tick, 1);
         assert_eq!(response.info.actions_applied, 1);
+    }
+
+    #[test]
+    fn plugin_group_installs_core_snapshot_replay_and_policy() {
+        let mut env = AgentApp::new(grouped_agent_app);
+        env.reset(ResetOptions::default()).unwrap();
+
+        assert!(env.world().contains_resource::<SnapshotStore>());
+        assert!(env.world().contains_resource::<ReplayRecorder>());
+        assert_eq!(
+            env.world()
+                .resource::<SnapshotPolicy>()
+                .checkpoint_every_ticks,
+            7
+        );
     }
 
     #[test]
