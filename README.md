@@ -5,7 +5,7 @@ A Bevy 0.18.1 workspace for driving a game as a deterministic simulation that an
 The implementation is split into small crates:
 
 - `bevy_agent_core`: schedules, `SimClock`, domain actions, input frames, observations, rewards, terminal state, checksums.
-- `bevy_agent_runner`: owns `App` and exposes `reset`, `step`, `step_many`, `fast_forward`, `snapshot`, `restore`, `restore_tick`, and `branch`.
+- `bevy_agent_runner`: owns `App` and exposes `reset`, `step`, `step_many`, `fast_forward`, `snapshot`, `restore`, `restore_tick`, `branch`, and visual capture hooks.
 - `bevy_agent_snapshot`: tier-1 gameplay snapshots with registered resources/components and `StableEntityId`.
 - `bevy_agent_replay`: action logs, checkpoint indexes, and timeline branches.
 - `bevy_agent_remote`: local JSON-RPC bridge with capability and session-token checks.
@@ -45,6 +45,7 @@ Drive it with the CLI:
 cargo run -p agentctl -- info
 cargo run -p agentctl -- reset --seed 42
 cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
+cargo run -p agentctl -- capture --out-dir screenshots --label after_step
 cargo run -p agentctl -- snapshot
 cargo run -p agentctl -- replay-export replay.json
 ```
@@ -59,6 +60,7 @@ obs = env.reset(seed=42)
 step = env.step({"type": "Move", "x": 1.0, "y": 0.0})
 snapshot = env.snapshot()
 env.restore(snapshot["snapshot_id"])
+capture = env.capture(output_dir="screenshots", label="after_restore")
 ```
 
 Run the tests:
@@ -71,6 +73,25 @@ Check optional visual/render dependencies still compile:
 
 ```sh
 cargo check --workspace --all-features
+```
+
+## Low-Speed Agent Play With Screenshots
+
+Agents can play at their own pace by alternating structured steps with on-demand captures:
+
+```sh
+cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
+cargo run -p agentctl -- reset --seed 42
+cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
+cargo run -p agentctl -- capture --out-dir screenshots --label tick_1
+```
+
+`agent.visual.capture` returns a PNG path plus tick/frame/size metadata. Games can register a software capture renderer for headless runs, as the sample platformer does, or use Bevy primary-window screenshots in `visual` builds.
+
+Start the sample with visual/render features when you want render plugins and primary-window screenshot support compiled in:
+
+```sh
+cargo run -p sample_platformer --features visual --example remote_http_visual -- 127.0.0.1:4000
 ```
 
 ## JSON-RPC Example
@@ -93,6 +114,7 @@ The sample also includes:
 
 - `remote_stdio`: JSON-RPC over newline-delimited stdin/stdout.
 - `remote_http`: HTTP `POST /rpc`, `GET /health`, and WebSocket JSON-RPC at `GET /ws`.
+- `remote_http_visual`: visual-feature remote with render plugins and primary-window screenshot support.
 - `agentctl`: a small HTTP client for common commands.
 - `python/bevy_agent_client.py`: a stdlib Python wrapper.
 - `docs/controllable-game.md`: integration checklist for games.

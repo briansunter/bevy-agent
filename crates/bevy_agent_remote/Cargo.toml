@@ -10,6 +10,10 @@ documentation = "https://docs.rs/bevy_agent_remote"
 keywords = ["bevy", "gamedev", "json-rpc", "agent"]
 categories = ["game-development", "network-programming"]
 
+[features]
+default = []
+visual = ["bevy_agent_runner/visual"]
+
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true

@@ -82,6 +82,21 @@ class AgentClient:
     def observe(self, observation_mode: str = "Hybrid") -> Any:
         return self.call("agent.observe", {"observation_mode": observation_mode})
 
+    def capture(
+        self,
+        output_dir: str = "screenshots",
+        label: str | None = None,
+        timeout_frames: int = 8,
+    ) -> Any:
+        return self.call(
+            "agent.visual.capture",
+            {
+                "output_dir": output_dir,
+                "label": label,
+                "timeout_frames": timeout_frames,
+            },
+        )
+
     def snapshot(self) -> Any:
         return self.call("agent.snapshot.create")
 

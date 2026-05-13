@@ -394,6 +394,65 @@ fn remote_rejects_missing_token_and_missing_capability() {
 }
 
 #[test]
+fn remote_visual_capture_writes_png_file() {
+    let mut env = make_env();
+    let bridge = JsonRpcBridge::default();
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.reset","params":{"options":{"seed":1,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,
+    );
+    bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.step","params":{"action":{"type":"Move","x":1.0,"y":0.0}}}"#,
+    );
+
+    let output_dir = capture_temp_dir();
+    let response = bridge.handle_json(
+        &mut env,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "agent.visual.capture",
+            "params": {
+                "output_dir": output_dir,
+                "label": "after step"
+            }
+        })
+        .to_string(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let path = PathBuf::from(value["result"]["path"].as_str().unwrap());
+
+    assert_eq!(value["result"]["tick"], 1);
+    assert_eq!(value["result"]["format"], "png");
+    assert!(value["result"]["width"].as_u64().unwrap() > 0);
+    assert!(std::fs::metadata(&path).unwrap().len() > 0);
+
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn remote_visual_capture_requires_capability() {
+    let mut env = make_env();
+    let bridge = JsonRpcBridge::new(RemoteSecurity {
+        capabilities: AgentCapability::STEP,
+        ..Default::default()
+    });
+    let response = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.visual.capture","params":{}}"#,
+    );
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing remote capability")
+    );
+}
+
+#[test]
 fn remote_control_pause_resume_and_set_mode_update_control_state() {
     let mut env = make_env();
     let bridge = JsonRpcBridge::default();
@@ -612,6 +671,19 @@ fn replay_temp_path() -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
         "bevy-agent-replay-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    path
+}
+
+fn capture_temp_dir() -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "bevy-agent-capture-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

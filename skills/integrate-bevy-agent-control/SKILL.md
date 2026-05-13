@@ -1,6 +1,6 @@
 ---
 name: integrate-bevy-agent-control
-description: "Integrate bevy_agent_control into a Bevy game so AI agents can control deterministic simulation ticks. Use when Codex is modifying or scaffolding a Bevy game, separating authoritative gameplay from rendering, defining serializable domain actions, converting keyboard/gamepad/network/test input into action frames, moving gameplay systems into AgentTick, using CurrentInputFrame and SimClock, registering snapshot state, writing symbolic observations and checksums, exposing localhost JSON-RPC or stdio control, or testing replay/snapshot determinism."
+description: "Integrate bevy_agent_control into a Bevy game so AI agents can control deterministic simulation ticks. Use when Codex is modifying or scaffolding a Bevy game, separating authoritative gameplay from rendering, defining serializable domain actions, converting keyboard/gamepad/network/test input into action frames, moving gameplay systems into AgentTick, using CurrentInputFrame and SimClock, registering snapshot state, writing symbolic observations and checksums, exposing visual screenshot capture, exposing localhost JSON-RPC or stdio control, or testing replay/snapshot determinism."
 metadata:
   short-description: Make Bevy games agent-controllable
 ---
@@ -26,6 +26,7 @@ A good integration has:
 - snapshot registration for every gameplay component/resource needed to resume;
 - stable IDs for entities visible in observations, actions, replays, and snapshots;
 - compact symbolic observations plus optional privileged debug fields;
+- optional on-demand PNG visual capture for agent inspection;
 - checksums over all state that can affect future simulation;
 - remote control bound to localhost by default with token/capability checks.
 
@@ -43,8 +44,9 @@ A good integration has:
 10. Register gameplay components and resources for snapshot/restore.
 11. Add a reset system that recreates a clean playable state from seed/options.
 12. Add an observation extractor and a checksum extractor.
-13. Expose HTTP or stdio control only after local stepping works.
-14. Add tests for step, batch step, action scheduling, snapshot/restore, replay, branch, remote schema, and determinism.
+13. Add a visual capture renderer if agents need screenshots in headless runs.
+14. Expose HTTP or stdio control only after local stepping works.
+15. Add tests for step, batch step, action scheduling, snapshot/restore, replay, branch, remote schema, visual capture, and determinism.
 
 ## Minimal Shape
 
@@ -81,6 +83,7 @@ impl Plugin for GamePlugin {
 When converting an existing Bevy game:
 
 - keep rendering systems in `Update`, but make them read simulation state rather than mutate rules;
+- use `VisualCaptureAppExt::insert_visual_capture_renderer` for headless screenshots, or enable the runner `visual` feature for Bevy primary-window screenshots;
 - move random decisions behind a seeded gameplay RNG resource and register it for snapshots;
 - move timers that affect gameplay to tick counters or `SimClock`;
 - replace raw `Entity` IDs in observations/actions with stable IDs;
@@ -97,6 +100,7 @@ Reject or revise integrations that:
 - use raw Bevy `Entity` IDs as semantic identity in observations, actions, snapshots, or replay logs;
 - omit gameplay resources/components from snapshot registration;
 - compute observations by dumping excessive ECS state when compact symbolic state would work;
+- implement screenshot capture by mutating gameplay state or adding visual state to checksums;
 - expose mutation or restore over remote control without a session token and capabilities;
 - validate only through visuals instead of `tick`, `reward`, terminal flags, observation fields, and checksum.
 
@@ -118,6 +122,7 @@ Add or update tests for:
 - branch creation does not mutate the parent timeline;
 - reset with the same seed produces the same initial observation/checksum;
 - observation policy hides state that should not be visible to the player;
+- `agent.visual.capture` writes a non-empty PNG and enforces token/capability checks;
 - remote methods return valid JSON-RPC schemas and enforce token/capabilities.
 
 ## References

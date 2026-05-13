@@ -4314,6 +4314,7 @@ dependencies = [
  "bevy_agent_replay",
  "bevy_agent_runner",
  "bevy_agent_snapshot",
+ "image",
  "serde",
  "serde_json",
 ]

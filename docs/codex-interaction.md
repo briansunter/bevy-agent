@@ -21,6 +21,14 @@ cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
 cargo run -p agentctl -- step-many '[{"type":"Move","x":1.0,"y":0.0},{"type":"Jump"}]'
 ```
 
+Capture visual state on demand:
+
+```sh
+cargo run -p agentctl -- capture --out-dir screenshots --label tick_1
+```
+
+For low-speed visual play, alternate one `step` command with `capture`, inspect the symbolic response and PNG, then choose the next domain action. The sample platformer can write capture PNGs from the headless HTTP runtime; visual builds can also use Bevy primary-window screenshots.
+
 Snapshot, restore, and branch:
 
 ```sh

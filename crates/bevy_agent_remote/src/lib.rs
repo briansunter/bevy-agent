@@ -8,7 +8,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bevy_agent_core::{AgentAction, ControlMode, ObservationMode, SnapshotId};
 use bevy_agent_replay::{ReplayLog, ReplayRecorder, start_recording, stop_recording};
-use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions};
+use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions, VisualCaptureOptions};
 use bevy_agent_snapshot::SnapshotStore;
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,7 @@ bitflags! {
         const RESTORE = 1 << 5;
         const BRANCH = 1 << 6;
         const SPAWN_DESPAWN = 1 << 7;
+        const VISUAL_CAPTURE = 1 << 8;
     }
 }
 
@@ -37,6 +38,7 @@ impl Default for AgentCapability {
             | Self::SNAPSHOT
             | Self::RESTORE
             | Self::BRANCH
+            | Self::VISUAL_CAPTURE
     }
 }
 
@@ -191,6 +193,18 @@ struct ReplayLoadParams {
     pub session_token: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct VisualCaptureParams {
+    #[serde(default)]
+    pub output_dir: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub timeout_frames: Option<u32>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -275,6 +289,7 @@ impl JsonRpcBridge {
                 "action": agent_action_schema(),
                 "observation": observation_schema(),
                 "step_response": step_response_schema(),
+                "visual_capture": visual_capture_schema(),
             })),
             "agent.reset" => {
                 self.require_capability(AgentCapability::STEP)?;
@@ -350,6 +365,22 @@ impl JsonRpcBridge {
                 let params: ObserveParams = serde_json::from_value(request.params)?;
                 self.check_token(params.session_token.as_deref())?;
                 Ok(serde_json::to_value(env.observe(params.observation_mode)?)?)
+            }
+            "agent.visual.capture" => {
+                self.require_capability(AgentCapability::VISUAL_CAPTURE)?;
+                let params: VisualCaptureParams = serde_json::from_value(request.params)?;
+                self.check_token(params.session_token.as_deref())?;
+                let mut options = VisualCaptureOptions::default();
+                if let Some(output_dir) = params.output_dir {
+                    options.output_dir = output_dir;
+                }
+                if params.label.is_some() {
+                    options.label = params.label;
+                }
+                if let Some(timeout_frames) = params.timeout_frames {
+                    options.timeout_frames = timeout_frames;
+                }
+                Ok(serde_json::to_value(env.capture_visual(options)?)?)
             }
             "agent.snapshot.create" => {
                 self.require_capability(AgentCapability::SNAPSHOT)?;
@@ -629,6 +660,23 @@ pub fn step_response_schema() -> Value {
             "truncated": { "type": "boolean" },
             "info": { "type": "object" },
             "checksum": { "anyOf": [{ "type": "object" }, { "type": "null" }] }
+        }
+    })
+}
+
+pub fn visual_capture_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "VisualCapture",
+        "type": "object",
+        "required": ["tick", "frame", "path", "width", "height", "format"],
+        "properties": {
+            "tick": { "type": "integer", "minimum": 0 },
+            "frame": { "type": "integer", "minimum": 0 },
+            "path": { "type": "string" },
+            "width": { "type": "integer", "minimum": 1 },
+            "height": { "type": "integer", "minimum": 1 },
+            "format": { "const": "png" }
         }
     })
 }
@@ -966,12 +1014,15 @@ mod tests {
         let action = agent_action_schema();
         let observation = observation_schema();
         let step = step_response_schema();
+        let visual = visual_capture_schema();
 
         assert_eq!(action["title"], "AgentAction");
         assert!(action["oneOf"].as_array().unwrap().len() >= 10);
         assert_eq!(observation["title"], "Observation");
         assert!(observation["$defs"]["player"].is_object());
         assert_eq!(step["title"], "StepResponse");
+        assert_eq!(visual["title"], "VisualCapture");
+        assert_eq!(visual["properties"]["format"]["const"], "png");
     }
 
     #[test]

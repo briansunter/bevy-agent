@@ -17,6 +17,7 @@ cargo run -p agentctl -- observation-space
 cargo run -p agentctl -- schema
 cargo run -p agentctl -- reset --seed 42
 cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
+cargo run -p agentctl -- capture --out-dir screenshots --label tick_1
 cargo run -p agentctl -- fast-forward 30
 cargo run -p agentctl -- snapshot
 cargo run -p agentctl -- snapshots
@@ -47,6 +48,7 @@ Core methods:
 - `agent.step_many`
 - `agent.fast_forward`
 - `agent.observe`
+- `agent.visual.capture`
 - `agent.snapshot.create`
 - `agent.snapshot.restore`
 - `agent.snapshot.list`
@@ -131,6 +133,21 @@ Reset:
 }
 ```
 
+Capture:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "agent.visual.capture",
+  "params": {
+    "output_dir": "screenshots",
+    "label": "tick_1",
+    "timeout_frames": 8
+  }
+}
+```
+
 ## Python Client
 
 ```python
@@ -140,6 +157,7 @@ env = AgentClient("http://127.0.0.1:4000/rpc")
 print(env.info())
 obs = env.reset(seed=42)
 step = env.step({"type": "Move", "x": 1.0, "y": 0.0})
+capture = env.capture(output_dir="screenshots", label="after_step")
 snapshot = env.snapshot()
 env.restore(snapshot["snapshot_id"])
 ```
@@ -154,6 +172,7 @@ Always inspect:
 - `info.actions_applied`: confirms input was consumed.
 - `info.snapshot_created`: records checkpoint creation.
 - `checksum`: compare across replay or restore tests.
+- `path`: for `agent.visual.capture`, verify the returned PNG exists and is non-empty before using it as visual evidence.
 
 ## Troubleshooting
 
@@ -161,5 +180,6 @@ Always inspect:
 - Actions ignored: check `info.actions_applied`, scheduled tick, pause/control mode, and whether the episode is already `done` or `truncated`.
 - Nondeterministic replay: compare initial seed/options, action order, tick count, RNG resources, and checksum inputs.
 - Restore mismatch: ensure the snapshot ID or restore tick belongs to the active timeline/branch.
+- Capture missing: ensure the app has the `VISUAL_CAPTURE` capability and either a registered visual capture renderer or a visual build with screenshot support.
 - HTTP 401/403: pass the same token used by the runtime, usually through `AGENT_TOKEN` or an `agentctl --token` flag.
 - Connection refused: verify the server command is still running, the bind address is localhost, and the port matches the client.

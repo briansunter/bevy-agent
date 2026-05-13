@@ -1,6 +1,6 @@
 ---
 name: control-bevy-agent-game
-description: "Operate a Bevy game that exposes the bevy_agent_control protocol. Use when Codex needs to run a controllable Bevy environment, inspect action and observation schemas, drive simulation through JSON-RPC, agentctl, Python, or stdio, step ticks deterministically, fast-forward, snapshot, restore, branch timelines, export or replay action traces, debug observations/rewards/checksums, or verify agent-game behavior without keyboard or mouse input."
+description: "Operate a Bevy game that exposes the bevy_agent_control protocol. Use when Codex needs to run a controllable Bevy environment, inspect action and observation schemas, drive simulation through JSON-RPC, agentctl, Python, or stdio, step ticks deterministically, capture screenshots on demand, fast-forward, snapshot, restore, branch timelines, export or replay action traces, debug observations/rewards/checksums, or verify agent-game behavior without keyboard or mouse input."
 metadata:
   short-description: Drive bevy_agent_control games
 ---
@@ -54,6 +54,7 @@ Example commands:
 ```sh
 cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
 cargo run -p agentctl -- step-many '[{"type":"Move","x":1.0,"y":0.0},{"type":"Jump"}]'
+cargo run -p agentctl -- capture --out-dir screenshots --label after_step
 cargo run -p agentctl -- fast-forward 30
 cargo run -p agentctl -- snapshot
 cargo run -p agentctl -- restore-tick 10
@@ -70,6 +71,19 @@ Read observations as state, not prose. For `Observation::Hybrid`, prefer:
 - `debug` only when the test intentionally needs privileged state.
 
 Do not infer success from visuals alone. A good verification cites the final tick, reward/terminal status, and checksum or relevant symbolic fields.
+
+## Visual Capture
+
+Use `agent.visual.capture` or `agentctl capture` only when visual context is needed. For low-speed play, alternate one structured `step` with an optional `capture`, inspect the returned PNG path and symbolic response, then choose the next action.
+
+Example:
+
+```sh
+cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
+cargo run -p agentctl -- capture --out-dir screenshots --label tick_1
+```
+
+Treat screenshots as supplemental evidence. Report the capture path alongside tick, reward, terminal state, and checksum.
 
 ## Determinism
 

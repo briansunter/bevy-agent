@@ -10,6 +10,9 @@ use bevy_agent_core::{
     SimClock, SnapshotEntity, StableEntityId, StableIdAllocator, StateChecksum,
 };
 use bevy_agent_replay::AgentReplayPlugin;
+use bevy_agent_runner::{
+    VisualCaptureAppExt, VisualCaptureOptions, VisualCaptureResult, visual_capture_path,
+};
 use bevy_agent_snapshot::{AgentSnapshotPlugin, SnapshotAppExt, clear_snapshot_entities};
 ```
 
@@ -27,6 +30,7 @@ impl Plugin for GamePlugin {
             .register_snapshot_resource::<GameScore>()
             .insert_observation_extractor(game_observation)
             .insert_checksum_extractor(game_checksum)
+            .insert_visual_capture_renderer(game_visual_capture)
             .add_systems(AgentReset, reset_level.in_set(AgentResetSet::Game))
             .add_systems(
                 AgentTick,
@@ -145,6 +149,35 @@ fn cooldowns(mut query: Query<&mut CooldownTicks>) {
     }
 }
 ```
+
+## Visual Capture
+
+Register a capture renderer when agents need screenshots during headless play. The renderer should read gameplay state, write a PNG, and return path metadata.
+
+```rust
+fn game_visual_capture(
+    world: &mut World,
+    options: &VisualCaptureOptions,
+) -> anyhow::Result<VisualCaptureResult> {
+    let tick = world.resource::<SimClock>().tick;
+    let frame = world.resource::<bevy_agent_core::AgentControlState>().frame;
+    let path = visual_capture_path(options, tick, frame)?;
+
+    // Draw a small PNG from gameplay state here.
+    // Keep this read-only with respect to authoritative simulation state.
+
+    Ok(VisualCaptureResult {
+        tick,
+        frame,
+        path,
+        width: 640,
+        height: 360,
+        format: "png".to_string(),
+    })
+}
+```
+
+Visual apps can also enable `bevy_agent_runner/visual` and use Bevy primary-window screenshots. Keep this out of checksums and snapshots.
 
 ## Observation
 

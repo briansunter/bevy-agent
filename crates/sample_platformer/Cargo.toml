@@ -12,7 +12,7 @@ categories = ["game-development", "simulation"]
 
 [features]
 default = []
-visual = ["bevy/2d"]
+visual = ["bevy/2d", "bevy/png", "bevy_agent_runner/visual", "bevy_agent_remote/visual"]
 
 [dependencies]
 anyhow.workspace = true
@@ -21,8 +21,13 @@ bevy_agent_core.workspace = true
 bevy_agent_replay.workspace = true
 bevy_agent_runner.workspace = true
 bevy_agent_snapshot.workspace = true
+image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
 bevy_agent_remote.workspace = true
+
+[[example]]
+name = "remote_http_visual"
+required-features = ["visual"]

@@ -1,5 +1,7 @@
 //! Runner API for manually stepping Bevy apps through agent simulation ticks.
 
+use std::path::{Path, PathBuf};
+
 use anyhow::{Result, anyhow};
 use bevy::prelude::*;
 use bevy_agent_core::{
@@ -27,6 +29,144 @@ impl Default for ResetOptions {
             create_initial_snapshot: true,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VisualCaptureOptions {
+    pub output_dir: PathBuf,
+    pub label: Option<String>,
+    pub timeout_frames: u32,
+}
+
+impl Default for VisualCaptureOptions {
+    fn default() -> Self {
+        Self {
+            output_dir: PathBuf::from("screenshots"),
+            label: None,
+            timeout_frames: 8,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VisualCaptureResult {
+    pub tick: u64,
+    pub frame: u64,
+    pub path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+}
+
+type VisualCaptureFn =
+    dyn Fn(&mut World, &VisualCaptureOptions) -> Result<VisualCaptureResult> + Send + Sync;
+
+#[derive(Resource)]
+pub struct AgentVisualCaptureRenderer {
+    capture: Box<VisualCaptureFn>,
+}
+
+impl AgentVisualCaptureRenderer {
+    pub fn new<F>(capture: F) -> Self
+    where
+        F: Fn(&mut World, &VisualCaptureOptions) -> Result<VisualCaptureResult>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            capture: Box::new(capture),
+        }
+    }
+
+    pub fn capture(
+        &self,
+        world: &mut World,
+        options: &VisualCaptureOptions,
+    ) -> Result<VisualCaptureResult> {
+        (self.capture)(world, options)
+    }
+}
+
+pub trait VisualCaptureAppExt {
+    fn insert_visual_capture_renderer<F>(&mut self, capture: F) -> &mut Self
+    where
+        F: Fn(&mut World, &VisualCaptureOptions) -> Result<VisualCaptureResult>
+            + Send
+            + Sync
+            + 'static;
+}
+
+impl VisualCaptureAppExt for App {
+    fn insert_visual_capture_renderer<F>(&mut self, capture: F) -> &mut Self
+    where
+        F: Fn(&mut World, &VisualCaptureOptions) -> Result<VisualCaptureResult>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.insert_resource(AgentVisualCaptureRenderer::new(capture))
+    }
+}
+
+pub fn sanitized_capture_label(label: Option<&str>) -> String {
+    let label = label.unwrap_or("capture");
+    let mut sanitized = String::new();
+    let mut previous_dash = false;
+    for character in label.chars() {
+        let next = if character.is_ascii_alphanumeric() {
+            previous_dash = false;
+            Some(character.to_ascii_lowercase())
+        } else if character == '-' || character == '_' || character.is_ascii_whitespace() {
+            if previous_dash {
+                None
+            } else {
+                previous_dash = true;
+                Some('-')
+            }
+        } else {
+            None
+        };
+        if let Some(next) = next {
+            sanitized.push(next);
+        }
+    }
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        "capture".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+pub fn visual_capture_path(
+    options: &VisualCaptureOptions,
+    tick: u64,
+    frame: u64,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(&options.output_dir)?;
+    let label = sanitized_capture_label(options.label.as_deref());
+    let stem = format!("tick-{tick:06}-frame-{frame:06}-{label}");
+    unique_path(&options.output_dir, &stem, "png")
+}
+
+fn unique_path(directory: &Path, stem: &str, extension: &str) -> Result<PathBuf> {
+    let first = directory.join(format!("{stem}.{extension}"));
+    if !first.exists() {
+        return Ok(first);
+    }
+
+    for index in 1..10_000 {
+        let candidate = directory.join(format!("{stem}-{index}.{extension}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "could not find an unused capture path for {}",
+        directory.display()
+    ))
 }
 
 pub trait AgentEnvironment {
@@ -123,6 +263,43 @@ impl AgentApp {
         last.ok_or_else(|| anyhow!("fast_forward called with zero ticks"))
     }
 
+    pub fn capture_visual(&mut self, options: VisualCaptureOptions) -> Result<VisualCaptureResult> {
+        self.ensure_started();
+        self.ensure_reset()?;
+
+        if self
+            .app
+            .world()
+            .contains_resource::<AgentVisualCaptureRenderer>()
+        {
+            return self.app.world_mut().resource_scope(
+                |world, renderer: Mut<AgentVisualCaptureRenderer>| {
+                    renderer.capture(world, &options)
+                },
+            );
+        }
+
+        self.capture_primary_window(options)
+    }
+
+    pub fn capture_primary_window(
+        &mut self,
+        options: VisualCaptureOptions,
+    ) -> Result<VisualCaptureResult> {
+        #[cfg(feature = "visual")]
+        {
+            self.capture_primary_window_impl(options)
+        }
+
+        #[cfg(not(feature = "visual"))]
+        {
+            let _ = options;
+            Err(anyhow!(
+                "visual capture requires a registered AgentVisualCaptureRenderer or the bevy_agent_runner visual feature"
+            ))
+        }
+    }
+
     pub fn replay_log(&self) -> Option<&ReplayLog> {
         self.app
             .world()
@@ -177,6 +354,66 @@ impl AgentApp {
     fn has_snapshot_support(&self) -> bool {
         self.app.world().contains_resource::<SnapshotStore>()
     }
+
+    #[cfg(feature = "visual")]
+    fn capture_primary_window_impl(
+        &mut self,
+        options: VisualCaptureOptions,
+    ) -> Result<VisualCaptureResult> {
+        use bevy::render::view::screenshot::{Screenshot, save_to_disk};
+        use bevy::window::{PrimaryWindow, Window};
+
+        let (tick, frame, width, height) = {
+            let world = self.app.world_mut();
+            let tick = world.resource::<SimClock>().tick;
+            let frame = world.resource::<AgentControlState>().frame;
+            let mut windows = world.query_filtered::<&Window, With<PrimaryWindow>>();
+            let window = windows
+                .iter(world)
+                .next()
+                .ok_or_else(|| anyhow!("visual capture requires a primary window"))?;
+            (
+                tick,
+                frame,
+                window.physical_width(),
+                window.physical_height(),
+            )
+        };
+        let path = visual_capture_path(&options, tick, frame)?;
+        let timeout_frames = options.timeout_frames.max(1);
+
+        self.app
+            .world_mut()
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path.clone()));
+
+        for _ in 0..=timeout_frames {
+            self.app.update();
+            if file_is_nonempty(&path) {
+                return Ok(VisualCaptureResult {
+                    tick,
+                    frame,
+                    path,
+                    width,
+                    height,
+                    format: "png".to_string(),
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+
+        Err(anyhow!(
+            "visual capture timed out after {timeout_frames} frames: {}",
+            path.display()
+        ))
+    }
+}
+
+#[cfg(feature = "visual")]
+fn file_is_nonempty(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false)
 }
 
 impl AgentEnvironment for AgentApp {
@@ -409,6 +646,45 @@ mod tests {
         let error = env.fast_forward(0).unwrap_err();
 
         assert!(error.to_string().contains("zero ticks"));
+    }
+
+    #[test]
+    fn capture_label_is_filesystem_safe() {
+        assert_eq!(sanitized_capture_label(Some("After Jump!")), "after-jump");
+        assert_eq!(sanitized_capture_label(Some("../bad/name")), "badname");
+        assert_eq!(sanitized_capture_label(Some("   ")), "capture");
+    }
+
+    #[test]
+    fn visual_capture_path_is_unique() {
+        let mut output_dir = std::env::temp_dir();
+        output_dir.push(format!(
+            "bevy-agent-runner-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let options = VisualCaptureOptions {
+            output_dir: output_dir.clone(),
+            label: Some("Test Capture".to_string()),
+            timeout_frames: 1,
+        };
+
+        let first = visual_capture_path(&options, 3, 4).unwrap();
+        std::fs::write(&first, b"exists").unwrap();
+        let second = visual_capture_path(&options, 3, 4).unwrap();
+
+        assert_eq!(
+            first.file_name().unwrap().to_str().unwrap(),
+            "tick-000003-frame-000004-test-capture.png"
+        );
+        assert_eq!(
+            second.file_name().unwrap().to_str().unwrap(),
+            "tick-000003-frame-000004-test-capture-1.png"
+        );
+        let _ = std::fs::remove_dir_all(output_dir);
     }
 
     #[test]

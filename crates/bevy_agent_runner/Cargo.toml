@@ -10,6 +10,10 @@ documentation = "https://docs.rs/bevy_agent_runner"
 keywords = ["bevy", "gamedev", "agent", "runner"]
 categories = ["game-development", "simulation"]
 
+[features]
+default = []
+visual = ["bevy/bevy_render", "bevy/bevy_window", "bevy/png"]
+
 [dependencies]
 anyhow.workspace = true
 bevy.workspace = true

@@ -89,6 +89,17 @@ fn build_request(command: &str, args: &mut Vec<String>) -> Result<(&'static str,
                 "observation_mode": take_option(args, "--mode").unwrap_or_else(|| "Hybrid".to_string()),
             }),
         )),
+        "capture" => Ok((
+            "agent.visual.capture",
+            json!({
+                "output_dir": take_option(args, "--out-dir").unwrap_or_else(|| "screenshots".to_string()),
+                "label": take_option(args, "--label"),
+                "timeout_frames": take_option(args, "--timeout-frames")
+                    .map(|value| value.parse::<u32>())
+                    .transpose()?
+                    .unwrap_or(8),
+            }),
+        )),
         "fast-forward" => {
             let ticks = args
                 .first()
@@ -222,6 +233,7 @@ fn print_usage() {
            step '<action-json>' [--mode Hybrid]\n\
            step-many '<actions-json-array>' [--return last|all|none]\n\
            observe [--mode Hybrid]\n\
+           capture [--out-dir screenshots] [--label name] [--timeout-frames N]\n\
            fast-forward <ticks>\n\
            snapshot | snapshots | restore <snapshot-id> | restore-tick <tick>\n\
            branch --from-tick <tick> [--label name]\n\
@@ -308,6 +320,11 @@ mod tests {
             ("action-space", vec![], "agent.action_space"),
             ("observation-space", vec![], "agent.observation_space"),
             ("observe", vec!["--mode", "FullDebugState"], "agent.observe"),
+            (
+                "capture",
+                vec!["--out-dir", "shots"],
+                "agent.visual.capture",
+            ),
             ("fast-forward", vec!["5"], "agent.fast_forward"),
             ("snapshot", vec![], "agent.snapshot.create"),
             ("snapshots", vec![], "agent.snapshot.list"),
@@ -359,6 +376,19 @@ mod tests {
         let (_, branch_params) = build_request("branch", &mut branch).unwrap();
         assert_eq!(branch_params["from_tick"], 42);
         assert_eq!(branch_params["label"], "try-alt");
+
+        let mut capture = vec![
+            "--out-dir".to_string(),
+            "shots".to_string(),
+            "--label".to_string(),
+            "after-step".to_string(),
+            "--timeout-frames".to_string(),
+            "3".to_string(),
+        ];
+        let (_, capture_params) = build_request("capture", &mut capture).unwrap();
+        assert_eq!(capture_params["output_dir"], "shots");
+        assert_eq!(capture_params["label"], "after-step");
+        assert_eq!(capture_params["timeout_frames"], 3);
     }
 
     #[test]
