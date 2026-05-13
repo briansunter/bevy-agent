@@ -1,0 +1,4 @@
+interface:
+  display_name: "Integrate Bevy Agent Control"
+  short_description: "Make Bevy games agent-controllable"
+  default_prompt: "Use $integrate-bevy-agent-control to move Bevy gameplay into deterministic agent ticks with actions, observations, snapshots, replay, and remote control."
