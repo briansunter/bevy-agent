@@ -3,17 +3,22 @@
 ## Imports
 
 ```rust
+use std::hash::Hash;
+
 use bevy::prelude::*;
 use bevy_agent_core::{
-    AgentAction, AgentControlAppExt, AgentControlPlugin, AgentReset, AgentResetSet, AgentSet,
-    AgentTick, CurrentInputFrame, EpisodeState, Observation, ObservationMode, RewardState,
-    SimClock, SnapshotEntity, StableEntityId, StableIdAllocator, StateChecksum,
+    AgentAction, AgentControlAppExt, AgentReset, AgentResetSet, AgentSet, AgentTick,
+    CurrentInputFrame, EpisodeState, Observation, ObservationMode, RewardState, SimClock,
+    SnapshotEntity, StableEntityId, StableHasher, StableIdAllocator, StateChecksum,
 };
-use bevy_agent_replay::AgentReplayPlugin;
 use bevy_agent_runner::{
-    VisualCaptureAppExt, VisualCaptureOptions, VisualCaptureResult, visual_capture_path,
+    AgentControlPlugins, VisualCaptureAppExt, VisualCaptureOptions, VisualCaptureResult,
+    visual_capture_path,
 };
-use bevy_agent_snapshot::{AgentSnapshotPlugin, SnapshotAppExt, clear_snapshot_entities};
+use bevy_agent_snapshot::{
+    SnapshotAppExt, clear_snapshot_entities, register_snapshot_components,
+    register_snapshot_resources,
+};
 ```
 
 ## Plugin Setup
@@ -22,13 +27,31 @@ use bevy_agent_snapshot::{AgentSnapshotPlugin, SnapshotAppExt, clear_snapshot_en
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GameScore>()
+            .init_resource::<GameplayRng>()
             .set_snapshot_metadata("my_game", env!("CARGO_PKG_VERSION"))
-            .register_snapshot_component::<StableEntityId>()
-            .register_snapshot_component::<Transform>()
-            .register_snapshot_component::<Velocity>()
-            .register_snapshot_component::<Player>()
-            .register_snapshot_resource::<GameScore>()
-            .insert_observation_extractor(game_observation)
+            .register_custom_action_schema(
+                "game_action",
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {
+                        "type": { "enum": ["dash", "interact_at"] },
+                        "x": { "type": "number" },
+                        "y": { "type": "number" }
+                    }
+                }),
+            );
+
+        register_snapshot_components!(
+            app,
+            StableEntityId,
+            Transform,
+            Velocity,
+            Player,
+        );
+        register_snapshot_resources!(app, GameScore, GameplayRng);
+
+        app.insert_observation_extractor(game_observation)
             .insert_checksum_extractor(game_checksum)
             .insert_visual_capture_renderer(game_visual_capture)
             .add_systems(AgentReset, reset_level.in_set(AgentResetSet::Game))
@@ -45,26 +68,29 @@ impl Plugin for GamePlugin {
 
 ## Headless and Visual Builders
 
-Keep a small deterministic builder for tests and agents, then layer visual plugins separately:
+Keep a small deterministic builder for tests and agents, then build visual apps separately so render plugins never enter headless test runs:
 
 ```rust
 pub fn build_headless_app() -> App {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
-        .add_plugins(AgentControlPlugin::deterministic())
-        .add_plugins(AgentSnapshotPlugin)
-        .add_plugins(AgentReplayPlugin)
+        .add_plugins(AgentControlPlugins::deterministic())
         .add_plugins(GamePlugin);
     app
 }
 
+#[cfg(feature = "visual")]
 pub fn build_visual_app() -> App {
-    let mut app = build_headless_app();
+    let mut app = App::new();
     app.add_plugins(DefaultPlugins)
-        .add_systems(Update, (camera_follow, render_debug_overlay));
+        .add_plugins(AgentControlPlugins::visual_debug())
+        .add_plugins(GamePlugin)
+        .add_plugins(GameVisualPlugin);
     app
 }
 ```
+
+Use `AgentControlPlugins::remote()` for long-running apps that are intended to be controlled through a remote loop, and use `with_snapshot_policy`, `without_snapshots`, or `without_replay` only when the default control/snapshot/replay stack is intentionally too broad.
 
 ## Reset
 
@@ -86,16 +112,14 @@ fn reset_level(world: &mut World) {
 
 ## Actions
 
-Prefer a game-specific serializable action enum:
+Use built-in `AgentAction` variants when they describe the control surface. For game-specific controls, carry a stable JSON payload in `AgentAction::Custom` and register the payload schema during plugin setup.
 
 ```rust
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum GameAction {
-    Noop,
-    Move { x: f32, y: f32 },
-    Jump,
-    Interact,
+    Dash,
+    InteractAt { x: f32, y: f32 },
 }
 ```
 
@@ -113,15 +137,18 @@ fn apply_actions(
         match action {
             AgentAction::Move { x, .. } => velocity.0.x = x.clamp(-1.0, 1.0) * 6.0,
             AgentAction::Jump => velocity.0.y = 9.5,
+            AgentAction::Custom { value } => {
+                if let Ok(action) = serde_json::from_value::<GameAction>(value.clone()) {
+                    apply_game_action(&mut velocity, action);
+                }
+            }
             _ => {}
         }
     }
 }
 ```
 
-For game-specific action spaces, define a serializable enum and keep the same pipeline shape: queue scheduled domain actions, drain into `CurrentInputFrame<MyAction>`, and consume that frame in simulation systems.
-
-Human input should enqueue `GameAction` values and should not mutate gameplay components directly.
+Human input should enqueue `AgentAction` values and should not mutate gameplay components directly.
 
 ## Deterministic Time
 
@@ -212,17 +239,16 @@ fn game_observation(world: &mut World, mode: ObservationMode) -> Observation {
 
 ```rust
 fn game_checksum(world: &mut World) -> StateChecksum {
-    use std::hash::{Hash, Hasher};
-
     let clock = world.resource::<SimClock>();
     let score = world.resource::<GameScore>();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = StableHasher::new();
     clock.tick.hash(&mut hasher);
+    clock.dt_seconds.to_bits().hash(&mut hasher);
     score.value.hash(&mut hasher);
 
     StateChecksum {
         tick: clock.tick,
-        hash: hasher.finish(),
+        hash: hasher.finish_hash(),
     }
 }
 ```
@@ -231,18 +257,21 @@ Include stable IDs, gameplay transforms/velocities, RNG state, score, episode st
 
 Sort query output by stable ID before hashing so iteration order cannot affect checksums.
 
+Do not use `DefaultHasher` for determinism checks; its algorithm is not a stable cross-version contract.
+
 ## Remote
 
-For local HTTP testing, expose the game with a localhost bind and optional token. Do not bind privileged mutation APIs to public interfaces by default.
+For local HTTP testing, expose the game with a loopback bind and optional token. Non-loopback HTTP binds without a session token are rejected by `HttpRemoteServer::serve`.
 
 Use the repository's remote examples as the baseline:
 
 ```sh
 cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
 AGENT_TOKEN=secret cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
+AGENT_TOKEN=secret cargo run -p sample_platformer --example remote_http -- 0.0.0.0:4000
 ```
 
-Remote mutation methods should require the same capability checks as restore/replay/branch methods.
+Remote schemas should advertise built-in actions, registered custom action schemas, and all observation variants. Remote mutation methods should require the same capability checks as restore/replay/branch methods.
 
 ## Tests
 
