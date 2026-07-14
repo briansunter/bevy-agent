@@ -1,6 +1,9 @@
-use bevy_agent_core::{AgentAction, LastStepResponse, Observation};
+use bevy_agent_core::{
+    ActionSource, AgentAction, AgentActionQueue, AgentControlState, ControlMode, LastStepResponse,
+    Observation,
+};
 use bevy_agent_remote::{AgentCapability, JsonRpcBridge, RemoteSecurity};
-use bevy_agent_replay::Timeline;
+use bevy_agent_replay::{ReplayRecorder, Timeline};
 use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions};
 use std::path::PathBuf;
 
@@ -665,6 +668,126 @@ fn remote_snapshot_restore_and_replay_load_inline_log_work() {
     );
     let load: serde_json::Value = serde_json::from_str(&load).unwrap();
     assert!(load["result"]["records"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn reset_clears_replay_log_and_starts_root_timeline_preserving_recording() {
+    let mut env = make_env();
+    env.reset(ResetOptions::default()).unwrap();
+    env.step(AgentAction::Move { x: 1.0, y: 0.0 }).unwrap();
+    env.step(AgentAction::Jump).unwrap();
+    let records_before = env.replay_log().unwrap().records.len();
+    assert!(records_before >= 2);
+
+    // Flip recording off and capture the current timeline identity.
+    env.world_mut().resource_mut::<ReplayRecorder>().recording = false;
+    let timeline_before = env.world().resource::<Timeline>().timeline_id;
+
+    env.reset(ResetOptions::default()).unwrap();
+
+    // The recording flag is preserved across the episode boundary.
+    assert!(!env.world().resource::<ReplayRecorder>().recording);
+    // Prior replay records are cleared (the fresh initial snapshot seeds the log
+    // metadata but adds no step records).
+    assert!(env.replay_log().unwrap().records.is_empty());
+
+    // A fresh timeline root was started and the control state tracks it.
+    let timeline = env.world().resource::<Timeline>();
+    let control = env.world().resource::<AgentControlState>();
+    assert_ne!(timeline.timeline_id, timeline_before);
+    assert_eq!(timeline.branches.len(), 1);
+    assert_eq!(
+        timeline
+            .branches
+            .get(&timeline.current_branch)
+            .unwrap()
+            .parent_branch,
+        None
+    );
+    assert_eq!(timeline.timeline_id, control.timeline_id);
+    assert_eq!(timeline.current_branch, control.branch_id);
+}
+
+#[test]
+fn restore_realigns_frame_to_next_tick() {
+    let mut env = make_env();
+    env.reset(ResetOptions::default()).unwrap();
+    for _ in 0..10 {
+        env.step(AgentAction::Move { x: 1.0, y: 0.0 }).unwrap();
+    }
+    let snapshot = env.snapshot().unwrap();
+    // Advance well past the snapshot so the frame would otherwise drift forward.
+    for _ in 0..8 {
+        env.step(AgentAction::Noop).unwrap();
+    }
+
+    env.restore(snapshot.snapshot_id).unwrap();
+    let response = env.step(AgentAction::Noop).unwrap();
+
+    // After restore, the next step's frame realigns to its tick.
+    assert_eq!(response.tick, snapshot.tick + 1);
+    assert_eq!(response.info.frame, response.tick);
+}
+
+#[test]
+fn restore_tick_reproduces_multi_action_tick_without_appending_records() {
+    let mut env = make_env();
+    env.reset(ResetOptions::default()).unwrap();
+    // Two opposing moves at the same tick make the outcome order-sensitive: the
+    // last move wins for horizontal velocity.
+    env.enqueue_action_at(1, ActionSource::Agent, AgentAction::Move { x: 1.0, y: 0.0 });
+    env.enqueue_action_at(1, ActionSource::Test, AgentAction::Move { x: -1.0, y: 0.0 });
+    let original = env.step(AgentAction::Noop).unwrap();
+    // The two enqueued moves plus the step's Noop all land on tick 1.
+    assert_eq!(original.info.actions_applied, 3);
+    let checksum = original.checksum.clone().expect("checksum");
+    let records_before = env.replay_log().unwrap().records.len();
+
+    env.restore_tick(1).unwrap();
+
+    let restored = env
+        .world()
+        .resource::<LastStepResponse>()
+        .0
+        .clone()
+        .expect("restored response");
+    assert_eq!(restored.tick, 1);
+    assert_eq!(restored.info.actions_applied, original.info.actions_applied);
+    assert_eq!(restored.checksum, Some(checksum));
+    // The replay was not appended to the recorder log.
+    assert_eq!(env.replay_log().unwrap().records.len(), records_before);
+}
+
+#[test]
+fn restore_tick_preserves_pending_actions_after_target_tick() {
+    let mut env = make_env();
+    env.reset(ResetOptions::default()).unwrap();
+    env.enqueue_action_at(5, ActionSource::Test, AgentAction::Jump);
+    env.snapshot().unwrap();
+    env.step(AgentAction::Noop).unwrap();
+
+    env.restore_tick(1).unwrap();
+
+    let queue = env.world().resource::<AgentActionQueue>();
+    assert_eq!(queue.pending.len(), 1);
+    assert_eq!(queue.pending.front().unwrap().tick, 5);
+}
+
+#[test]
+fn paused_and_inspect_only_modes_block_step_without_advancing() {
+    let mut env = make_env();
+    env.reset(ResetOptions::default()).unwrap();
+    let tick_before = env.current_tick();
+
+    env.world_mut().resource_mut::<AgentControlState>().mode = ControlMode::Paused;
+    let paused_error = env.step(AgentAction::Move { x: 1.0, y: 0.0 }).unwrap_err();
+    assert_eq!(env.current_tick(), tick_before);
+    assert!(paused_error.to_string().contains("Paused"));
+
+    env.world_mut().resource_mut::<AgentControlState>().mode = ControlMode::InspectOnly;
+    let inspect_error = env.step(AgentAction::Move { x: 1.0, y: 0.0 }).unwrap_err();
+    assert_eq!(env.current_tick(), tick_before);
+    assert!(inspect_error.to_string().contains("InspectOnly"));
 }
 
 fn replay_temp_path() -> PathBuf {

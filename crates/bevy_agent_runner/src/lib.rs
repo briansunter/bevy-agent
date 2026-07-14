@@ -438,10 +438,91 @@ impl AgentApp {
     ) -> Result<StepResponse<Observation>> {
         self.ensure_started();
         self.ensure_reset()?;
+        self.reject_paused_or_inspect_only()?;
         let next_tick = self.current_tick() + 1;
         self.enqueue_action_at(next_tick, source, action);
         self.run_one_agent_tick();
         self.last_response()
+    }
+
+    /// External stepping (`step`/`step_many`/`fast_forward`) is rejected while
+    /// the control mode is behavioral-only. Internal reconstruction
+    /// (`restore`/`restore_tick`/`branch`) bypasses `step_with_source` and may
+    /// still rebuild state. Returns before any action is enqueued so the tick is
+    /// left unchanged.
+    fn reject_paused_or_inspect_only(&self) -> Result<()> {
+        let mode = self
+            .app
+            .world()
+            .resource::<AgentControlState>()
+            .mode
+            .clone();
+        match mode {
+            ControlMode::Paused => Err(anyhow!(
+                "cannot step while control mode is Paused; resume before stepping"
+            )),
+            ControlMode::InspectOnly => Err(anyhow!(
+                "cannot step while control mode is InspectOnly; switch modes before stepping"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Replays one `AgentTick` per recorded tick in `(checkpoint_tick,
+    /// target_tick]`, grouping all actions sharing a recorded tick into that
+    /// tick while preserving their recorded source and order. Empty ticks with
+    /// no recorded actions still run. Recording is expected to be disabled by
+    /// the caller so the replay is not appended to the log.
+    fn replay_tick_interval(
+        &mut self,
+        log: &ReplayLog,
+        checkpoint_tick: u64,
+        target_tick: u64,
+    ) -> Result<()> {
+        // Preserve actions that were already scheduled beyond the replay target.
+        // They are intentionally not in the replay log yet, but should remain
+        // pending when the caller continues from the restored tick.
+        let future_actions = self
+            .app
+            .world()
+            .get_resource::<AgentActionQueue>()
+            .map(|queue| {
+                queue
+                    .pending
+                    .iter()
+                    .filter(|scheduled| scheduled.tick > target_tick)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // The recorded actions fully define the interval; drop any pending
+        // actions restored from the checkpoint so each tick matches the recorded
+        // history exactly. Future actions are restored below after replay.
+        if let Some(mut queue) = self.app.world_mut().get_resource_mut::<AgentActionQueue>() {
+            queue.clear();
+        }
+
+        // Schedule each recorded action at its recorded tick, preserving its
+        // recorded source and relative order.
+        for record in log.actions_between(checkpoint_tick, target_tick) {
+            self.enqueue_action_at(record.tick, record.source, record.action);
+        }
+        for scheduled in future_actions {
+            self.enqueue_action_at(scheduled.tick, scheduled.source, scheduled.action);
+        }
+
+        // Run exactly one AgentTick per tick in the interval, including empty
+        // ticks where no actions were recorded, and verify each produced a
+        // response.
+        for _ in 0..target_tick.saturating_sub(checkpoint_tick) {
+            self.run_one_agent_tick();
+            if self.app.world().resource::<LastStepResponse>().0.is_none() {
+                return Err(anyhow!("replay tick produced no StepResponse"));
+            }
+        }
+
+        Ok(())
     }
 
     fn has_snapshot_support(&self) -> bool {
@@ -525,6 +606,7 @@ impl AgentEnvironment for AgentApp {
 
         self.app.world_mut().run_schedule(AgentReset);
         self.reset_once = true;
+        reset_replay_and_timeline(self.app.world_mut());
 
         let mut response = self.last_response()?;
         if options.create_initial_snapshot && self.has_snapshot_support() {
@@ -610,6 +692,17 @@ impl AgentEnvironment for AgentApp {
         }
 
         restore_snapshot(self.app.world_mut(), snapshot)?;
+        {
+            // The snapshot restores the simulation clock but not the control
+            // frame or snapshot bookkeeping. Realign the frame to the restored
+            // tick and clear any stale snapshot marker so the next response does
+            // not falsely report a freshly created snapshot.
+            let world = self.app.world_mut();
+            let restored_tick = world.resource::<SimClock>().tick;
+            let mut control = world.resource_mut::<AgentControlState>();
+            control.frame = restored_tick;
+            control.last_snapshot_created = None;
+        }
         self.reset_once = true;
         collect_observation(self.app.world_mut());
         Ok(())
@@ -631,8 +724,12 @@ impl AgentEnvironment for AgentApp {
             .or_else(|| log.initial_snapshot.map(|snapshot_id| (0, snapshot_id)))
             .ok_or_else(|| anyhow!("no checkpoint exists at or before tick {tick}"))?;
 
+        // Start at the selected checkpoint.
         self.restore(snapshot_id)?;
 
+        // Replay must never be recorded into the log. Disable recording for the
+        // duration of the replay and restore the previous flag on both the
+        // success and error paths.
         let old_recording = self
             .app
             .world()
@@ -643,13 +740,13 @@ impl AgentEnvironment for AgentApp {
             recorder.recording = false;
         }
 
-        for record in log.actions_between(checkpoint_tick, tick) {
-            self.step_with_source(record.action, ActionSource::Replay)?;
-        }
+        let replay_result = self.replay_tick_interval(&log, checkpoint_tick, tick);
 
         if let Some(mut recorder) = self.app.world_mut().get_resource_mut::<ReplayRecorder>() {
             recorder.recording = old_recording;
         }
+        replay_result?;
+
         Ok(())
     }
 
@@ -693,6 +790,34 @@ pub fn clear_episode(world: &mut World) {
     *world.resource_mut::<EpisodeState>() = EpisodeState::default();
     *world.resource_mut::<RewardState>() = RewardState::default();
     world.resource_mut::<CurrentInputFrame>().actions.clear();
+}
+
+/// Marks an episode boundary by starting a fresh replay log and timeline root.
+///
+/// Called from `AgentApp::reset` after the `AgentReset` schedule and before the
+/// optional initial snapshot. It replaces the `ReplayLog` with a fresh one while
+/// preserving the `ReplayRecorder.recording` flag, installs a fresh `Timeline`
+/// root, and synchronizes `AgentControlState.timeline_id`/`branch_id` to that
+/// new root. It is a no-op for apps that do not install the replay resources, so
+/// core-only and snapshot-less configurations remain supported.
+fn reset_replay_and_timeline(world: &mut World) {
+    let new_root = world.get_resource_mut::<Timeline>().map(|mut timeline| {
+        *timeline = Timeline::default();
+        (timeline.timeline_id, timeline.current_branch)
+    });
+
+    if let Some(mut recorder) = world.get_resource_mut::<ReplayRecorder>() {
+        let recording = recorder.recording;
+        recorder.log = ReplayLog::default();
+        recorder.recording = recording;
+    }
+
+    if let Some((timeline_id, branch_id)) = new_root
+        && let Some(mut control) = world.get_resource_mut::<AgentControlState>()
+    {
+        control.timeline_id = timeline_id;
+        control.branch_id = branch_id;
+    }
 }
 
 #[cfg(test)]

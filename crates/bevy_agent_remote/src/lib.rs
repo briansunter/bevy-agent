@@ -32,6 +32,8 @@ bitflags! {
         const BRANCH = 1 << 6;
         const SPAWN_DESPAWN = 1 << 7;
         const VISUAL_CAPTURE = 1 << 8;
+        /// Mutating control of run state: pause/resume/set_mode.
+        const CONTROL = 1 << 9;
     }
 }
 
@@ -44,22 +46,14 @@ impl Default for AgentCapability {
             | Self::RESTORE
             | Self::BRANCH
             | Self::VISUAL_CAPTURE
+            | Self::CONTROL
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RemoteSecurity {
     pub session_token: Option<String>,
     pub capabilities: AgentCapability,
-}
-
-impl Default for RemoteSecurity {
-    fn default() -> Self {
-        Self {
-            session_token: None,
-            capabilities: AgentCapability::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -239,6 +233,16 @@ impl JsonRpcBridge {
 
     pub fn handle_request(&self, env: &mut AgentApp, request: JsonRpcRequest) -> JsonRpcResponse {
         let id = request.id.clone();
+        if let Err(error) = validate_jsonrpc_version(&request) {
+            return JsonRpcResponse::Error {
+                jsonrpc: "2.0",
+                id,
+                error: JsonRpcError {
+                    code: -32600,
+                    message: error.to_string(),
+                },
+            };
+        }
         match self.dispatch(env, request) {
             Ok(result) => JsonRpcResponse::Result {
                 jsonrpc: "2.0",
@@ -272,14 +276,18 @@ impl JsonRpcBridge {
 
     fn dispatch(&self, env: &mut AgentApp, request: JsonRpcRequest) -> Result<Value> {
         match request.method.as_str() {
-            "agent.info" => Ok(json!({
-                "name": "bevy_agent_control",
-                "version": env!("CARGO_PKG_VERSION"),
-                "bevy_version": "0.18.1",
-                "tick": env.current_tick(),
-                "capabilities": self.security.capabilities.bits(),
-            })),
+            "agent.info" => {
+                self.authorize(None, &request.params)?;
+                Ok(json!({
+                    "name": "bevy_agent_control",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "bevy_version": "0.18.1",
+                    "tick": env.current_tick(),
+                    "capabilities": self.security.capabilities.bits(),
+                }))
+            }
             "agent.action_space" => {
+                self.authorize(None, &request.params)?;
                 let catalog = env.world().get_resource::<AgentActionCatalog>();
                 Ok(json!({
                     "type": "json_schema",
@@ -288,12 +296,16 @@ impl JsonRpcBridge {
                     "custom_actions": custom_action_schema_map(catalog),
                 }))
             }
-            "agent.observation_space" => Ok(json!({
-                "modes": ["PlayerKnowledge", "FullDebugState", "DiffSinceLastTick", "PixelFrame", "Hybrid"],
-                "default": "Hybrid",
-                "schema": observation_schema()
-            })),
+            "agent.observation_space" => {
+                self.authorize(None, &request.params)?;
+                Ok(json!({
+                    "modes": ["PlayerKnowledge", "FullDebugState", "DiffSinceLastTick", "PixelFrame", "Hybrid"],
+                    "default": "Hybrid",
+                    "schema": observation_schema()
+                }))
+            }
             "agent.schema" => {
+                self.authorize(None, &request.params)?;
                 let catalog = env.world().get_resource::<AgentActionCatalog>();
                 Ok(json!({
                     "action": agent_action_schema_with_custom_actions(catalog),
@@ -442,11 +454,14 @@ impl JsonRpcBridge {
                     .retain(|value| *value != params.snapshot_id);
                 Ok(Value::Null)
             }
-            "agent.timeline.current" => Ok(json!({
-                "tick": env.current_tick(),
-                "timeline_id": env.world().resource::<bevy_agent_core::AgentControlState>().timeline_id,
-                "branch_id": env.world().resource::<bevy_agent_core::AgentControlState>().branch_id,
-            })),
+            "agent.timeline.current" => {
+                self.authorize(None, &request.params)?;
+                Ok(json!({
+                    "tick": env.current_tick(),
+                    "timeline_id": env.world().resource::<bevy_agent_core::AgentControlState>().timeline_id,
+                    "branch_id": env.world().resource::<bevy_agent_core::AgentControlState>().branch_id,
+                }))
+            }
             "agent.timeline.branch" => {
                 self.require_capability(AgentCapability::BRANCH)?;
                 let params: BranchParams = serde_json::from_value(request.params)?;
@@ -466,6 +481,7 @@ impl JsonRpcBridge {
                 Ok(json!({ "current_tick": env.current_tick() }))
             }
             "agent.control.set_mode" => {
+                self.require_capability(AgentCapability::CONTROL)?;
                 let params: ControlModeParams = serde_json::from_value(request.params)?;
                 self.check_token(params.session_token.as_deref())?;
                 env.world_mut()
@@ -474,6 +490,7 @@ impl JsonRpcBridge {
                 Ok(Value::Null)
             }
             "agent.control.pause" => {
+                self.require_capability(AgentCapability::CONTROL)?;
                 self.check_token(token_from_params(&request.params).as_deref())?;
                 env.world_mut()
                     .resource_mut::<bevy_agent_core::AgentControlState>()
@@ -481,6 +498,7 @@ impl JsonRpcBridge {
                 Ok(Value::Null)
             }
             "agent.control.resume" => {
+                self.require_capability(AgentCapability::CONTROL)?;
                 self.check_token(token_from_params(&request.params).as_deref())?;
                 env.world_mut()
                     .resource_mut::<bevy_agent_core::AgentControlState>()
@@ -567,6 +585,30 @@ impl JsonRpcBridge {
         }
         Ok(())
     }
+
+    /// Authorize a request against the configured capability set and session
+    /// token. `capability` is `None` for read-only inspectors that require no
+    /// capability gate but must still present the session token when one is
+    /// configured. The token is read with the established `session_token`
+    /// params convention, so no token is required when none is configured.
+    fn authorize(&self, capability: Option<AgentCapability>, params: &Value) -> Result<()> {
+        if let Some(capability) = capability {
+            self.require_capability(capability)?;
+        }
+        self.check_token(token_from_params(params).as_deref())
+    }
+}
+
+/// Validate the JSON-RPC version field. A present `jsonrpc` member must be
+/// exactly `"2.0"`; an absent member is tolerated so existing clients that omit
+/// it keep working.
+fn validate_jsonrpc_version(request: &JsonRpcRequest) -> Result<()> {
+    if let Some(version) = request.jsonrpc.as_deref()
+        && version != "2.0"
+    {
+        return Err(anyhow!("invalid Request: jsonrpc must be \"2.0\""));
+    }
+    Ok(())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -859,6 +901,7 @@ impl HttpRemoteServer {
         stream: &mut TcpStream,
         request: &HttpRequest,
     ) -> Result<()> {
+        validate_websocket_handshake(request, &self.bridge.security)?;
         let key = request
             .header("sec-websocket-key")
             .ok_or_else(|| anyhow!("missing Sec-WebSocket-Key"))?;
@@ -884,6 +927,51 @@ impl HttpRemoteServer {
             }
         }
     }
+}
+
+fn validate_websocket_handshake(request: &HttpRequest, security: &RemoteSecurity) -> Result<()> {
+    let valid_upgrade = request
+        .header("upgrade")
+        .map(|value| value.trim().eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    if !valid_upgrade {
+        return Err(anyhow!("missing or invalid WebSocket Upgrade header"));
+    }
+
+    let connection_upgrade = request
+        .header("connection")
+        .map(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        .unwrap_or(false);
+    if !connection_upgrade {
+        return Err(anyhow!("missing WebSocket Connection: Upgrade header"));
+    }
+
+    if request.header("sec-websocket-version").map(str::trim) != Some("13") {
+        return Err(anyhow!("WebSocket version 13 is required"));
+    }
+
+    let has_key = request
+        .header("sec-websocket-key")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if !has_key {
+        return Err(anyhow!("missing Sec-WebSocket-Key"));
+    }
+
+    // A browser Origin is a cross-site request signal. Tokenless loopback
+    // WebSocket sessions are intended for non-browser local clients; require
+    // an explicit session token before accepting browser-originated traffic.
+    if security.session_token.is_none() && request.header("origin").is_some() {
+        return Err(anyhow!(
+            "WebSocket connections with an Origin header require a session token"
+        ));
+    }
+
+    Ok(())
 }
 
 fn require_safe_bind(local_addr: SocketAddr, security: &RemoteSecurity) -> Result<()> {
@@ -959,11 +1047,15 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         headers.push((key.trim().to_string(), value.trim().to_string()));
     }
 
-    let content_length = headers
+    let content_length = match headers
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.parse::<usize>().ok())
-        .unwrap_or(0);
+    {
+        Some((_, value)) => value
+            .parse::<usize>()
+            .with_context(|| format!("invalid Content-Length: {value}"))?,
+        None => 0,
+    };
     if content_length > MAX_HTTP_BODY_BYTES {
         return Err(anyhow!(
             "HTTP request body of {content_length} bytes exceeds limit of {MAX_HTTP_BODY_BYTES}"
@@ -1017,6 +1109,7 @@ fn write_http_response(
     Ok(())
 }
 
+#[derive(Debug)]
 enum WebSocketMessage {
     Text(String),
     Ping(Vec<u8>),
@@ -1033,6 +1126,7 @@ fn websocket_accept_key(key: &str) -> String {
 fn read_websocket_text(stream: &mut TcpStream) -> Result<WebSocketMessage> {
     let mut header = [0; 2];
     stream.read_exact(&mut header)?;
+    let fin = header[0] & 0x80 != 0;
     let opcode = header[0] & 0x0f;
     let masked = header[1] & 0x80 != 0;
     let mut len = (header[1] & 0x7f) as u64;
@@ -1046,17 +1140,34 @@ fn read_websocket_text(stream: &mut TcpStream) -> Result<WebSocketMessage> {
         len = u64::from_be_bytes(extended);
     }
 
-    let mut mask = [0; 4];
-    if masked {
-        stream.read_exact(&mut mask)?;
+    let is_control_frame = matches!(opcode, 0x8..=0xa);
+
+    // Validate the frame before allocating its payload. Client-to-server
+    // frames must be masked, this server has no continuation support so
+    // fragments are rejected, control frames cannot exceed 125 bytes, and the
+    // payload must fit the body limit (including 64-bit extended lengths).
+    if !masked {
+        return Err(anyhow!("unmasked websocket client frame"));
     }
+    if !fin {
+        return Err(anyhow!("fragmented websocket frames are not supported"));
+    }
+    if is_control_frame && len > 125 {
+        return Err(anyhow!("control frame payload exceeds 125 bytes"));
+    }
+    if len > MAX_HTTP_BODY_BYTES as u64 {
+        return Err(anyhow!(
+            "websocket payload of {len} bytes exceeds limit of {MAX_HTTP_BODY_BYTES}"
+        ));
+    }
+
+    let mut mask = [0; 4];
+    stream.read_exact(&mut mask)?;
 
     let mut payload = vec![0; len as usize];
     stream.read_exact(&mut payload)?;
-    if masked {
-        for (index, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[index % 4];
-        }
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
     }
 
     match opcode {
@@ -1216,6 +1327,45 @@ mod tests {
     }
 
     #[test]
+    fn websocket_handshake_requires_protocol_headers_and_token_for_origin() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/ws".to_string(),
+            headers: vec![
+                ("Upgrade".to_string(), "websocket".to_string()),
+                ("Connection".to_string(), "keep-alive, Upgrade".to_string()),
+                ("Sec-WebSocket-Version".to_string(), "13".to_string()),
+                (
+                    "Sec-WebSocket-Key".to_string(),
+                    "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+                ),
+            ],
+            body: String::new(),
+        };
+
+        assert!(validate_websocket_handshake(&request, &RemoteSecurity::default()).is_ok());
+
+        let mut origin_request = request;
+        origin_request
+            .headers
+            .push(("Origin".to_string(), "http://evil.example".to_string()));
+        let error =
+            validate_websocket_handshake(&origin_request, &RemoteSecurity::default()).unwrap_err();
+        assert!(error.to_string().contains("Origin"));
+
+        assert!(
+            validate_websocket_handshake(
+                &origin_request,
+                &RemoteSecurity {
+                    session_token: Some("secret".to_string()),
+                    ..Default::default()
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn read_http_request_parses_headers_and_body() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1360,6 +1510,169 @@ mod tests {
         let _ = handle.join();
         assert!(
             err.to_string().contains("exceeds limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_http_request_rejects_malformed_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let _ = stream.write_all(
+                b"POST /rpc HTTP/1.1\r\nHost: localhost\r\nContent-Length: oops\r\n\r\nbody",
+            );
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let err = read_http_request(&mut stream).unwrap_err();
+        let _ = handle.join();
+
+        assert!(
+            err.to_string().contains("invalid Content-Length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn control_capability_is_part_of_the_default_capability_set() {
+        assert!(AgentCapability::default().contains(AgentCapability::CONTROL));
+        // A capability that was never granted by default is still absent.
+        assert!(!AgentCapability::default().contains(AgentCapability::MUTATE_ECS));
+    }
+
+    #[test]
+    fn authorize_readonly_enforces_session_token_when_configured() {
+        let bridge = JsonRpcBridge::new(RemoteSecurity {
+            session_token: Some("secret".to_string()),
+            ..Default::default()
+        });
+
+        // Read-only inspectors pass no capability; only the session token matters.
+        assert!(bridge.authorize(None, &json!({})).is_err());
+        assert!(
+            bridge
+                .authorize(None, &json!({ "session_token": "wrong" }))
+                .is_err()
+        );
+        assert!(
+            bridge
+                .authorize(None, &json!({ "session_token": "secret" }))
+                .is_ok()
+        );
+
+        // With no token configured, read-only access stays open.
+        assert!(JsonRpcBridge::default().authorize(None, &json!({})).is_ok());
+    }
+
+    #[test]
+    fn authorize_control_requires_capability_and_token() {
+        let bridge = JsonRpcBridge::new(RemoteSecurity {
+            session_token: Some("secret".to_string()),
+            ..Default::default()
+        });
+
+        // CONTROL is granted by default, so a correct token authorizes it.
+        assert!(
+            bridge
+                .authorize(
+                    Some(AgentCapability::CONTROL),
+                    &json!({ "session_token": "secret" })
+                )
+                .is_ok()
+        );
+        assert!(
+            bridge
+                .authorize(Some(AgentCapability::CONTROL), &json!({}))
+                .is_err()
+        );
+        assert!(
+            bridge
+                .authorize(
+                    Some(AgentCapability::CONTROL),
+                    &json!({ "session_token": "wrong" })
+                )
+                .is_err()
+        );
+
+        // Dropping CONTROL rejects even a correct token.
+        let mut capabilities = AgentCapability::default();
+        capabilities.remove(AgentCapability::CONTROL);
+        let no_control = JsonRpcBridge::new(RemoteSecurity {
+            session_token: Some("secret".to_string()),
+            capabilities,
+        });
+        assert!(
+            no_control
+                .authorize(
+                    Some(AgentCapability::CONTROL),
+                    &json!({ "session_token": "secret" })
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_jsonrpc_version_rejects_anything_other_than_two_dot_zero() {
+        fn req(version: Option<&str>) -> JsonRpcRequest {
+            JsonRpcRequest {
+                jsonrpc: version.map(ToOwned::to_owned),
+                id: json!(1),
+                method: "agent.info".to_string(),
+                params: json!({}),
+            }
+        }
+
+        assert!(validate_jsonrpc_version(&req(Some("2.0"))).is_ok());
+        // Absent version is tolerated to keep existing clients working.
+        assert!(validate_jsonrpc_version(&req(None)).is_ok());
+        assert!(validate_jsonrpc_version(&req(Some("1.0"))).is_err());
+        assert!(validate_jsonrpc_version(&req(Some("2"))).is_err());
+        assert!(validate_jsonrpc_version(&req(Some("2.00"))).is_err());
+    }
+
+    #[test]
+    fn read_websocket_text_rejects_oversized_extended_length_without_allocating() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            // FIN+text, masked, 64-bit extended length claiming a huge payload
+            // that we deliberately never transmit.
+            let mut frame = vec![0x81, 0xff];
+            frame.extend_from_slice(&u64::MAX.to_be_bytes());
+            stream.write_all(&frame).unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let err = read_websocket_text(&mut stream).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(
+            err.to_string().contains("exceeds limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_websocket_text_rejects_unmasked_client_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            // FIN+text, unmasked, with an unmasked payload.
+            stream
+                .write_all(&[0x81, 0x05, b'h', b'e', b'l', b'l', b'o'])
+                .unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let err = read_websocket_text(&mut stream).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(
+            err.to_string().contains("unmasked"),
             "unexpected error: {err}"
         );
     }

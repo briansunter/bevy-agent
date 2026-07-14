@@ -1,11 +1,13 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -42,9 +44,12 @@ fn build_request(command: &str, args: &mut Vec<String>) -> Result<(&'static str,
         "action-space" => Ok(("agent.action_space", json!({}))),
         "observation-space" => Ok(("agent.observation_space", json!({}))),
         "reset" => {
-            let seed = take_option(args, "--seed")
+            // A bare reset matches ResetOptions::default() (seed: Some(0)); an
+            // explicit --seed still wins. --seed without a value is an error.
+            let seed = take_value_option(args, "--seed")?
                 .map(|value| value.parse::<u64>())
-                .transpose()?;
+                .transpose()?
+                .unwrap_or(0);
             let observation_mode =
                 take_option(args, "--mode").unwrap_or_else(|| "Hybrid".to_string());
             Ok((
@@ -155,17 +160,18 @@ fn post_json_rpc(url: &str, request: &Value) -> Result<Value> {
     let endpoint = HttpEndpoint::parse(url)?;
     let body = serde_json::to_string(request)?;
     let mut stream = TcpStream::connect((&*endpoint.host, endpoint.port))?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    let host_header = endpoint.host_header();
     let http_request = format!(
         "POST {} HTTP/1.1\r\n\
-         Host: {}:{}\r\n\
+         Host: {host_header}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
         endpoint.path,
-        endpoint.host,
-        endpoint.port,
         body.len(),
         body
     );
@@ -174,13 +180,24 @@ fn post_json_rpc(url: &str, request: &Value) -> Result<Value> {
 
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
-    let (_, body) = response
+    let (status_line, response_body) = response
         .split_once("\r\n\r\n")
         .ok_or_else(|| anyhow!("malformed HTTP response"))?;
-    let value = serde_json::from_str(body.trim())?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|token| token.parse::<u16>().ok())
+        .ok_or_else(|| anyhow!("malformed HTTP status line"))?;
+    if !(200..300).contains(&status_code) {
+        // Surface transport/server errors with their body. A 2xx response may
+        // still carry a JSON-RPC level error, which is returned verbatim below.
+        return Err(anyhow!("HTTP {status_code}: {}", response_body.trim()));
+    }
+    let value = serde_json::from_str(response_body.trim())?;
     Ok(value)
 }
 
+#[derive(Debug)]
 struct HttpEndpoint {
     host: String,
     port: u16,
@@ -196,12 +213,47 @@ impl HttpEndpoint {
             .split_once('/')
             .map(|(host, path)| (host, format!("/{path}")))
             .unwrap_or((rest, "/rpc".to_string()));
-        let (host, port) = if let Some((host, port)) = host_port.rsplit_once(':') {
-            (host.to_string(), port.parse::<u16>()?)
-        } else {
-            (host_port.to_string(), 80)
-        };
+        let (host, port) = parse_host_port(host_port)?;
         Ok(Self { host, port, path })
+    }
+
+    fn host_header(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+fn parse_host_port(host_port: &str) -> Result<(String, u16)> {
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        let closing = bracketed
+            .find(']')
+            .ok_or_else(|| anyhow!("invalid bracketed host {host_port}"))?;
+        let host = bracketed[..closing].to_string();
+        let suffix = &bracketed[closing + 1..];
+        let port = if suffix.is_empty() {
+            80
+        } else {
+            suffix
+                .strip_prefix(':')
+                .ok_or_else(|| anyhow!("invalid host/port {host_port}"))?
+                .parse::<u16>()?
+        };
+        return Ok((host, port));
+    }
+
+    if host_port.matches(':').count() > 1 {
+        return Err(anyhow!(
+            "IPv6 addresses must be enclosed in brackets: {host_port}"
+        ));
+    }
+
+    if let Some((host, port)) = host_port.rsplit_once(':') {
+        Ok((host.to_string(), port.parse::<u16>()?))
+    } else {
+        Ok((host_port.to_string(), 80))
     }
 }
 
@@ -212,6 +264,21 @@ fn take_option(args: &mut Vec<String>, name: &str) -> Option<String> {
         Some(args.remove(index))
     } else {
         None
+    }
+}
+
+/// Like `take_option`, but errors when the option is present without a value
+/// (for example `--seed` at the end of the argument list). Returns `Ok(None)`
+/// when the option is absent, so callers can still apply their own default.
+fn take_value_option(args: &mut Vec<String>, name: &str) -> Result<Option<String>> {
+    let Some(index) = args.iter().position(|arg| arg == name) else {
+        return Ok(None);
+    };
+    args.remove(index);
+    if index < args.len() {
+        Ok(Some(args.remove(index)))
+    } else {
+        Err(anyhow!("{name} requires a value"))
     }
 }
 
@@ -263,6 +330,22 @@ mod tests {
         assert_eq!(endpoint.host, "127.0.0.1");
         assert_eq!(endpoint.port, 4010);
         assert_eq!(endpoint.path, "/rpc");
+    }
+
+    #[test]
+    fn endpoint_parse_supports_bracketed_ipv6() {
+        let endpoint = HttpEndpoint::parse("http://[::1]:4010/rpc").unwrap();
+
+        assert_eq!(endpoint.host, "::1");
+        assert_eq!(endpoint.port, 4010);
+        assert_eq!(endpoint.host_header(), "[::1]:4010");
+    }
+
+    #[test]
+    fn endpoint_parse_rejects_unbracketed_ipv6() {
+        let error = HttpEndpoint::parse("http://::1:4010/rpc").unwrap_err();
+
+        assert!(error.to_string().contains("enclosed in brackets"));
     }
 
     #[test]
@@ -419,5 +502,97 @@ mod tests {
         handle.join().unwrap();
 
         assert_eq!(value["result"]["ok"], true);
+    }
+
+    #[test]
+    fn bare_reset_serializes_the_default_seed_zero() {
+        // A bare reset must match ResetOptions::default(), whose seed is Some(0),
+        // rather than sending a null seed that skips reseeding entirely.
+        let mut args: Vec<String> = Vec::new();
+
+        let (_, params) = build_request("reset", &mut args).unwrap();
+
+        assert_eq!(params["options"]["seed"], 0);
+        assert_eq!(params["options"]["observation_mode"], "Hybrid");
+        assert_eq!(params["options"]["create_initial_snapshot"], true);
+    }
+
+    #[test]
+    fn explicit_seed_overrides_the_default() {
+        let mut args = vec!["--seed".to_string(), "42".to_string()];
+
+        let (_, params) = build_request("reset", &mut args).unwrap();
+
+        assert_eq!(params["options"]["seed"], 42);
+    }
+
+    #[test]
+    fn reset_seed_without_a_value_errors() {
+        let mut args = vec!["--seed".to_string()];
+
+        let error = build_request("reset", &mut args).unwrap_err();
+
+        assert!(
+            error.to_string().contains("--seed requires a value"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn post_json_rpc_errors_on_non_2xx_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 1024];
+            let _ = stream.read(&mut buf);
+            let body = "server exploded";
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let error = post_json_rpc(
+            &format!("http://{addr}/rpc"),
+            &json!({"jsonrpc":"2.0","id":1,"method":"agent.info","params":{}}),
+        )
+        .unwrap_err();
+        handle.join().unwrap();
+
+        assert!(
+            error.to_string().contains("HTTP 500"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn post_json_rpc_preserves_jsonrpc_error_on_http_200() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 1024];
+            let _ = stream.read(&mut buf);
+            // The bridge returns JSON-RPC errors in an HTTP 200 body.
+            let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"invalid or missing session token"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let value = post_json_rpc(
+            &format!("http://{addr}/rpc"),
+            &json!({"jsonrpc":"2.0","id":1,"method":"agent.info","params":{}}),
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(value["error"]["code"], -32603);
     }
 }

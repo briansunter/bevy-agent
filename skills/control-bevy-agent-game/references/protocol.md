@@ -64,6 +64,29 @@ Core methods:
 - `agent.control.resume`
 - `agent.control.set_mode`
 
+## Security and Capabilities
+
+The bridge gates methods with an optional session token and a capability set.
+
+- Session token: when `RemoteSecurity.session_token` is configured, every method requires `params.session_token` to match it. No token is required when none is configured. `agentctl` sends it through `--token` or `AGENT_TOKEN`.
+- Read-only inspectors (`agent.info`, `agent.action_space`, `agent.observation_space`, `agent.schema`, `agent.timeline.current`) require the token when configured but need no capability.
+- Mutating methods require both the token and the matching capability.
+
+Capability bits — the default set grants every capability except `MUTATE_ECS` and `SPAWN_DESPAWN`:
+
+- `STEP`: `agent.reset`, `agent.step`, `agent.step_many`, `agent.fast_forward`, and the replay methods.
+- `OBSERVE_PLAYER`: `agent.observe`.
+- `VISUAL_CAPTURE`: `agent.visual.capture`.
+- `SNAPSHOT`: `agent.snapshot.create`, `agent.snapshot.list`, `agent.snapshot.delete`.
+- `RESTORE`: `agent.snapshot.restore`, `agent.timeline.restore_tick`.
+- `BRANCH`: `agent.timeline.branch`.
+- `CONTROL`: `agent.control.pause`, `agent.control.resume`, `agent.control.set_mode`.
+- `MUTATE_ECS`, `SPAWN_DESPAWN`: reserved, not granted by default.
+
+Authentication and capability failures are returned as JSON-RPC errors in an HTTP 200 response, not as HTTP 401/403. Unauthenticated binds are only permitted on loopback; set `AGENT_TOKEN` before binding a public interface such as `0.0.0.0`.
+
+Tokenless WebSocket sessions must omit the browser `Origin` header; browser clients should configure a session token.
+
 ## Curl Smoke Tests
 
 Use curl when no CLI wrapper exists:
@@ -181,5 +204,5 @@ Always inspect:
 - Nondeterministic replay: compare initial seed/options, action order, tick count, RNG resources, and checksum inputs.
 - Restore mismatch: ensure the snapshot ID or restore tick belongs to the active timeline/branch.
 - Capture missing: ensure the app has the `VISUAL_CAPTURE` capability and either a registered visual capture renderer or a visual build with screenshot support.
-- HTTP 401/403: pass the same token used by the runtime, usually through `AGENT_TOKEN` or an `agentctl --token` flag.
+- Auth or capability rejected: the bridge reports these as JSON-RPC errors inside an HTTP 200 body (for example an `-32603` "invalid or missing session token" or "missing remote capability" message), not as HTTP 401/403. Pass the runtime's token via `AGENT_TOKEN` or `agentctl --token`; mutating methods also need the matching capability in `RemoteSecurity.capabilities`.
 - Connection refused: verify the server command is still running, the bind address is localhost, and the port matches the client.

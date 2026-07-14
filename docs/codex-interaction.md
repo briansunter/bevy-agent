@@ -51,7 +51,9 @@ AGENT_TOKEN=secret cargo run -p sample_platformer --example remote_http -- 127.0
 cargo run -p agentctl -- --token secret info
 ```
 
-Remote servers may run without a token only on loopback binds. Set `AGENT_TOKEN` before binding to a public interface such as `0.0.0.0`.
+Remote servers may run without a token only on loopback binds. Set `AGENT_TOKEN` before binding to a public interface such as `0.0.0.0`. A missing or wrong token, or a missing capability, is returned as a JSON-RPC error in the HTTP 200 response body rather than as an HTTP 401/403; mutating methods such as `agent.control.pause`/`resume`/`set_mode` require the `CONTROL` capability.
+
+Tokenless WebSocket sessions are intended for non-browser local clients; browser-originated WebSocket handshakes require a session token.
 
 For direct tool sessions where HTTP is unnecessary, use stdio:
 

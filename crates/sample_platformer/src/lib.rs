@@ -694,11 +694,14 @@ fn platformer_checksum(world: &mut World) -> StateChecksum {
         Option<&Transform>,
         Option<&Velocity>,
         Option<&Player>,
+        Option<&OnGround>,
         Option<&Platform>,
         Option<&Goal>,
         Option<&Coin>,
     )>();
-    for (stable_id, transform, velocity, player, platform, goal, coin) in query.iter(world) {
+    for (stable_id, transform, velocity, player, on_ground, platform, goal, coin) in
+        query.iter(world)
+    {
         let Some(stable_id) = stable_id.copied() else {
             continue;
         };
@@ -712,7 +715,10 @@ fn platformer_checksum(world: &mut World) -> StateChecksum {
                 .unwrap_or(0),
             velocity.map(|value| value.linvel.x.to_bits()).unwrap_or(0),
             velocity.map(|value| value.linvel.y.to_bits()).unwrap_or(0),
-            player.is_some(),
+            player
+                .map(|value| value.health.to_bits())
+                .unwrap_or_default(),
+            on_ground.map(|value| value.0).unwrap_or_default(),
             platform.is_some(),
             goal.is_some(),
             coin.map(|coin| coin.value).unwrap_or_default(),
@@ -764,5 +770,31 @@ mod tests {
         assert!(app.world().contains_resource::<SimClock>());
         assert!(app.world().contains_resource::<GameScore>());
         assert!(app.world().contains_resource::<PlatformerState>());
+    }
+
+    #[test]
+    fn platformer_checksum_includes_observed_player_state() {
+        let mut app = build_headless_app();
+        app.finish();
+        app.cleanup();
+        let player = app
+            .world_mut()
+            .spawn((
+                StableEntityId::from_u64(1),
+                Transform::default(),
+                Velocity::default(),
+                Player { health: 100.0 },
+                OnGround(false),
+            ))
+            .id();
+
+        let baseline = platformer_checksum(app.world_mut()).hash;
+        app.world_mut().get_mut::<Player>(player).unwrap().health = 50.0;
+        let damaged = platformer_checksum(app.world_mut()).hash;
+        assert_ne!(damaged, baseline);
+
+        app.world_mut().get_mut::<OnGround>(player).unwrap().0 = true;
+        let grounded = platformer_checksum(app.world_mut()).hash;
+        assert_ne!(grounded, damaged);
     }
 }

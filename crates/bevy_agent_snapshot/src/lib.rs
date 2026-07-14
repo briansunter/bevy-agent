@@ -4,15 +4,17 @@
 //! [`SnapshotEntity`](bevy_agent_core::SnapshotEntity) and registered
 //! resources/components are serialized and restored.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use anyhow::{Context, Result, anyhow};
 use bevy::ecs::world::{EntityRef, EntityWorldMut};
 use bevy::prelude::*;
 use bevy_agent_core::{
-    AgentAction, AgentActionQueue, AgentControlState, AgentSet, ScheduledAction, SimClock,
-    SnapshotEntity, SnapshotId, StableEntityId, StableHasher, StateChecksum, TimelineId,
+    AgentAction, AgentActionQueue, AgentControlState, AgentSet, CurrentInputFrame,
+    DeterministicRng, EpisodeState, ObservationConfig, RewardState, ScheduledAction, SimClock,
+    SnapshotEntity, SnapshotId, StableEntityId, StableHasher, StableIdAllocator, StateChecksum,
+    TimelineId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -279,6 +281,12 @@ impl Plugin for AgentSnapshotPlugin {
             .register_snapshot_component::<StableEntityId>()
             .register_snapshot_resource::<SimClock>()
             .register_snapshot_resource::<AgentActionQueue>()
+            .register_snapshot_resource::<StableIdAllocator>()
+            .register_snapshot_resource::<DeterministicRng>()
+            .register_snapshot_resource::<CurrentInputFrame>()
+            .register_snapshot_resource::<ObservationConfig>()
+            .register_snapshot_resource::<RewardState>()
+            .register_snapshot_resource::<EpisodeState>()
             .add_systems(
                 bevy_agent_core::AgentTick,
                 maybe_take_snapshot.in_set(AgentSet::Snapshot),
@@ -486,6 +494,24 @@ pub fn restore_snapshot(world: &mut World, snapshot_id: SnapshotId) -> Result<St
 }
 
 pub fn restore_snapshot_value(world: &mut World, snapshot: &Snapshot) -> Result<StateChecksum> {
+    let expected_schema_hash = world.resource::<SnapshotRegistry>().schema_hash();
+    if snapshot.manifest.schema_hash != expected_schema_hash {
+        return Err(anyhow!(
+            "snapshot schema hash mismatch: expected {expected_schema_hash}, got {}",
+            snapshot.manifest.schema_hash
+        ));
+    }
+
+    let mut stable_ids = HashSet::with_capacity(snapshot.entities.len());
+    for entity in &snapshot.entities {
+        if !stable_ids.insert(entity.stable_id) {
+            return Err(anyhow!(
+                "snapshot contains duplicate StableEntityId {}",
+                entity.stable_id.0
+            ));
+        }
+    }
+
     clear_snapshot_entities(world);
 
     for resource in &snapshot.resources {
@@ -736,6 +762,41 @@ mod tests {
             .collect::<Vec<_>>();
         rows.sort_unstable();
         assert_eq!(rows, vec![(10, 5)]);
+    }
+
+    #[test]
+    fn restore_snapshot_restores_registered_core_allocator() {
+        let mut app = app_with_snapshot();
+
+        let before = app.world().resource::<StableIdAllocator>().next;
+        let snapshot = create_snapshot(app.world_mut(), None).unwrap();
+
+        app.world_mut().resource_mut::<StableIdAllocator>().next = 4242;
+        restore_snapshot(app.world_mut(), snapshot.snapshot_id).unwrap();
+
+        assert_eq!(app.world().resource::<StableIdAllocator>().next, before);
+    }
+
+    #[test]
+    fn restore_snapshot_rejects_schema_mismatch_before_mutating_world() {
+        let mut app = app_with_snapshot();
+        let result = create_snapshot(app.world_mut(), None).unwrap();
+        let snapshot = app
+            .world()
+            .resource::<SnapshotStore>()
+            .snapshots
+            .get(&result.snapshot_id)
+            .cloned()
+            .unwrap();
+        app.world_mut().resource_mut::<TestResource>().value = "changed".to_string();
+
+        let mut incompatible = snapshot;
+        incompatible.manifest.schema_hash = "incompatible-schema".to_string();
+
+        let error = restore_snapshot_value(app.world_mut(), &incompatible).unwrap_err();
+
+        assert!(error.to_string().contains("schema hash mismatch"));
+        assert_eq!(app.world().resource::<TestResource>().value, "changed");
     }
 
     #[test]

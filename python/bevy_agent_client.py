@@ -7,6 +7,10 @@ import subprocess
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+from urllib.error import HTTPError, URLError
+
+
+HTTP_TIMEOUT_SECONDS = 30.0
 
 
 class AgentError(RuntimeError):
@@ -37,8 +41,17 @@ class AgentClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(http_request) as response:
-            message = json.loads(response.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(
+                http_request, timeout=HTTP_TIMEOUT_SECONDS
+            ) as response:
+                message = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace").strip()
+            detail = f": {body}" if body else ""
+            raise AgentError(f"HTTP {error.code}{detail}") from error
+        except URLError as error:
+            raise AgentError(f"request failed: {error.reason}") from error
         if "error" in message:
             raise AgentError(message["error"]["message"])
         return message["result"]
