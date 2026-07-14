@@ -2,7 +2,7 @@
 
 A Bevy 0.18.1 workspace for driving a game as a deterministic simulation that an AI agent can step, inspect, snapshot, restore, replay, and branch.
 
-The implementation is split into small crates:
+The workspace is organized around small crates with one responsibility each:
 
 - `bevy_agent_core`: schedules, `SimClock`, domain actions, input frames, observations, rewards, terminal state, checksums.
 - `bevy_agent_runner`: owns `App`, provides `AgentControlPlugins`, and exposes `reset`, `step`, `step_many`, `fast_forward`, `snapshot`, `restore`, `restore_tick`, `branch`, and visual capture hooks.
@@ -10,6 +10,31 @@ The implementation is split into small crates:
 - `bevy_agent_replay`: action logs, checkpoint indexes, and timeline branches.
 - `bevy_agent_remote`: local JSON-RPC bridge with capability and session-token checks.
 - `sample_platformer`: a headless Bevy platformer wired into `AgentTick`.
+
+## Requirements
+
+- Rust 1.91 or newer
+- Cargo
+- Python 3.10 or newer only for the optional stdlib client in `python/`
+
+Run the commands below from the repository root. The HTTP server examples are long-running: leave the server running in one terminal and use `agentctl`, `curl`, or Python from another. `agentctl` defaults to `http://127.0.0.1:4000/rpc`; use `--url` when the server is elsewhere.
+
+## Repository Layout
+
+- `crates/`: reusable runtime crates, the `agentctl` CLI, and the sample platformer.
+- `python/`: an optional stdlib-only HTTP client.
+- `docs/`: user, integration, and publishing guides; start with [`docs/README.md`](docs/README.md).
+- `skills/`: Codex skills and their protocol/integration references.
+- `Cargo.toml` and `Cargo.lock`: workspace metadata and the locked dependency graph.
+
+## Documentation
+
+- [`docs/README.md`](docs/README.md): documentation index.
+- [`docs/codex-interaction.md`](docs/codex-interaction.md): step, capture, snapshot, restore, branch, replay, and security commands.
+- [`docs/controllable-game.md`](docs/controllable-game.md): integration checklist for a Bevy game.
+- [`docs/publishing.md`](docs/publishing.md): package and publish checks.
+- [`skills/control-bevy-agent-game/SKILL.md`](skills/control-bevy-agent-game/SKILL.md): agent-facing control workflow.
+- [`skills/integrate-bevy-agent-control/SKILL.md`](skills/integrate-bevy-agent-control/SKILL.md): agent-facing integration workflow.
 
 ## Quick Start
 
@@ -48,6 +73,8 @@ Start a local HTTP/WebSocket remote server:
 cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
 ```
 
+The server exposes `POST /rpc`, `GET /health`, and `GET /ws`. For a command-by-command interaction guide, see [`docs/codex-interaction.md`](docs/codex-interaction.md).
+
 Drive it with the CLI:
 
 ```sh
@@ -75,7 +102,9 @@ capture = env.capture(output_dir="screenshots", label="after_restore")
 Run the tests:
 
 ```sh
-cargo test --workspace
+cargo fmt --all -- --check
+cargo test --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 Check optional visual/render dependencies still compile:
@@ -117,7 +146,7 @@ cargo run -p sample_platformer --features visual --example remote_http_visual --
 }
 ```
 
-The bridge currently provides an in-process/stdio JSON-RPC handler. It is deliberately transport-light so it can be embedded into tests, CLIs, or a Bevy Remote Protocol transport without changing the simulation API.
+The JSON-RPC bridge is deliberately transport-light so it can be embedded into tests, CLIs, stdio, or the HTTP/WebSocket server without changing the simulation API.
 
 The sample also includes:
 
@@ -143,3 +172,5 @@ Gameplay systems that need replayable behavior should:
 - keep rendering/UI systems read-only with respect to authoritative simulation state.
 
 The sample platformer follows this contract: movement, gravity, collision, coin pickup, reward, terminal checks, observation extraction, snapshots, replay, and branches all run headlessly under explicit agent control.
+
+Commands that capture images or export replays write local runtime output such as `screenshots/` and `replay.json`. Those paths are ignored by Git; keep any intentional fixtures under an explicitly named test or example directory.

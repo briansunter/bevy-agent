@@ -6,14 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 description = "Replay logs and timeline branches for controllable Bevy agent simulations."
 readme.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/bevy_agent_replay"
 keywords = ["bevy", "gamedev", "replay", "agent"]
 categories = ["game-development", "simulation"]
 
 [dependencies]
-anyhow.workspace = true
 bevy.workspace = true
 bevy_agent_core.workspace = true
-bevy_agent_snapshot.workspace = true
 serde.workspace = true
 uuid.workspace = true

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 description = "Runner API that owns and steps controllable Bevy agent simulation apps."
 readme.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/bevy_agent_runner"
 keywords = ["bevy", "gamedev", "agent", "runner"]
 categories = ["game-development", "simulation"]

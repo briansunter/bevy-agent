@@ -1,5 +1,19 @@
+# Rust build artifacts
 /target/
 **/*.rs.bk
+
+# Python bytecode
 __pycache__/
-*.pyc
+*.py[cod]
+
+# Local runtime output from the examples and agentctl
+/screenshots/
+/replay.json
+
+# Local coverage output
+/coverage/
+/.coverage
+/lcov.info
+
+# OS metadata
 .DS_Store

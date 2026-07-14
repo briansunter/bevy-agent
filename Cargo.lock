@@ -377,7 +377,6 @@ name = "bevy_agent_core"
 version = "0.1.0"
 dependencies = [
  "bevy",
- "bitflags 2.11.1",
  "rand",
  "rand_chacha",
  "serde",
@@ -406,10 +405,8 @@ dependencies = [
 name = "bevy_agent_replay"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bevy",
  "bevy_agent_core",
- "bevy_agent_snapshot",
  "serde",
  "uuid",
 ]
@@ -436,8 +433,6 @@ dependencies = [
  "bevy_agent_core",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
- "uuid",
 ]
 
 [[package]]

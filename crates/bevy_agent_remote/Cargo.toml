@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 description = "JSON-RPC, HTTP, WebSocket, and stdio remote-control bridge for bevy_agent_control."
 readme.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/bevy_agent_remote"
 keywords = ["bevy", "gamedev", "json-rpc", "agent"]
 categories = ["game-development", "network-programming"]

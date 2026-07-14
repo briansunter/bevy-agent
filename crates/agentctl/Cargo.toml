@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 description = "Command-line JSON-RPC client for bevy_agent_control environments."
 readme.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/agentctl"
 keywords = ["bevy", "gamedev", "agent", "json-rpc"]
 categories = ["command-line-utilities", "game-development"]
