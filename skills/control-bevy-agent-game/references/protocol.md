@@ -64,6 +64,14 @@ Core methods:
 - `agent.control.resume`
 - `agent.control.set_mode`
 
+`agent.reset` returns a stable envelope with `tick`, `observation`,
+`checksum`, `snapshot_id`, `timeline_id`, and `branch_id`.
+`agent.step_many` always returns the same object shape. Its top-level fields
+include aggregate `reward`, separate `done` and `truncated`, last `info`,
+last `checksum`, and `responses` (populated when `return_observations` is
+`all`). Replay export returns a portable `bundle` containing the log and every
+referenced snapshot.
+
 ## Security and Capabilities
 
 The bridge gates methods with an optional session token and a capability set.
@@ -166,7 +174,8 @@ Capture:
   "params": {
     "output_dir": "screenshots",
     "label": "tick_1",
-    "timeout_frames": 8
+    "timeout_frames": 8,
+    "source": "primary_window"
   }
 }
 ```
@@ -178,7 +187,8 @@ from bevy_agent_client import AgentClient
 
 env = AgentClient("http://127.0.0.1:4000/rpc")
 print(env.info())
-obs = env.reset(seed=42)
+reset = env.reset(seed=42)
+obs = reset["observation"]
 step = env.step({"type": "Move", "x": 1.0, "y": 0.0})
 capture = env.capture(output_dir="screenshots", label="after_step")
 snapshot = env.snapshot()
@@ -202,7 +212,7 @@ Always inspect:
 - No movement: inspect `agent.action_space` and confirm action names/fields match the schema exactly.
 - Actions ignored: check `info.actions_applied`, scheduled tick, pause/control mode, and whether the episode is already `done` or `truncated`.
 - Nondeterministic replay: compare initial seed/options, action order, tick count, RNG resources, and checksum inputs.
-- Restore mismatch: ensure the snapshot ID or restore tick belongs to the active timeline/branch.
-- Capture missing: ensure the app has the `VISUAL_CAPTURE` capability and either a registered visual capture renderer or a visual build with screenshot support.
+- Restore mismatch: ensure the portable replay bundle contains the referenced snapshot and matches the running game/version.
+- Capture missing: ensure the app has the `VISUAL_CAPTURE` capability and either a registered visual capture renderer or a visual app using `BevyRemoteControlPlugin`; use `source: "primary_window"` to bypass software capture.
 - Auth or capability rejected: the bridge reports these as JSON-RPC errors inside an HTTP 200 body (for example an `-32603` "invalid or missing session token" or "missing remote capability" message), not as HTTP 401/403. Pass the runtime's token via `AGENT_TOKEN` or `agentctl --token`; mutating methods also need the matching capability in `RemoteSecurity.capabilities`.
 - Connection refused: verify the server command is still running, the bind address is localhost, and the port matches the client.

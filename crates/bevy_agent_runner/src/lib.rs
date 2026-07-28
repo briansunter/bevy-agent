@@ -6,15 +6,15 @@ use anyhow::{Result, anyhow};
 use bevy::app::{PluginGroup, PluginGroupBuilder};
 use bevy::prelude::*;
 use bevy_agent_core::{
-    ActionSource, AgentAction, AgentActionQueue, AgentControlPlugin, AgentControlState,
-    AgentPostTick, AgentPreTick, AgentReset, AgentTick, ControlMode, CurrentInputFrame,
-    DeterministicRng, EpisodeState, LastStepResponse, Observation, ObservationConfig,
-    ObservationMode, RewardState, SimClock, SnapshotId, StepResponse, collect_observation,
+    ActionSource, AgentAction, AgentActionQueue, AgentControlPlugin, AgentControlState, AgentReset,
+    ControlMode, CurrentInputFrame, DeterministicRng, EnvironmentMetadata, EpisodeState,
+    LastStepResponse, Observation, ObservationConfig, ObservationMode, ResetResponse, RewardState,
+    SimClock, SnapshotId, StepManyResponse, StepResponse, collect_observation, run_agent_tick,
 };
 use bevy_agent_replay::{AgentReplayPlugin, ReplayLog, ReplayRecorder, Timeline};
 use bevy_agent_snapshot::{
-    AgentSnapshotPlugin, SnapshotCreateResult, SnapshotPolicy, SnapshotStore, create_snapshot,
-    restore_snapshot,
+    AgentSnapshotPlugin, Snapshot, SnapshotCreateResult, SnapshotPolicy, SnapshotStore,
+    create_snapshot, restore_snapshot,
 };
 use serde::{Deserialize, Serialize};
 
@@ -128,6 +128,17 @@ pub struct VisualCaptureOptions {
     pub output_dir: PathBuf,
     pub label: Option<String>,
     pub timeout_frames: u32,
+    #[serde(default)]
+    pub source: CaptureSource,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSource {
+    #[default]
+    Auto,
+    Software,
+    PrimaryWindow,
 }
 
 impl Default for VisualCaptureOptions {
@@ -136,8 +147,21 @@ impl Default for VisualCaptureOptions {
             output_dir: PathBuf::from("screenshots"),
             label: None,
             timeout_frames: 8,
+            source: CaptureSource::Auto,
         }
     }
+}
+
+/// A portable replay artifact containing every snapshot referenced by its log.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplayBundle {
+    pub format_version: u32,
+    pub log: ReplayLog,
+    pub snapshots: Vec<Snapshot>,
+}
+
+impl ReplayBundle {
+    pub const FORMAT_VERSION: u32 = 1;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -311,6 +335,26 @@ impl AgentApp {
         }
     }
 
+    /// Wraps an app whose plugins have already been finished by an external
+    /// runner. This is primarily used by main-thread integrations that lend
+    /// their world to the synchronous control API for one request.
+    pub fn from_running_app(app: App, reset_once: bool) -> Self {
+        Self {
+            app,
+            started: true,
+            reset_once,
+        }
+    }
+
+    pub fn into_app(self) -> App {
+        self.app
+    }
+
+    #[must_use]
+    pub const fn has_reset(&self) -> bool {
+        self.reset_once
+    }
+
     pub fn app(&self) -> &App {
         &self.app
     }
@@ -360,19 +404,39 @@ impl AgentApp {
         self.ensure_started();
         self.ensure_reset()?;
 
-        if self
-            .app
-            .world()
-            .contains_resource::<AgentVisualCaptureRenderer>()
-        {
-            return self.app.world_mut().resource_scope(
-                |world, renderer: Mut<AgentVisualCaptureRenderer>| {
-                    renderer.capture(world, &options)
-                },
-            );
+        match options.source {
+            CaptureSource::PrimaryWindow => self.capture_primary_window(options),
+            CaptureSource::Software => {
+                if !self
+                    .app
+                    .world()
+                    .contains_resource::<AgentVisualCaptureRenderer>()
+                {
+                    return Err(anyhow!(
+                        "software visual capture requested, but no AgentVisualCaptureRenderer is registered"
+                    ));
+                }
+                self.app.world_mut().resource_scope(
+                    |world, renderer: Mut<AgentVisualCaptureRenderer>| {
+                        renderer.capture(world, &options)
+                    },
+                )
+            }
+            CaptureSource::Auto => {
+                if self
+                    .app
+                    .world()
+                    .contains_resource::<AgentVisualCaptureRenderer>()
+                {
+                    return self.app.world_mut().resource_scope(
+                        |world, renderer: Mut<AgentVisualCaptureRenderer>| {
+                            renderer.capture(world, &options)
+                        },
+                    );
+                }
+                self.capture_primary_window(options)
+            }
         }
-
-        self.capture_primary_window(options)
     }
 
     pub fn capture_primary_window(
@@ -400,6 +464,165 @@ impl AgentApp {
             .map(|recorder| &recorder.log)
     }
 
+    pub fn reset_with_response(
+        &mut self,
+        options: ResetOptions,
+    ) -> Result<ResetResponse<Observation>> {
+        let observation = <Self as AgentEnvironment>::reset(self, options)?;
+        let response = self.last_response()?;
+        Ok(ResetResponse {
+            tick: response.tick,
+            observation,
+            checksum: response.checksum,
+            snapshot_id: response.info.snapshot_created,
+            timeline_id: response.info.timeline_id,
+            branch_id: response.info.branch_id,
+        })
+    }
+
+    pub fn step_many_with_response(
+        &mut self,
+        actions: Vec<AgentAction>,
+        stop_on_done: bool,
+        include_responses: bool,
+    ) -> Result<StepManyResponse<Observation>> {
+        let start_tick = self.current_tick();
+        let mut responses = Vec::new();
+        for action in actions {
+            let response = self.step(action)?;
+            let terminal = response.done || response.truncated;
+            responses.push(response);
+            if stop_on_done && terminal {
+                break;
+            }
+        }
+        let last = responses.last();
+        Ok(StepManyResponse {
+            start_tick,
+            end_tick: last.map_or(start_tick, |response| response.tick),
+            steps: responses.len(),
+            observation: last.map(|response| response.observation.clone()),
+            reward: responses.iter().map(|response| response.reward).sum(),
+            done: last.is_some_and(|response| response.done),
+            truncated: last.is_some_and(|response| response.truncated),
+            info: last.map(|response| response.info.clone()),
+            checksum: last.and_then(|response| response.checksum.clone()),
+            responses: if include_responses {
+                responses
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    pub fn export_replay_bundle(&self) -> Result<ReplayBundle> {
+        let log = self
+            .app
+            .world()
+            .get_resource::<ReplayRecorder>()
+            .map(|recorder| recorder.log.clone())
+            .ok_or_else(|| anyhow!("AgentReplayPlugin is not installed"))?;
+        let store = self
+            .app
+            .world()
+            .get_resource::<SnapshotStore>()
+            .ok_or_else(|| anyhow!("AgentSnapshotPlugin is not installed"))?;
+
+        let mut ids = log.checkpoints.values().copied().collect::<Vec<_>>();
+        if let Some(initial) = log.initial_snapshot {
+            ids.push(initial);
+        }
+        ids.sort();
+        ids.dedup();
+
+        let snapshots = ids
+            .into_iter()
+            .map(|id| {
+                store
+                    .snapshots
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("replay references missing snapshot {id:?}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(ReplayBundle {
+            format_version: ReplayBundle::FORMAT_VERSION,
+            log,
+            snapshots,
+        })
+    }
+
+    pub fn load_replay_bundle(&mut self, bundle: ReplayBundle) -> Result<()> {
+        if bundle.format_version != ReplayBundle::FORMAT_VERSION {
+            return Err(anyhow!(
+                "unsupported replay bundle format {}; expected {}",
+                bundle.format_version,
+                ReplayBundle::FORMAT_VERSION
+            ));
+        }
+        let environment = self
+            .app
+            .world()
+            .get_resource::<EnvironmentMetadata>()
+            .cloned()
+            .unwrap_or_default();
+        if environment.name != "unknown-game" && bundle.log.manifest.game_id != environment.name {
+            return Err(anyhow!(
+                "replay game mismatch: expected {}, got {}",
+                environment.name,
+                bundle.log.manifest.game_id
+            ));
+        }
+        if environment.name != "unknown-game"
+            && bundle.log.manifest.game_version != environment.version
+        {
+            return Err(anyhow!(
+                "replay version mismatch: expected {}, got {}",
+                environment.version,
+                bundle.log.manifest.game_version
+            ));
+        }
+
+        let referenced = bundle
+            .log
+            .initial_snapshot
+            .into_iter()
+            .chain(bundle.log.checkpoints.values().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        let provided = bundle
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.manifest.snapshot_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(missing) = referenced.difference(&provided).next() {
+            return Err(anyhow!(
+                "replay bundle is missing referenced snapshot {missing:?}"
+            ));
+        }
+
+        {
+            let mut store = self
+                .app
+                .world_mut()
+                .get_resource_mut::<SnapshotStore>()
+                .ok_or_else(|| anyhow!("AgentSnapshotPlugin is not installed"))?;
+            for snapshot in bundle.snapshots {
+                let id = snapshot.manifest.snapshot_id;
+                if let Some(label) = snapshot.manifest.label.clone() {
+                    store.labels.insert(label, id);
+                }
+                store.snapshots.insert(id, snapshot);
+            }
+        }
+        self.app
+            .world_mut()
+            .get_resource_mut::<ReplayRecorder>()
+            .ok_or_else(|| anyhow!("AgentReplayPlugin is not installed"))?
+            .log = bundle.log;
+        Ok(())
+    }
+
     fn ensure_started(&mut self) {
         if self.started {
             return;
@@ -416,10 +639,7 @@ impl AgentApp {
     }
 
     fn run_one_agent_tick(&mut self) {
-        let world = self.app.world_mut();
-        world.run_schedule(AgentPreTick);
-        world.run_schedule(AgentTick);
-        world.run_schedule(AgentPostTick);
+        run_agent_tick(self.app.world_mut());
     }
 
     fn last_response(&self) -> Result<StepResponse<Observation>> {
@@ -609,6 +829,11 @@ impl AgentEnvironment for AgentApp {
         reset_replay_and_timeline(self.app.world_mut());
 
         let mut response = self.last_response()?;
+        {
+            let control = self.app.world().resource::<AgentControlState>();
+            response.info.timeline_id = control.timeline_id;
+            response.info.branch_id = control.branch_id;
+        }
         if options.create_initial_snapshot && self.has_snapshot_support() {
             let snapshot = create_snapshot(
                 self.app.world_mut(),
@@ -622,12 +847,12 @@ impl AgentEnvironment for AgentApp {
                     .insert(snapshot.tick, snapshot.snapshot_id);
                 recorder
                     .log
-                    .checksums
+                    .snapshot_checksums
                     .insert(snapshot.tick, snapshot.checksum);
             }
             response.info.snapshot_created = Some(snapshot.snapshot_id);
-            self.app.world_mut().resource_mut::<LastStepResponse>().0 = Some(response.clone());
         }
+        self.app.world_mut().resource_mut::<LastStepResponse>().0 = Some(response.clone());
 
         Ok(response.observation)
     }
@@ -679,7 +904,7 @@ impl AgentEnvironment for AgentApp {
                 .insert(result.tick, result.snapshot_id);
             recorder
                 .log
-                .checksums
+                .snapshot_checksums
                 .insert(result.tick, result.checksum.clone());
         }
         Ok(result)
@@ -801,6 +1026,10 @@ pub fn clear_episode(world: &mut World) {
 /// new root. It is a no-op for apps that do not install the replay resources, so
 /// core-only and snapshot-less configurations remain supported.
 fn reset_replay_and_timeline(world: &mut World) {
+    let environment = world
+        .get_resource::<EnvironmentMetadata>()
+        .cloned()
+        .unwrap_or_default();
     let new_root = world.get_resource_mut::<Timeline>().map(|mut timeline| {
         *timeline = Timeline::default();
         (timeline.timeline_id, timeline.current_branch)
@@ -809,6 +1038,8 @@ fn reset_replay_and_timeline(world: &mut World) {
     if let Some(mut recorder) = world.get_resource_mut::<ReplayRecorder>() {
         let recording = recorder.recording;
         recorder.log = ReplayLog::default();
+        recorder.log.manifest.game_id = environment.name;
+        recorder.log.manifest.game_version = environment.version;
         recorder.recording = recording;
     }
 
@@ -914,6 +1145,7 @@ mod tests {
             output_dir: output_dir.clone(),
             label: Some("Test Capture".to_string()),
             timeout_frames: 1,
+            source: CaptureSource::Auto,
         };
 
         let first = visual_capture_path(&options, 3, 4).unwrap();

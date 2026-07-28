@@ -298,18 +298,32 @@ Snapshot restore test shape:
 #[test]
 fn restore_replays_to_same_checksum() {
     let mut env = AgentApp::new(build_headless_app);
-    let first = env.reset(ResetOptions { seed: Some(42), ..Default::default() }).unwrap();
+    let first = env.reset_with_response(
+        ResetOptions { seed: Some(42), ..Default::default() }
+    ).unwrap();
     let snapshot = env.snapshot().unwrap();
 
-    let actions = [
+    let actions = vec![
         AgentAction::Move { x: 1.0, y: 0.0 },
         AgentAction::Jump,
         AgentAction::Noop,
     ];
-    let a = env.step_many(actions.clone()).unwrap().checksum;
+    let a = env
+        .step_many(actions.clone())
+        .unwrap()
+        .last()
+        .unwrap()
+        .checksum
+        .clone();
 
     env.restore(snapshot.snapshot_id).unwrap();
-    let b = env.step_many(actions).unwrap().checksum;
+    let b = env
+        .step_many(actions)
+        .unwrap()
+        .last()
+        .unwrap()
+        .checksum
+        .clone();
 
     assert_eq!(first.tick, 0);
     assert_eq!(a, b);

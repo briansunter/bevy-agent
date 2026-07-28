@@ -265,6 +265,10 @@ fn remote_action_and_observation_spaces_include_json_schema() {
     let action: serde_json::Value = serde_json::from_str(&action_response).unwrap();
     assert_eq!(action["result"]["type"], "json_schema");
     assert!(action["result"]["schema"]["oneOf"].is_array());
+    assert_eq!(
+        action["result"]["actions"],
+        serde_json::json!(["Noop", "Move", "Jump", "Dodge"])
+    );
 
     let observation_response = bridge.handle_json(
         &mut env,
@@ -310,6 +314,37 @@ fn remote_replay_export_and_load_round_trip() {
     assert_eq!(load["result"]["records"], 2);
 
     let _ = std::fs::remove_file(export["result"]["path"].as_str().unwrap());
+}
+
+#[test]
+fn portable_replay_bundle_restores_in_a_fresh_environment() {
+    let mut source = make_env();
+    source.reset(ResetOptions::default()).unwrap();
+    source.step(AgentAction::Move { x: 1.0, y: 0.0 }).unwrap();
+    let expected = source.step(AgentAction::Jump).unwrap().checksum.unwrap();
+    let bundle = source.export_replay_bundle().unwrap();
+
+    assert_eq!(bundle.log.manifest.game_id, "sample_platformer");
+    assert!(!bundle.snapshots.is_empty());
+
+    let mut fresh = make_env();
+    fresh
+        .reset(ResetOptions {
+            create_initial_snapshot: false,
+            ..Default::default()
+        })
+        .unwrap();
+    fresh.load_replay_bundle(bundle).unwrap();
+    fresh.restore_tick(2).unwrap();
+
+    let restored = fresh
+        .world()
+        .resource::<LastStepResponse>()
+        .0
+        .as_ref()
+        .and_then(|response| response.checksum.clone())
+        .unwrap();
+    assert_eq!(restored, expected);
 }
 
 #[test]
@@ -553,7 +588,8 @@ fn remote_misc_methods_cover_info_schema_observe_fast_forward_and_errors() {
         r#"{"jsonrpc":"2.0","id":2,"method":"agent.info","params":{}}"#,
     );
     let info: serde_json::Value = serde_json::from_str(&info).unwrap();
-    assert_eq!(info["result"]["name"], "bevy_agent_control");
+    assert_eq!(info["result"]["name"], "sample_platformer");
+    assert_eq!(info["result"]["agent_control_version"], "0.1.0");
 
     let schema = bridge.handle_json(
         &mut env,
@@ -602,7 +638,11 @@ fn remote_step_many_return_modes_and_restore_tick_work() {
         r#"{"jsonrpc":"2.0","id":2,"method":"agent.step_many","params":{"actions":[{"type":"Noop"},{"type":"Noop"}],"return_observations":"all"}}"#,
     );
     let all: serde_json::Value = serde_json::from_str(&all).unwrap();
-    assert!(all["result"]["observation"].as_array().unwrap().len() == 2);
+    assert_eq!(all["result"]["responses"].as_array().unwrap().len(), 2);
+    assert!(all["result"]["observation"].is_object());
+    assert!(all["result"]["info"].is_object());
+    assert!(all["result"]["reward"].is_number());
+    assert_eq!(all["result"]["truncated"], false);
 
     let none = bridge.handle_json(
         &mut env,
@@ -662,7 +702,7 @@ fn remote_snapshot_restore_and_replay_load_inline_log_work() {
             "jsonrpc": "2.0",
             "id": 6,
             "method": "agent.replay.load",
-            "params": { "log": export["result"]["log"].clone() }
+            "params": { "bundle": export["result"]["bundle"].clone() }
         })
         .to_string(),
     );
@@ -706,6 +746,24 @@ fn reset_clears_replay_log_and_starts_root_timeline_preserving_recording() {
     );
     assert_eq!(timeline.timeline_id, control.timeline_id);
     assert_eq!(timeline.current_branch, control.branch_id);
+}
+
+#[test]
+fn reset_response_reports_the_new_root_timeline() {
+    let mut env = make_env();
+    let reset = env.reset_with_response(ResetOptions::default()).unwrap();
+    let control = env.world().resource::<AgentControlState>();
+
+    assert_eq!(reset.timeline_id, control.timeline_id);
+    assert_eq!(reset.branch_id, control.branch_id);
+    let last = env
+        .world()
+        .resource::<LastStepResponse>()
+        .0
+        .as_ref()
+        .unwrap();
+    assert_eq!(last.info.timeline_id, control.timeline_id);
+    assert_eq!(last.info.branch_id, control.branch_id);
 }
 
 #[test]

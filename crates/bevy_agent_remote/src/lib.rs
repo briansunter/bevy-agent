@@ -2,14 +2,23 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use bevy_agent_core::{AgentAction, AgentActionCatalog, ControlMode, ObservationMode, SnapshotId};
-use bevy_agent_replay::{ReplayLog, ReplayRecorder, start_recording, stop_recording};
-use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions, VisualCaptureOptions};
+use bevy::prelude::*;
+use bevy_agent_core::{
+    AgentAction, AgentActionCatalog, AgentActionKind, AgentObservationCatalog, ControlMode,
+    EnvironmentMetadata, ObservationMode, SnapshotId,
+};
+use bevy_agent_replay::{ReplayLog, start_recording, stop_recording};
+use bevy_agent_runner::{
+    AgentApp, AgentEnvironment, CaptureSource, ReplayBundle, ResetOptions, VisualCaptureOptions,
+};
+#[cfg(feature = "visual")]
+use bevy_agent_runner::{AgentVisualCaptureRenderer, VisualCaptureResult, visual_capture_path};
 use bevy_agent_snapshot::SnapshotStore;
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
@@ -61,7 +70,7 @@ pub struct JsonRpcBridge {
     pub security: RemoteSecurity,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     #[serde(default)]
     pub jsonrpc: Option<String>,
@@ -187,6 +196,8 @@ struct ReplayLoadParams {
     #[serde(default)]
     pub log: Option<ReplayLog>,
     #[serde(default)]
+    pub bundle: Option<ReplayBundle>,
+    #[serde(default)]
     pub session_token: Option<String>,
 }
 
@@ -198,6 +209,8 @@ struct VisualCaptureParams {
     pub label: Option<String>,
     #[serde(default)]
     pub timeout_frames: Option<u32>,
+    #[serde(default)]
+    pub source: Option<CaptureSource>,
     #[serde(default)]
     pub session_token: Option<String>,
 }
@@ -278,9 +291,16 @@ impl JsonRpcBridge {
         match request.method.as_str() {
             "agent.info" => {
                 self.authorize(None, &request.params)?;
+                let metadata = env
+                    .world()
+                    .get_resource::<EnvironmentMetadata>()
+                    .cloned()
+                    .unwrap_or_default();
                 Ok(json!({
-                    "name": "bevy_agent_control",
-                    "version": env!("CARGO_PKG_VERSION"),
+                    "name": metadata.name,
+                    "version": metadata.version,
+                    "description": metadata.description,
+                    "agent_control_version": env!("CARGO_PKG_VERSION"),
                     "bevy_version": "0.18.1",
                     "tick": env.current_tick(),
                     "capabilities": self.security.capabilities.bits(),
@@ -291,27 +311,31 @@ impl JsonRpcBridge {
                 let catalog = env.world().get_resource::<AgentActionCatalog>();
                 Ok(json!({
                     "type": "json_schema",
-                    "actions": ["Noop", "Move", "Look", "Jump", "Crouch", "Sprint", "Interact", "Attack", "UseItem", "Dodge", "Custom"],
+                    "actions": supported_action_names(catalog),
                     "schema": agent_action_schema_with_custom_actions(catalog),
                     "custom_actions": custom_action_schema_map(catalog),
                 }))
             }
             "agent.observation_space" => {
                 self.authorize(None, &request.params)?;
+                let catalog = env.world().get_resource::<AgentObservationCatalog>();
                 Ok(json!({
                     "modes": ["PlayerKnowledge", "FullDebugState", "DiffSinceLastTick", "PixelFrame", "Hybrid"],
                     "default": "Hybrid",
-                    "schema": observation_schema()
+                    "schema": observation_schema_with_catalog(catalog)
                 }))
             }
             "agent.schema" => {
                 self.authorize(None, &request.params)?;
                 let catalog = env.world().get_resource::<AgentActionCatalog>();
+                let observations = env.world().get_resource::<AgentObservationCatalog>();
                 Ok(json!({
                     "action": agent_action_schema_with_custom_actions(catalog),
                     "custom_actions": custom_action_schema_map(catalog),
-                    "observation": observation_schema(),
+                    "observation": observation_schema_with_catalog(observations),
                     "step_response": step_response_schema(),
+                    "reset_response": reset_response_schema(),
+                    "step_many_response": step_many_response_schema(),
                     "visual_capture": visual_capture_schema(),
                 }))
             }
@@ -319,7 +343,9 @@ impl JsonRpcBridge {
                 self.require_capability(AgentCapability::STEP)?;
                 let params: ResetParams = serde_json::from_value(request.params)?;
                 self.check_token(params.session_token.as_deref())?;
-                Ok(serde_json::to_value(env.reset(params.options)?)?)
+                Ok(serde_json::to_value(
+                    env.reset_with_response(params.options)?,
+                )?)
             }
             "agent.step" => {
                 self.require_capability(AgentCapability::STEP)?;
@@ -336,47 +362,20 @@ impl JsonRpcBridge {
                 self.require_capability(AgentCapability::STEP)?;
                 let params: StepManyParams = serde_json::from_value(request.params)?;
                 self.check_token(params.session_token.as_deref())?;
-                let mut responses = Vec::new();
-                for action in params.actions {
-                    let response = env.step(action)?;
-                    let done = response.done || response.truncated;
-                    responses.push(response);
-                    if params.stop_on_done && done {
-                        break;
-                    }
+                if !matches!(params.return_observations.as_str(), "none" | "last" | "all") {
+                    return Err(anyhow!(
+                        "return_observations must be one of: none, last, all"
+                    ));
                 }
-                let start_tick = responses
-                    .first()
-                    .map(|response| response.tick.saturating_sub(1))
-                    .unwrap_or_else(|| env.current_tick());
-                let end_tick = responses
-                    .last()
-                    .map(|response| response.tick)
-                    .unwrap_or(start_tick);
-                let done = responses
-                    .last()
-                    .map(|response| response.done || response.truncated)
-                    .unwrap_or(false);
-                let checksum = responses
-                    .last()
-                    .and_then(|response| response.checksum.clone());
-                let observation = match params.return_observations.as_str() {
-                    "none" => Value::Null,
-                    "last" => responses
-                        .last()
-                        .map(|response| serde_json::to_value(&response.observation))
-                        .transpose()?
-                        .unwrap_or(Value::Null),
-                    _ => serde_json::to_value(&responses)?,
-                };
-                Ok(json!({
-                    "start_tick": start_tick,
-                    "end_tick": end_tick,
-                    "steps": responses.len(),
-                    "observation": observation,
-                    "done": done,
-                    "checksum": checksum,
-                }))
+                let mut response = env.step_many_with_response(
+                    params.actions,
+                    params.stop_on_done,
+                    params.return_observations == "all",
+                )?;
+                if params.return_observations == "none" {
+                    response.observation = None;
+                }
+                Ok(serde_json::to_value(response)?)
             }
             "agent.fast_forward" => {
                 self.require_capability(AgentCapability::STEP)?;
@@ -403,6 +402,9 @@ impl JsonRpcBridge {
                 }
                 if let Some(timeout_frames) = params.timeout_frames {
                     options.timeout_frames = timeout_frames;
+                }
+                if let Some(source) = params.source {
+                    options.source = source;
                 }
                 Ok(serde_json::to_value(env.capture_visual(options)?)?)
             }
@@ -526,40 +528,49 @@ impl JsonRpcBridge {
                 self.require_capability(AgentCapability::STEP)?;
                 let params: ReplayExportParams = serde_json::from_value(request.params)?;
                 self.check_token(params.session_token.as_deref())?;
-                let log = env
-                    .world()
-                    .get_resource::<ReplayRecorder>()
-                    .map(|recorder| recorder.log.clone())
-                    .ok_or_else(|| anyhow!("AgentReplayPlugin is not installed"))?;
+                let bundle = env.export_replay_bundle()?;
                 if let Some(path) = &params.path {
-                    let encoded = serde_json::to_string_pretty(&log)?;
+                    let encoded = serde_json::to_string_pretty(&bundle)?;
                     std::fs::write(path, encoded)
-                        .with_context(|| format!("writing replay log to {path}"))?;
+                        .with_context(|| format!("writing replay bundle to {path}"))?;
                 }
                 Ok(json!({
                     "path": params.path,
-                    "records": log.records.len(),
-                    "checkpoints": log.checkpoints.len(),
-                    "log": log,
+                    "records": bundle.log.records.len(),
+                    "checkpoints": bundle.log.checkpoints.len(),
+                    "bundle": bundle,
                 }))
             }
             "agent.replay.load" => {
                 self.require_capability(AgentCapability::STEP)?;
                 let params: ReplayLoadParams = serde_json::from_value(request.params)?;
                 self.check_token(params.session_token.as_deref())?;
-                let log = if let Some(log) = params.log {
-                    log
+                let bundle = if let Some(bundle) = params.bundle {
+                    bundle
+                } else if let Some(log) = params.log {
+                    replay_bundle_from_legacy_log(env, log)?
                 } else if let Some(path) = params.path {
                     let bytes = std::fs::read_to_string(&path)
-                        .with_context(|| format!("reading replay log from {path}"))?;
-                    serde_json::from_str::<ReplayLog>(&bytes)
-                        .with_context(|| format!("decoding replay log from {path}"))?
+                        .with_context(|| format!("reading replay bundle from {path}"))?;
+                    match serde_json::from_str::<ReplayBundle>(&bytes) {
+                        Ok(bundle) => bundle,
+                        Err(bundle_error) => {
+                            let log = serde_json::from_str::<ReplayLog>(&bytes).with_context(|| {
+                                format!(
+                                    "decoding replay bundle from {path} ({bundle_error}); legacy log decode also failed"
+                                )
+                            })?;
+                            replay_bundle_from_legacy_log(env, log)?
+                        }
+                    }
                 } else {
-                    return Err(anyhow!("agent.replay.load requires either path or log"));
+                    return Err(anyhow!(
+                        "agent.replay.load requires one of: path, bundle, log"
+                    ));
                 };
-                let records = log.records.len();
-                let checkpoints = log.checkpoints.len();
-                env.world_mut().resource_mut::<ReplayRecorder>().log = log;
+                let records = bundle.log.records.len();
+                let checkpoints = bundle.log.checkpoints.len();
+                env.load_replay_bundle(bundle)?;
                 Ok(json!({
                     "records": records,
                     "checkpoints": checkpoints,
@@ -629,6 +640,27 @@ fn token_from_params(params: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn replay_bundle_from_legacy_log(env: &AgentApp, log: ReplayLog) -> Result<ReplayBundle> {
+    let store = env
+        .world()
+        .get_resource::<SnapshotStore>()
+        .ok_or_else(|| anyhow!("AgentSnapshotPlugin is not installed"))?;
+    let referenced = log
+        .initial_snapshot
+        .into_iter()
+        .chain(log.checkpoints.values().copied())
+        .collect::<std::collections::BTreeSet<_>>();
+    let snapshots = referenced
+        .into_iter()
+        .filter_map(|id| store.snapshots.get(&id).cloned())
+        .collect();
+    Ok(ReplayBundle {
+        format_version: ReplayBundle::FORMAT_VERSION,
+        log,
+        snapshots,
+    })
+}
+
 #[must_use]
 pub fn agent_action_schema() -> Value {
     agent_action_schema_with_custom_actions(None)
@@ -637,7 +669,7 @@ pub fn agent_action_schema() -> Value {
 #[must_use]
 pub fn agent_action_schema_with_custom_actions(catalog: Option<&AgentActionCatalog>) -> Value {
     let custom_value_schema = custom_action_value_schema(catalog);
-    json!({
+    let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "AgentAction",
         "oneOf": [
@@ -653,13 +685,67 @@ pub fn agent_action_schema_with_custom_actions(catalog: Option<&AgentActionCatal
             { "type": "object", "required": ["type"], "properties": { "type": { "const": "Dodge" } }, "additionalProperties": false },
             { "type": "object", "required": ["type", "value"], "properties": { "type": { "const": "Custom" }, "value": custom_value_schema }, "additionalProperties": false }
         ]
+    });
+    if let Some(catalog) = catalog
+        && catalog.supported_actions.is_some()
+        && let Some(variants) = schema.get_mut("oneOf").and_then(Value::as_array_mut)
+    {
+        variants.retain(|variant| {
+            variant
+                .pointer("/properties/type/const")
+                .and_then(Value::as_str)
+                .and_then(action_kind_from_wire_name)
+                .is_some_and(|kind| catalog.supports(kind))
+        });
+    }
+    schema
+}
+
+#[must_use]
+pub fn supported_action_names(catalog: Option<&AgentActionCatalog>) -> Vec<&'static str> {
+    const ACTIONS: [(&str, AgentActionKind); 11] = [
+        ("Noop", AgentActionKind::Noop),
+        ("Move", AgentActionKind::Move),
+        ("Look", AgentActionKind::Look),
+        ("Jump", AgentActionKind::Jump),
+        ("Crouch", AgentActionKind::Crouch),
+        ("Sprint", AgentActionKind::Sprint),
+        ("Interact", AgentActionKind::Interact),
+        ("Attack", AgentActionKind::Attack),
+        ("UseItem", AgentActionKind::UseItem),
+        ("Dodge", AgentActionKind::Dodge),
+        ("Custom", AgentActionKind::Custom),
+    ];
+    ACTIONS
+        .iter()
+        .filter(|(_, kind)| catalog.is_none_or(|catalog| catalog.supports(*kind)))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+fn action_kind_from_wire_name(name: &str) -> Option<AgentActionKind> {
+    Some(match name {
+        "Noop" => AgentActionKind::Noop,
+        "Move" => AgentActionKind::Move,
+        "Look" => AgentActionKind::Look,
+        "Jump" => AgentActionKind::Jump,
+        "Crouch" => AgentActionKind::Crouch,
+        "Sprint" => AgentActionKind::Sprint,
+        "Interact" => AgentActionKind::Interact,
+        "Attack" => AgentActionKind::Attack,
+        "UseItem" => AgentActionKind::UseItem,
+        "Dodge" => AgentActionKind::Dodge,
+        "Custom" => AgentActionKind::Custom,
+        _ => return None,
     })
 }
 
 #[must_use]
 pub fn custom_action_schema_map(catalog: Option<&AgentActionCatalog>) -> Value {
     let mut map = serde_json::Map::new();
-    if let Some(catalog) = catalog {
+    if let Some(catalog) = catalog
+        && catalog.supports(AgentActionKind::Custom)
+    {
         for (name, schema) in &catalog.custom_actions {
             map.insert(name.clone(), schema.schema.clone());
         }
@@ -685,6 +771,14 @@ fn custom_action_value_schema(catalog: Option<&AgentActionCatalog>) -> Value {
 
 #[must_use]
 pub fn observation_schema() -> Value {
+    observation_schema_with_catalog(None)
+}
+
+#[must_use]
+pub fn observation_schema_with_catalog(catalog: Option<&AgentObservationCatalog>) -> Value {
+    let domain_value_schema = catalog
+        .and_then(|catalog| catalog.schema.clone())
+        .unwrap_or(Value::Bool(true));
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "Observation",
@@ -694,6 +788,16 @@ pub fn observation_schema() -> Value {
             { "$ref": "#/$defs/fullStateObservation" },
             { "$ref": "#/$defs/deltaObservation" },
             { "$ref": "#/$defs/pixelObservation" },
+            {
+                "type": "object",
+                "required": ["kind", "tick", "value"],
+                "properties": {
+                    "kind": { "const": "Domain" },
+                    "tick": { "type": "integer", "minimum": 0 },
+                    "value": domain_value_schema
+                },
+                "additionalProperties": false
+            },
             { "type": "object", "required": ["kind", "message"], "properties": { "kind": { "const": "Error" }, "message": { "type": "string" } } }
         ],
         "$defs": {
@@ -798,6 +902,49 @@ pub fn step_response_schema() -> Value {
             "truncated": { "type": "boolean" },
             "info": { "type": "object" },
             "checksum": { "anyOf": [{ "type": "object" }, { "type": "null" }] }
+        }
+    })
+}
+
+#[must_use]
+pub fn reset_response_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "ResetResponse",
+        "type": "object",
+        "required": ["tick", "observation", "checksum", "snapshot_id", "timeline_id", "branch_id"],
+        "properties": {
+            "tick": { "type": "integer", "minimum": 0 },
+            "observation": observation_schema(),
+            "checksum": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
+            "snapshot_id": { "anyOf": [{ "type": "string", "format": "uuid" }, { "type": "null" }] },
+            "timeline_id": { "type": "string", "format": "uuid" },
+            "branch_id": { "type": "string", "format": "uuid" }
+        }
+    })
+}
+
+#[must_use]
+pub fn step_many_response_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "StepManyResponse",
+        "type": "object",
+        "required": [
+            "start_tick", "end_tick", "steps", "observation", "reward",
+            "done", "truncated", "info", "checksum", "responses"
+        ],
+        "properties": {
+            "start_tick": { "type": "integer", "minimum": 0 },
+            "end_tick": { "type": "integer", "minimum": 0 },
+            "steps": { "type": "integer", "minimum": 0 },
+            "observation": { "anyOf": [observation_schema(), { "type": "null" }] },
+            "reward": { "type": "number" },
+            "done": { "type": "boolean" },
+            "truncated": { "type": "boolean" },
+            "info": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
+            "checksum": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
+            "responses": { "type": "array", "items": step_response_schema() }
         }
     })
 }
@@ -927,6 +1074,342 @@ impl HttpRemoteServer {
             }
         }
     }
+}
+
+struct MainThreadRemoteRequest {
+    body: String,
+    reply: mpsc::Sender<String>,
+}
+
+#[derive(Resource)]
+struct MainThreadRemoteQueue {
+    receiver: Mutex<mpsc::Receiver<MainThreadRemoteRequest>>,
+}
+
+#[derive(Resource)]
+struct MainThreadRemoteState {
+    bridge: JsonRpcBridge,
+    reset_once: bool,
+}
+
+/// Runs remote control inside a normal Bevy app.
+///
+/// Networking happens on a background thread, while every JSON-RPC operation
+/// that touches Bevy state is pumped from `Update` on Bevy's main thread. This
+/// keeps the winit/render runner alive and makes real primary-window captures
+/// work in remote visual sessions.
+pub struct BevyRemoteControlPlugin {
+    listener: Arc<TcpListener>,
+    bridge: JsonRpcBridge,
+}
+
+impl BevyRemoteControlPlugin {
+    pub fn bind(bind_addr: impl Into<String>, bridge: JsonRpcBridge) -> Result<Self> {
+        let bind_addr = bind_addr.into();
+        let listener =
+            TcpListener::bind(&bind_addr).with_context(|| format!("binding {bind_addr}"))?;
+        let local_addr = listener
+            .local_addr()
+            .with_context(|| format!("reading bound address for {bind_addr}"))?;
+        require_safe_bind(local_addr, &bridge.security)?;
+        Ok(Self {
+            listener: Arc::new(listener),
+            bridge,
+        })
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.listener.local_addr()?)
+    }
+}
+
+impl Plugin for BevyRemoteControlPlugin {
+    fn build(&self, app: &mut App) {
+        let (sender, receiver) = mpsc::channel();
+        let listener = Arc::clone(&self.listener);
+        let security = self.bridge.security.clone();
+        let local_addr = listener
+            .local_addr()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        std::thread::Builder::new()
+            .name("bevy-agent-remote".to_string())
+            .spawn(move || {
+                eprintln!("bevy_agent_remote listening on http://{local_addr}/rpc");
+                if let Err(error) = serve_main_thread_remote(listener, sender, security) {
+                    eprintln!("bevy_agent_remote server stopped: {error:#}");
+                }
+            })
+            .expect("failed to spawn bevy-agent remote server thread");
+
+        app.insert_resource(MainThreadRemoteQueue {
+            receiver: Mutex::new(receiver),
+        })
+        .insert_resource(MainThreadRemoteState {
+            bridge: self.bridge.clone(),
+            reset_once: false,
+        })
+        .add_systems(Update, pump_main_thread_remote);
+    }
+}
+
+fn serve_main_thread_remote(
+    listener: Arc<TcpListener>,
+    sender: mpsc::Sender<MainThreadRemoteRequest>,
+    security: RemoteSecurity,
+) -> Result<()> {
+    for stream in listener.incoming() {
+        let mut stream = stream?;
+        if let Err(error) = handle_main_thread_connection(&sender, &security, &mut stream) {
+            let _ = write_http_response(
+                &mut stream,
+                500,
+                "Internal Server Error",
+                "application/json",
+                &json!({ "error": error.to_string() }).to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_main_thread_connection(
+    sender: &mpsc::Sender<MainThreadRemoteRequest>,
+    security: &RemoteSecurity,
+    stream: &mut TcpStream,
+) -> Result<()> {
+    let request = read_http_request(stream)?;
+    if request.method == "GET" && request.path == "/health" {
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            &json!({ "ok": true }).to_string(),
+        );
+    }
+    if request.method == "GET" && request.path == "/ws" {
+        validate_websocket_handshake(&request, security)?;
+        let key = request
+            .header("sec-websocket-key")
+            .ok_or_else(|| anyhow!("missing Sec-WebSocket-Key"))?;
+        let accept = websocket_accept_key(key);
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             \r\n"
+        );
+        stream.write_all(response.as_bytes())?;
+        stream.flush()?;
+        loop {
+            match read_websocket_text(stream)? {
+                WebSocketMessage::Text(body) => {
+                    let response = request_on_main_thread(sender, body)?;
+                    write_websocket_text(stream, &response)?;
+                }
+                WebSocketMessage::Ping(payload) => write_websocket_pong(stream, &payload)?,
+                WebSocketMessage::Close => return Ok(()),
+            }
+        }
+    }
+    if request.method == "POST" && request.path == "/rpc" {
+        let response = request_on_main_thread(sender, request.body)?;
+        return write_http_response(stream, 200, "OK", "application/json", &response);
+    }
+    write_http_response(
+        stream,
+        404,
+        "Not Found",
+        "application/json",
+        &json!({ "error": "not found" }).to_string(),
+    )
+}
+
+fn request_on_main_thread(
+    sender: &mpsc::Sender<MainThreadRemoteRequest>,
+    body: String,
+) -> Result<String> {
+    let (reply, receiver) = mpsc::channel();
+    sender
+        .send(MainThreadRemoteRequest { body, reply })
+        .map_err(|_| anyhow!("Bevy main-thread remote pump has stopped"))?;
+    receiver
+        .recv_timeout(HTTP_READ_TIMEOUT)
+        .map_err(|error| anyhow!("timed out waiting for Bevy main thread: {error}"))
+}
+
+fn pump_main_thread_remote(world: &mut World) {
+    let requests = {
+        let queue = world.resource::<MainThreadRemoteQueue>();
+        let receiver = queue
+            .receiver
+            .lock()
+            .expect("main-thread remote queue mutex poisoned");
+        receiver.try_iter().take(64).collect::<Vec<_>>()
+    };
+
+    for request in requests {
+        #[cfg(feature = "visual")]
+        if try_schedule_primary_window_capture(world, &request) {
+            continue;
+        }
+        let response = dispatch_json_on_world(world, &request.body);
+        let _ = request.reply.send(response);
+    }
+}
+
+fn dispatch_json_on_world(world: &mut World, body: &str) -> String {
+    let (bridge, reset_once) = {
+        let state = world.resource::<MainThreadRemoteState>();
+        (state.bridge.clone(), state.reset_once)
+    };
+    let owned_world = std::mem::replace(world, World::new());
+    let mut app = App::empty();
+    *app.world_mut() = owned_world;
+    let mut env = AgentApp::from_running_app(app, reset_once);
+    let response = bridge.handle_json(&mut env, body);
+    let reset_once = env.has_reset();
+    let mut app = env.into_app();
+    *world = std::mem::replace(app.world_mut(), World::new());
+    world.resource_mut::<MainThreadRemoteState>().reset_once = reset_once;
+    response
+}
+
+#[cfg(feature = "visual")]
+fn try_schedule_primary_window_capture(
+    world: &mut World,
+    request: &MainThreadRemoteRequest,
+) -> bool {
+    use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
+    use bevy::window::{PrimaryWindow, Window};
+
+    let Ok(rpc) = serde_json::from_str::<JsonRpcRequest>(&request.body) else {
+        return false;
+    };
+    if rpc.method != "agent.visual.capture" {
+        return false;
+    }
+    let Ok(params) = serde_json::from_value::<VisualCaptureParams>(rpc.params.clone()) else {
+        return false;
+    };
+    let source = params.source.unwrap_or_default();
+    if source == CaptureSource::Software
+        || (source == CaptureSource::Auto
+            && world.contains_resource::<AgentVisualCaptureRenderer>())
+    {
+        return false;
+    }
+
+    let bridge = world.resource::<MainThreadRemoteState>().bridge.clone();
+    let authorization = bridge
+        .require_capability(AgentCapability::VISUAL_CAPTURE)
+        .and_then(|()| bridge.check_token(params.session_token.as_deref()));
+    if let Err(error) = authorization {
+        let _ = request
+            .reply
+            .send(error_json_rpc_response(rpc.id, error.to_string()));
+        return true;
+    }
+
+    if !world.resource::<MainThreadRemoteState>().reset_once {
+        let reset_request = serde_json::to_string(&JsonRpcRequest {
+            jsonrpc: Some("2.0".to_string()),
+            id: Value::Null,
+            method: "agent.reset".to_string(),
+            params: json!({
+                "options": ResetOptions::default(),
+                "session_token": params.session_token,
+            }),
+        })
+        .expect("reset request is serializable");
+        let reset_response = dispatch_json_on_world(world, &reset_request);
+        if serde_json::from_str::<Value>(&reset_response)
+            .ok()
+            .and_then(|value| value.get("error").cloned())
+            .is_some()
+        {
+            let _ = request.reply.send(reset_response);
+            return true;
+        }
+    }
+
+    let (tick, frame, width, height) = {
+        let tick = world.resource::<bevy_agent_core::SimClock>().tick;
+        let frame = world.resource::<bevy_agent_core::AgentControlState>().frame;
+        let mut windows = world.query_filtered::<&Window, With<PrimaryWindow>>();
+        let Some(window) = windows.iter(world).next() else {
+            let _ = request.reply.send(error_json_rpc_response(
+                rpc.id,
+                "visual capture requires a primary window".to_string(),
+            ));
+            return true;
+        };
+        (
+            tick,
+            frame,
+            window.physical_width(),
+            window.physical_height(),
+        )
+    };
+    let options = VisualCaptureOptions {
+        output_dir: params
+            .output_dir
+            .unwrap_or_else(|| VisualCaptureOptions::default().output_dir),
+        label: params.label,
+        timeout_frames: params
+            .timeout_frames
+            .unwrap_or_else(|| VisualCaptureOptions::default().timeout_frames),
+        source,
+    };
+    let path = match visual_capture_path(&options, tick, frame) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = request
+                .reply
+                .send(error_json_rpc_response(rpc.id, error.to_string()));
+            return true;
+        }
+    };
+    let reply = request.reply.clone();
+    let id = rpc.id;
+    let result_path = path.clone();
+    let mut save = save_to_disk(path);
+    world
+        .spawn(Screenshot::primary_window())
+        .observe(move |captured: On<ScreenshotCaptured>| {
+            save(captured);
+            let result = VisualCaptureResult {
+                tick,
+                frame,
+                path: result_path.clone(),
+                width,
+                height,
+                format: "png".to_string(),
+            };
+            let response = JsonRpcResponse::Result {
+                jsonrpc: "2.0",
+                id: id.clone(),
+                result: serde_json::to_value(result).expect("capture result is serializable"),
+            };
+            let _ = reply
+                .send(serde_json::to_string(&response).expect("JSON-RPC response is serializable"));
+        });
+    true
+}
+
+#[cfg(feature = "visual")]
+fn error_json_rpc_response(id: Value, message: String) -> String {
+    serde_json::to_string(&JsonRpcResponse::Error {
+        jsonrpc: "2.0",
+        id,
+        error: JsonRpcError {
+            code: -32603,
+            message,
+        },
+    })
+    .expect("JSON-RPC error response is serializable")
 }
 
 fn validate_websocket_handshake(request: &HttpRequest, security: &RemoteSecurity) -> Result<()> {
@@ -1285,6 +1768,38 @@ mod tests {
             action["oneOf"][10]["properties"]["value"]["oneOf"][0]["properties"]["type"]["const"],
             "Input"
         );
+    }
+
+    #[test]
+    fn discovery_filters_actions_and_embeds_domain_observation_schema() {
+        let mut actions = AgentActionCatalog::default();
+        actions.set_supported_actions([
+            AgentActionKind::Noop,
+            AgentActionKind::Move,
+            AgentActionKind::Custom,
+        ]);
+        let action = agent_action_schema_with_custom_actions(Some(&actions));
+        assert_eq!(
+            supported_action_names(Some(&actions)),
+            vec!["Noop", "Move", "Custom"]
+        );
+        assert_eq!(action["oneOf"].as_array().unwrap().len(), 3);
+
+        let observations = AgentObservationCatalog {
+            schema: Some(json!({
+                "type": "object",
+                "required": ["phase"],
+                "properties": { "phase": { "type": "string" } }
+            })),
+        };
+        let observation = observation_schema_with_catalog(Some(&observations));
+        let domain = observation["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["const"] == "Domain")
+            .unwrap();
+        assert_eq!(domain["properties"]["value"]["required"], json!(["phase"]));
     }
 
     #[test]

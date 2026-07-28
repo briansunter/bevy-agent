@@ -1,5 +1,4 @@
-use bevy_agent_remote::{HttpRemoteServer, JsonRpcBridge, RemoteSecurity};
-use bevy_agent_runner::AgentApp;
+use bevy_agent_remote::{BevyRemoteControlPlugin, JsonRpcBridge, RemoteSecurity};
 
 fn main() -> anyhow::Result<()> {
     let bind_addr = std::env::args()
@@ -12,7 +11,10 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let mut env = AgentApp::new(sample_platformer::build_visual_app);
     let bridge = JsonRpcBridge::new(security);
-    HttpRemoteServer::new(bind_addr, bridge).serve(&mut env)
+    let remote = BevyRemoteControlPlugin::bind(bind_addr, bridge)?;
+    let mut app = sample_platformer::build_visual_app();
+    app.add_plugins(remote);
+    app.run();
+    Ok(())
 }

@@ -12,9 +12,9 @@ use bevy::ecs::world::{EntityRef, EntityWorldMut};
 use bevy::prelude::*;
 use bevy_agent_core::{
     AgentAction, AgentActionQueue, AgentControlState, AgentSet, CurrentInputFrame,
-    DeterministicRng, EpisodeState, ObservationConfig, RewardState, ScheduledAction, SimClock,
-    SnapshotEntity, SnapshotId, StableEntityId, StableHasher, StableIdAllocator, StateChecksum,
-    TimelineId,
+    DeterministicRng, EnvironmentMetadata, EpisodeState, ObservationConfig, RewardState,
+    ScheduledAction, SimClock, SnapshotChecksum, SnapshotEntity, SnapshotId, StableEntityId,
+    StableHasher, StableIdAllocator, TimelineId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -96,7 +96,7 @@ pub struct Snapshot {
     pub entities: Vec<EntitySnapshot>,
     pub action_queue: Vec<ScheduledAction<AgentAction>>,
     pub replay_state: SnapshotReplayState,
-    pub checksum: StateChecksum,
+    pub checksum: SnapshotChecksum,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -139,7 +139,7 @@ pub struct ResourceSnapshot {
 pub struct SnapshotCreateResult {
     pub snapshot_id: SnapshotId,
     pub tick: u64,
-    pub checksum: StateChecksum,
+    pub checksum: SnapshotChecksum,
 }
 
 pub trait SnapshotAppExt {
@@ -217,6 +217,14 @@ impl SnapshotAppExt for App {
             .unwrap_or_default();
         metadata.game_id = game_id.into();
         metadata.game_version = game_version.into();
+        self.insert_resource(EnvironmentMetadata {
+            name: metadata.game_id.clone(),
+            version: metadata.game_version.clone(),
+            description: self
+                .world()
+                .get_resource::<EnvironmentMetadata>()
+                .and_then(|environment| environment.description.clone()),
+        });
         self.insert_resource(metadata)
     }
 }
@@ -476,13 +484,13 @@ pub fn capture_snapshot(world: &mut World, label: Option<String>) -> Result<Snap
         replay_state: SnapshotReplayState {
             replay_cursor_tick: world.resource::<SimClock>().tick,
         },
-        checksum: StateChecksum { tick: 0, hash: 0 },
+        checksum: SnapshotChecksum { tick: 0, hash: 0 },
     };
     snapshot.checksum = checksum_snapshot(&snapshot)?;
     Ok(snapshot)
 }
 
-pub fn restore_snapshot(world: &mut World, snapshot_id: SnapshotId) -> Result<StateChecksum> {
+pub fn restore_snapshot(world: &mut World, snapshot_id: SnapshotId) -> Result<SnapshotChecksum> {
     let snapshot = world
         .resource::<SnapshotStore>()
         .snapshots
@@ -493,7 +501,7 @@ pub fn restore_snapshot(world: &mut World, snapshot_id: SnapshotId) -> Result<St
     restore_snapshot_value(world, &snapshot)
 }
 
-pub fn restore_snapshot_value(world: &mut World, snapshot: &Snapshot) -> Result<StateChecksum> {
+pub fn restore_snapshot_value(world: &mut World, snapshot: &Snapshot) -> Result<SnapshotChecksum> {
     let expected_schema_hash = world.resource::<SnapshotRegistry>().schema_hash();
     if snapshot.manifest.schema_hash != expected_schema_hash {
         return Err(anyhow!(
@@ -567,7 +575,7 @@ pub fn lookup_snapshot_by_label(world: &World, label: &str) -> Option<SnapshotId
     world.resource::<SnapshotStore>().labels.get(label).copied()
 }
 
-pub fn checksum_snapshot(snapshot: &Snapshot) -> Result<StateChecksum> {
+pub fn checksum_snapshot(snapshot: &Snapshot) -> Result<SnapshotChecksum> {
     let mut hasher = StableHasher::new();
     snapshot.clock.tick.hash(&mut hasher);
     snapshot.clock.dt_seconds.to_bits().hash(&mut hasher);
@@ -588,7 +596,7 @@ pub fn checksum_snapshot(snapshot: &Snapshot) -> Result<StateChecksum> {
         hasher.write_json(&serde_json::to_value(action)?);
     }
 
-    Ok(StateChecksum {
+    Ok(SnapshotChecksum {
         tick: snapshot.clock.tick,
         hash: hasher.finish_hash(),
     })

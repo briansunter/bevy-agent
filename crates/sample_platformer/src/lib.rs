@@ -5,10 +5,10 @@ use std::hash::Hash;
 use anyhow::Result;
 use bevy::prelude::*;
 use bevy_agent_core::{
-    AgentAction, AgentControlAppExt, AgentControlState, AgentReset, AgentResetSet, AgentSet,
-    CurrentInputFrame, EntityObservation, EpisodeState, ObjectiveObservation, Observation,
-    ObservationMode, PlayerObservation, RewardState, SimClock, SnapshotEntity, StableEntityId,
-    StableHasher, StableIdAllocator, StateChecksum, SymbolicObservation,
+    AgentAction, AgentActionKind, AgentControlAppExt, AgentControlState, AgentReset, AgentResetSet,
+    AgentSet, CurrentInputFrame, EntityObservation, EpisodeState, ObjectiveObservation,
+    Observation, ObservationMode, PlayerObservation, RewardState, SimClock, SnapshotEntity,
+    StableEntityId, StableHasher, StableIdAllocator, StateChecksum, SymbolicObservation,
 };
 use bevy_agent_runner::{
     AgentControlPlugins, VisualCaptureAppExt, VisualCaptureOptions, VisualCaptureResult,
@@ -91,7 +91,13 @@ impl Plugin for PlatformerPlugin {
         app.init_resource::<PlatformerConfig>()
             .init_resource::<GameScore>()
             .init_resource::<PlatformerState>()
-            .set_snapshot_metadata("sample_platformer", env!("CARGO_PKG_VERSION"));
+            .set_snapshot_metadata("sample_platformer", env!("CARGO_PKG_VERSION"))
+            .set_supported_actions([
+                AgentActionKind::Noop,
+                AgentActionKind::Move,
+                AgentActionKind::Jump,
+                AgentActionKind::Dodge,
+            ]);
         register_snapshot_components!(
             app,
             StableEntityId,

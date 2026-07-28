@@ -391,6 +391,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "bevy",
  "bevy_agent_core",
  "bevy_agent_replay",
  "bevy_agent_runner",

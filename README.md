@@ -92,7 +92,8 @@ Or drive it from Python:
 from bevy_agent_client import AgentClient
 
 env = AgentClient("http://127.0.0.1:4000/rpc")
-obs = env.reset(seed=42)
+reset = env.reset(seed=42)
+obs = reset["observation"]
 step = env.step({"type": "Move", "x": 1.0, "y": 0.0})
 snapshot = env.snapshot()
 env.restore(snapshot["snapshot_id"])
@@ -124,13 +125,17 @@ cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
 cargo run -p agentctl -- capture --out-dir screenshots --label tick_1
 ```
 
-`agent.visual.capture` returns a PNG path plus tick/frame/size metadata. Games can register a software capture renderer for headless runs, as the sample platformer does, or use Bevy primary-window screenshots in `visual` builds.
+`agent.visual.capture` returns a PNG path plus tick/frame/size metadata. Set `source` to `software`, `primary_window`, or `auto`. Games can register a software capture renderer for headless runs, as the sample platformer does.
 
 Start the sample with visual/render features when you want render plugins and primary-window screenshot support compiled in:
 
 ```sh
 cargo run -p sample_platformer --features visual --example remote_http_visual -- 127.0.0.1:4000
 ```
+
+The visual example installs `BevyRemoteControlPlugin` in the normal Bevy app and
+then calls `app.run()`. Network I/O stays on a background thread while Bevy
+state changes and primary-window capture are handled on the main thread.
 
 ## JSON-RPC Example
 
@@ -163,6 +168,7 @@ The sample also includes:
 
 Gameplay systems that need replayable behavior should:
 
+- enqueue autonomous policy decisions from `AgentDecision`, which runs exactly once before each controlled tick;
 - run in `AgentTick`, not ordinary frame `Update`;
 - read `SimClock`, not wall-clock `Time`;
 - consume `CurrentInputFrame<AgentAction>`, not keyboard/mouse state directly;
@@ -170,6 +176,11 @@ Gameplay systems that need replayable behavior should:
 - register all gameplay state with `SnapshotAppExt` or the snapshot registration macros;
 - use `StableHasher` or an equivalent deterministic checksum path for replay validation;
 - keep rendering/UI systems read-only with respect to authoritative simulation state.
+
+Call `set_environment_metadata`, `set_supported_actions`, and
+`set_observation_schema` during integration so remote discovery describes the
+game rather than the library defaults. Replay exports are portable bundles that
+include all referenced initial and checkpoint snapshots.
 
 The sample platformer follows this contract: movement, gravity, collision, coin pickup, reward, terminal checks, observation extraction, snapshots, replay, and branches all run headlessly under explicit agent control.
 

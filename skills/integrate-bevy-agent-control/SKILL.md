@@ -21,7 +21,9 @@ A good integration has:
 - `AgentControlPlugins::deterministic()` for the standard control/snapshot/replay stack;
 - an optional visual app builder using `DefaultPlugins` plus `AgentControlPlugins::visual_debug()`;
 - stable built-in `AgentAction` variants or registered custom action schemas for `AgentAction::Custom`;
+- environment metadata plus an explicit supported-action catalog for accurate remote discovery;
 - one action queue/frame consumed by deterministic gameplay systems;
+- autonomous policies registered in `AgentDecision`, once per simulation tick;
 - gameplay systems scheduled in `AgentTick` and `AgentSet::Simulation`;
 - deterministic time from `SimClock`, not Bevy `Time`;
 - snapshot macro registration for every gameplay component/resource needed to resume;
@@ -34,7 +36,7 @@ A good integration has:
 ## Workflow
 
 1. Map the current gameplay loop: input collection, movement/physics, spawning, scoring, terminal conditions, RNG, and reset.
-2. Define the action surface. Prefer built-in `AgentAction` variants when they fit; use `AgentAction::Custom` plus a registered JSON schema for game-specific actions.
+2. Define the action surface. Register environment metadata and supported built-in actions; use `AgentAction::Custom` plus a registered JSON schema for game-specific actions.
 3. Convert every input source, including keyboard/gamepad/network/tests/agents/replay, into the same action queue.
 4. Add `AgentControlPlugins::deterministic()` for headless/test builds. Use `visual_debug()` for visual debugging and `remote()` for long-running remote-controlled apps when needed.
 5. Build a deterministic headless app with `MinimalPlugins`.
@@ -44,8 +46,8 @@ A good integration has:
 9. Add `SnapshotEntity` and `StableEntityId` to gameplay entities.
 10. Register gameplay components and resources with `register_snapshot_components!` and `register_snapshot_resources!`.
 11. Add a reset system that recreates a clean playable state from seed/options.
-12. Add an observation extractor, a checksum extractor, and custom action schemas when the game exposes custom actions.
-13. Add a visual capture renderer if agents need screenshots in headless runs.
+12. Add an observation extractor, its domain schema when applicable, a checksum extractor, and custom action schemas when the game exposes custom actions.
+13. Add a visual capture renderer if agents need screenshots in headless runs. For a real window, install `BevyRemoteControlPlugin` in the visual app and let the normal Bevy runner own the main thread.
 14. Expose HTTP or stdio control only after local stepping works; keep tokenless HTTP on loopback only.
 15. Add tests for step, batch step, action scheduling, custom action schemas, snapshot/restore, replay, branch, remote schema, visual capture, and determinism.
 
@@ -53,7 +55,9 @@ A good integration has:
 
 ```rust
 use bevy::prelude::*;
-use bevy_agent_core::{AgentControlAppExt, AgentSet, AgentTick, StableEntityId};
+use bevy_agent_core::{
+    AgentActionKind, AgentControlAppExt, AgentDecision, AgentSet, AgentTick, StableEntityId,
+};
 use bevy_agent_runner::AgentControlPlugins;
 use bevy_agent_snapshot::{register_snapshot_components, register_snapshot_resources};
 
@@ -70,7 +74,14 @@ impl Plugin for GamePlugin {
         register_snapshot_components!(app, StableEntityId, Transform, Velocity, Player);
         register_snapshot_resources!(app, GameScore, GameplayRng);
 
-        app.register_custom_action_schema(
+        app.set_environment_metadata("my_game", env!("CARGO_PKG_VERSION"), None)
+            .set_supported_actions([
+                AgentActionKind::Noop,
+                AgentActionKind::Move,
+                AgentActionKind::Jump,
+                AgentActionKind::Custom,
+            ])
+            .register_custom_action_schema(
             "game_action",
             serde_json::json!({
                 "type": "object",
@@ -83,7 +94,7 @@ impl Plugin for GamePlugin {
             }),
         );
 
-        app.add_systems(
+        app.add_systems(AgentDecision, agent_policy).add_systems(
             AgentTick,
             (apply_actions, physics_step, scoring, terminal_check)
                 .chain()
@@ -101,6 +112,9 @@ When converting an existing Bevy game:
 - use `AgentControlPlugins::{deterministic, visual_debug, remote}` instead of manually adding the core/snapshot/replay plugins;
 - use `with_snapshot_policy`, `without_snapshots`, and `without_replay` only when the app intentionally needs a non-standard control stack;
 - use `VisualCaptureAppExt::insert_visual_capture_renderer` for headless screenshots, or enable the runner `visual` feature for Bevy primary-window screenshots;
+- install `BevyRemoteControlPlugin` into visual apps and call `app.run()` so winit and screenshot capture stay on the main thread;
+- register autonomous decision systems in `AgentDecision`, never render-frame `Update`;
+- register environment metadata, supported actions, and a domain observation schema so discovery reflects the game;
 - register custom action schemas with `AgentControlAppExt::register_custom_action_schema` so remote clients can discover game-specific action payloads;
 - register snapshot types with `register_snapshot_components!` and `register_snapshot_resources!`;
 - move random decisions behind a seeded gameplay RNG resource and register it for snapshots;
@@ -141,6 +155,7 @@ Add or update tests for:
 - queued and future actions apply once on the intended tick;
 - `step_many` matches repeated `step`;
 - snapshot, restore, and subsequent replay produce matching checksums;
+- exported replay bundles load and restore in a fresh environment;
 - branch creation does not mutate the parent timeline;
 - reset with the same seed produces the same initial observation/checksum;
 - observation policy hides state that should not be visible to the player;

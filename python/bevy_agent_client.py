@@ -6,7 +6,7 @@ import json
 import subprocess
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, TypedDict
 from urllib.error import HTTPError, URLError
 
 
@@ -15,6 +15,61 @@ HTTP_TIMEOUT_SECONDS = 30.0
 
 class AgentError(RuntimeError):
     pass
+
+
+class Checksum(TypedDict):
+    tick: int
+    hash: int
+
+
+class StepInfo(TypedDict, total=False):
+    frame: int
+    timeline_id: str
+    branch_id: str
+    actions_applied: int
+    snapshot_created: str | None
+    episode_reason: str | None
+
+
+class StepResponse(TypedDict):
+    tick: int
+    observation: dict[str, Any]
+    reward: float
+    done: bool
+    truncated: bool
+    info: StepInfo
+    checksum: Checksum | None
+
+
+class ResetResponse(TypedDict):
+    tick: int
+    observation: dict[str, Any]
+    checksum: Checksum | None
+    snapshot_id: str | None
+    timeline_id: str
+    branch_id: str
+
+
+class StepManyResponse(TypedDict):
+    start_tick: int
+    end_tick: int
+    steps: int
+    observation: dict[str, Any] | None
+    reward: float
+    done: bool
+    truncated: bool
+    info: StepInfo | None
+    checksum: Checksum | None
+    responses: list[StepResponse]
+
+
+class VisualCaptureResponse(TypedDict):
+    tick: int
+    frame: int
+    path: str
+    width: int
+    height: int
+    format: str
 
 
 @dataclass
@@ -59,7 +114,9 @@ class AgentClient:
     def info(self) -> Any:
         return self.call("agent.info")
 
-    def reset(self, seed: int | None = 0, observation_mode: str = "Hybrid") -> Any:
+    def reset(
+        self, seed: int | None = 0, observation_mode: str = "Hybrid"
+    ) -> ResetResponse:
         return self.call(
             "agent.reset",
             {
@@ -71,7 +128,9 @@ class AgentClient:
             },
         )
 
-    def step(self, action: dict[str, Any], observation_mode: str = "Hybrid") -> Any:
+    def step(
+        self, action: dict[str, Any], observation_mode: str = "Hybrid"
+    ) -> StepResponse:
         return self.call(
             "agent.step",
             {"action": action, "observation_mode": observation_mode},
@@ -82,7 +141,7 @@ class AgentClient:
         actions: list[dict[str, Any]],
         return_observations: str = "last",
         stop_on_done: bool = True,
-    ) -> Any:
+    ) -> StepManyResponse:
         return self.call(
             "agent.step_many",
             {
@@ -100,13 +159,15 @@ class AgentClient:
         output_dir: str = "screenshots",
         label: str | None = None,
         timeout_frames: int = 8,
-    ) -> Any:
+        source: Literal["auto", "software", "primary_window"] = "auto",
+    ) -> VisualCaptureResponse:
         return self.call(
             "agent.visual.capture",
             {
                 "output_dir": output_dir,
                 "label": label,
                 "timeout_frames": timeout_frames,
+                "source": source,
             },
         )
 

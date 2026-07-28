@@ -13,11 +13,17 @@ categories = ["game-development", "network-programming"]
 
 [features]
 default = []
-visual = ["bevy_agent_runner/visual"]
+visual = [
+    "bevy/bevy_render",
+    "bevy/bevy_window",
+    "bevy/png",
+    "bevy_agent_runner/visual",
+]
 
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
+bevy.workspace = true
 bevy_agent_core.workspace = true
 bevy_agent_replay.workspace = true
 bevy_agent_runner.workspace = true

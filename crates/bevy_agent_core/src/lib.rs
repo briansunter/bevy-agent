@@ -4,7 +4,7 @@
 //! simulation clock, observation types, reward/episode state, and extension
 //! traits used by the runner, snapshot, replay, and remote crates.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use bevy::ecs::schedule::ScheduleLabel;
@@ -29,6 +29,14 @@ pub type ControlResult<T> = Result<T, AgentControlError>;
 
 #[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AgentReset;
+
+/// Runs once immediately before each controlled simulation tick.
+///
+/// Agent policies should enqueue actions for the upcoming tick from this
+/// schedule. Keeping decisions in their own schedule makes it impossible for
+/// policy code to accidentally run once per render frame.
+#[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AgentDecision;
 
 #[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AgentPreTick;
@@ -219,6 +227,41 @@ pub enum AgentAction {
     },
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActionKind {
+    Noop,
+    Move,
+    Look,
+    Jump,
+    Crouch,
+    Sprint,
+    Interact,
+    Attack,
+    UseItem,
+    Dodge,
+    Custom,
+}
+
+impl AgentAction {
+    #[must_use]
+    pub const fn kind(&self) -> AgentActionKind {
+        match self {
+            Self::Noop => AgentActionKind::Noop,
+            Self::Move { .. } => AgentActionKind::Move,
+            Self::Look { .. } => AgentActionKind::Look,
+            Self::Jump => AgentActionKind::Jump,
+            Self::Crouch => AgentActionKind::Crouch,
+            Self::Sprint => AgentActionKind::Sprint,
+            Self::Interact => AgentActionKind::Interact,
+            Self::Attack { .. } => AgentActionKind::Attack,
+            Self::UseItem { .. } => AgentActionKind::UseItem,
+            Self::Dodge => AgentActionKind::Dodge,
+            Self::Custom { .. } => AgentActionKind::Custom,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CustomActionSchema {
     pub name: String,
@@ -227,6 +270,11 @@ pub struct CustomActionSchema {
 
 #[derive(Resource, Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct AgentActionCatalog {
+    /// `None` preserves the original behavior and exposes every built-in
+    /// action. Games can opt into accurate discovery with
+    /// [`AgentControlAppExt::set_supported_actions`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_actions: Option<BTreeSet<AgentActionKind>>,
     pub custom_actions: BTreeMap<String, CustomActionSchema>,
 }
 
@@ -239,6 +287,34 @@ impl AgentActionCatalog {
         let name = name.into();
         self.custom_actions
             .insert(name.clone(), CustomActionSchema { name, schema });
+    }
+
+    pub fn set_supported_actions(&mut self, actions: impl IntoIterator<Item = AgentActionKind>) {
+        self.supported_actions = Some(actions.into_iter().collect());
+    }
+
+    #[must_use]
+    pub fn supports(&self, action: AgentActionKind) -> bool {
+        self.supported_actions
+            .as_ref()
+            .is_none_or(|supported| supported.contains(&action))
+    }
+}
+
+#[derive(Resource, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentMetadata {
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+}
+
+impl Default for EnvironmentMetadata {
+    fn default() -> Self {
+        Self {
+            name: "unknown-game".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            description: None,
+        }
     }
 }
 
@@ -396,6 +472,11 @@ pub enum Observation {
         pixels: Option<PixelObservation>,
         debug: Option<serde_json::Value>,
     },
+    /// A game-defined, domain-shaped observation.
+    Domain {
+        tick: u64,
+        value: serde_json::Value,
+    },
     Error {
         message: String,
     },
@@ -416,8 +497,27 @@ impl Observation {
     }
 }
 
+#[derive(Resource, Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentObservationCatalog {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StateChecksum {
+pub struct EnvironmentChecksum {
+    pub tick: u64,
+    pub hash: u64,
+}
+
+/// Backwards-compatible name for the checksum of live gameplay state.
+pub type StateChecksum = EnvironmentChecksum;
+
+/// Checksum of the serialized, registered snapshot representation.
+///
+/// This is deliberately a distinct type from [`EnvironmentChecksum`]: games
+/// may use a custom live-state checksum that covers a different state surface.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotChecksum {
     pub tick: u64,
     pub hash: u64,
 }
@@ -441,6 +541,30 @@ pub struct StepResponse<O = Observation> {
     pub truncated: bool,
     pub info: StepInfo,
     pub checksum: Option<StateChecksum>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ResetResponse<O = Observation> {
+    pub tick: u64,
+    pub observation: O,
+    pub checksum: Option<EnvironmentChecksum>,
+    pub snapshot_id: Option<SnapshotId>,
+    pub timeline_id: TimelineId,
+    pub branch_id: BranchId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StepManyResponse<O = Observation> {
+    pub start_tick: u64,
+    pub end_tick: u64,
+    pub steps: usize,
+    pub observation: Option<O>,
+    pub reward: f32,
+    pub done: bool,
+    pub truncated: bool,
+    pub info: Option<StepInfo>,
+    pub checksum: Option<EnvironmentChecksum>,
+    pub responses: Vec<StepResponse<O>>,
 }
 
 #[derive(Resource, Clone, Debug, Serialize, Deserialize)]
@@ -558,6 +682,20 @@ pub trait AgentControlAppExt {
         name: impl Into<String>,
         schema: serde_json::Value,
     ) -> &mut Self;
+
+    fn set_environment_metadata(
+        &mut self,
+        name: impl Into<String>,
+        version: impl Into<String>,
+        description: Option<String>,
+    ) -> &mut Self;
+
+    fn set_supported_actions(
+        &mut self,
+        actions: impl IntoIterator<Item = AgentActionKind>,
+    ) -> &mut Self;
+
+    fn set_observation_schema(&mut self, schema: serde_json::Value) -> &mut Self;
 }
 
 impl AgentControlAppExt for App {
@@ -588,6 +726,47 @@ impl AgentControlAppExt for App {
             .register_custom_action_schema(name, schema);
         self
     }
+
+    fn set_environment_metadata(
+        &mut self,
+        name: impl Into<String>,
+        version: impl Into<String>,
+        description: Option<String>,
+    ) -> &mut Self {
+        self.insert_resource(EnvironmentMetadata {
+            name: name.into(),
+            version: version.into(),
+            description,
+        })
+    }
+
+    fn set_supported_actions(
+        &mut self,
+        actions: impl IntoIterator<Item = AgentActionKind>,
+    ) -> &mut Self {
+        if !self.world().contains_resource::<AgentActionCatalog>() {
+            self.init_resource::<AgentActionCatalog>();
+        }
+        self.world_mut()
+            .resource_mut::<AgentActionCatalog>()
+            .set_supported_actions(actions);
+        self
+    }
+
+    fn set_observation_schema(&mut self, schema: serde_json::Value) -> &mut Self {
+        self.insert_resource(AgentObservationCatalog {
+            schema: Some(schema),
+        })
+    }
+}
+
+/// Runs exactly one agent-controlled simulation tick, including the policy
+/// decision and pre/post hooks.
+pub fn run_agent_tick(world: &mut World) {
+    world.run_schedule(AgentDecision);
+    world.run_schedule(AgentPreTick);
+    world.run_schedule(AgentTick);
+    world.run_schedule(AgentPostTick);
 }
 
 #[derive(Clone, Debug)]
@@ -632,6 +811,7 @@ impl AgentControlPlugin {
 impl Plugin for AgentControlPlugin {
     fn build(&self, app: &mut App) {
         app.init_schedule(AgentReset)
+            .init_schedule(AgentDecision)
             .init_schedule(AgentPreTick)
             .init_schedule(AgentTick)
             .init_schedule(AgentPostTick)
@@ -642,6 +822,8 @@ impl Plugin for AgentControlPlugin {
             .init_resource::<AgentActionQueue>()
             .init_resource::<CurrentInputFrame>()
             .init_resource::<AgentActionCatalog>()
+            .init_resource::<AgentObservationCatalog>()
+            .init_resource::<EnvironmentMetadata>()
             .init_resource::<ObservationConfig>()
             .init_resource::<RewardState>()
             .init_resource::<EpisodeState>()
@@ -1105,5 +1287,39 @@ mod tests {
             Observation::FullState(serde_json::json!({ "tick": 1 }))
         );
         assert_eq!(response.checksum, Some(StateChecksum { tick: 1, hash: 42 }));
+    }
+
+    #[test]
+    fn agent_decision_runs_once_before_each_simulation_tick() {
+        #[derive(Resource, Default)]
+        struct PolicyCalls(u64);
+
+        fn policy(
+            mut calls: ResMut<PolicyCalls>,
+            clock: Res<SimClock>,
+            mut queue: ResMut<AgentActionQueue>,
+        ) {
+            calls.0 += 1;
+            queue.schedule(clock.tick + 1, ActionSource::Agent, AgentAction::Noop);
+        }
+
+        let mut app = App::new();
+        app.add_plugins(AgentControlPlugin::deterministic())
+            .init_resource::<PolicyCalls>()
+            .add_systems(AgentDecision, policy);
+        app.finish();
+        app.cleanup();
+
+        run_agent_tick(app.world_mut());
+        run_agent_tick(app.world_mut());
+
+        assert_eq!(app.world().resource::<PolicyCalls>().0, 2);
+        assert_eq!(app.world().resource::<SimClock>().tick, 2);
+        assert_eq!(
+            app.world()
+                .resource::<AgentControlState>()
+                .last_action_count,
+            1
+        );
     }
 }

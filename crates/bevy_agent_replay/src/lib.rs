@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use bevy::prelude::*;
 use bevy_agent_core::{
     ActionSource, AgentAction, AgentControlState, AgentSet, BranchId, CurrentInputFrame,
-    SnapshotId, StateChecksum, TimelineId,
+    EnvironmentMetadata, SnapshotChecksum, SnapshotId, TimelineId,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -40,7 +40,8 @@ pub struct ReplayLog {
     pub initial_snapshot: Option<SnapshotId>,
     pub records: Vec<ActionRecord>,
     pub checkpoints: BTreeMap<u64, SnapshotId>,
-    pub checksums: BTreeMap<u64, StateChecksum>,
+    #[serde(default, alias = "checksums")]
+    pub snapshot_checksums: BTreeMap<u64, SnapshotChecksum>,
 }
 
 impl ReplayLog {
@@ -189,9 +190,15 @@ pub fn record_replay_step(
 }
 
 pub fn start_recording(world: &mut World, initial_snapshot: Option<SnapshotId>) {
+    let metadata = world
+        .get_resource::<EnvironmentMetadata>()
+        .cloned()
+        .unwrap_or_default();
     let mut recorder = world.resource_mut::<ReplayRecorder>();
     recorder.recording = true;
     recorder.log = ReplayLog::default();
+    recorder.log.manifest.game_id = metadata.name;
+    recorder.log.manifest.game_version = metadata.version;
     recorder.log.initial_snapshot = initial_snapshot;
 }
 
