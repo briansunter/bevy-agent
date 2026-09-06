@@ -19,13 +19,13 @@ use bevy_agent_core::{
     EnvironmentMetadata, LastStepResponse, ObservationConfig, ObservationMode, SnapshotId,
     collect_observation_with_mode,
 };
-use bevy_agent_replay::{ReplayLog, stop_recording};
+use bevy_agent_replay::{ReplayLog, Timeline, collect_replay_references, stop_recording};
 use bevy_agent_runner::{
     AgentApp, AgentEnvironment, CaptureSource, ReplayBundle, ResetOptions, VisualCaptureOptions,
 };
 #[cfg(feature = "visual")]
 use bevy_agent_runner::{AgentVisualCaptureRenderer, VisualCaptureResult, visual_capture_path};
-use bevy_agent_snapshot::SnapshotStore;
+use bevy_agent_snapshot::{SnapshotStore, delete_snapshot_checked};
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -828,12 +828,23 @@ impl JsonRpcBridge {
                     .map_err(into_auth)?;
                 self.require_capability(AgentCapability::SNAPSHOT)
                     .map_err(into_auth)?;
-                let mut store = env.world_mut().resource_mut::<SnapshotStore>();
-                store.snapshots.remove(&params.snapshot_id);
-                store.labels.retain(|_, value| *value != params.snapshot_id);
-                store
-                    .checkpoints
-                    .retain(|value| *value != params.snapshot_id);
+                // Checked delete: reject snapshots that are pinned in the
+                // store or still referenced by the replay log / live timeline
+                // fork snapshots instead of silently dropping them.
+                let mut referenced: std::collections::BTreeSet<SnapshotId> = env
+                    .replay_log()
+                    .map(collect_replay_references)
+                    .unwrap_or_default();
+                if let Some(timeline) = env.world().get_resource::<Timeline>() {
+                    referenced.extend(
+                        timeline
+                            .branches
+                            .values()
+                            .filter_map(|branch| branch.fork_snapshot),
+                    );
+                }
+                delete_snapshot_checked(env.world_mut(), params.snapshot_id, &referenced)
+                    .map_err(into_internal)?;
                 Ok(Value::Null)
             }
             "agent.timeline.current" => {
@@ -944,11 +955,12 @@ impl JsonRpcBridge {
                 // Route through `AgentApp::start_recording` (baseline snapshot
                 // capture + timeline pinning), not the free recording fn.
                 // Ensure initialization first so the baseline tick is valid.
+                // Always pass `None` so a fresh baseline is captured for the
+                // current tick; reusing a stale `initial_snapshot` from a
+                // previous recording would pin the new log to an old baseline.
                 let init_mode = current_observation_mode(env);
                 ensure_initialized_with_mode(env, &init_mode).map_err(into_internal)?;
-                let initial_snapshot = env.replay_log().and_then(|log| log.initial_snapshot);
-                env.start_recording(initial_snapshot)
-                    .map_err(into_internal)?;
+                env.start_recording(None).map_err(into_internal)?;
                 Ok(json!({ "recording": true }))
             }
             "agent.replay.stop" => {
@@ -1066,6 +1078,11 @@ impl JsonRpcBridge {
                 };
                 let records = bundle.log.records.len();
                 let checkpoints = bundle.log.checkpoints.len();
+                // Validate the branch graph BEFORE installing anything: the
+                // runner install path writes snapshots/store state, so a
+                // malformed topology must be rejected up front.
+                validate_replay_bundle_topology(&bundle)
+                    .map_err(|error| invalid_params(error.to_string()))?;
                 env.load_replay_bundle(bundle).map_err(into_internal)?;
                 Ok(json!({
                     "records": records,
@@ -1229,6 +1246,13 @@ fn observe_with_request_mode(env: &mut AgentApp, mode: &ObservationMode) -> Resu
 /// (at or before the current tick) and the replay interval back to it must
 /// fit [`MAX_TICKS_PER_REQUEST`]. `fast_forward` enforces the same tick
 /// budget on the forward interval.
+/// Maximum branch-graph size accepted on replay import.
+pub const MAX_IMPORT_BRANCHES: usize = 10_000;
+/// Maximum parent-chain depth followed while validating an imported branch
+/// graph. Bounds every lineage walk so a malicious bundle cannot force
+/// unbounded traversal.
+pub const MAX_IMPORT_LINEAGE_DEPTH: usize = 1024;
+
 fn validate_history_target(env: &AgentApp, target_tick: u64, what: &str) -> Result<()> {
     let current = env.current_tick();
     if target_tick > current {
@@ -1325,6 +1349,94 @@ fn token_from_params(params: &Value) -> Option<String> {
         .get("session_token")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+/// Validate an imported replay bundle's branch graph BEFORE installing
+/// anything into the store/timeline. Rejects oversize graphs, duplicate ids,
+/// self-parenting, unknown parents, missing/multiple roots, and parent-chain
+/// cycles. Every lineage walk is bounded: each chain carries a visited set
+/// (cycle detection) and a [`MAX_IMPORT_LINEAGE_DEPTH`] step cap.
+fn validate_replay_bundle_topology(bundle: &ReplayBundle) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+
+    let topology = &bundle.log.timeline_topology;
+    // Legacy logs carry no topology; nothing graph-shaped to validate.
+    if topology.is_empty() {
+        return Ok(());
+    }
+    if topology.len() > MAX_IMPORT_BRANCHES {
+        return Err(anyhow!(
+            "replay bundle branch graph of {} exceeds limit of {MAX_IMPORT_BRANCHES}",
+            topology.len()
+        ));
+    }
+    let mut parents: HashMap<_, _> = HashMap::with_capacity(topology.len());
+    for branch in topology {
+        if parents
+            .insert(branch.branch_id, branch.parent_branch)
+            .is_some()
+        {
+            return Err(anyhow!(
+                "replay bundle has duplicate branch id {:?}",
+                branch.branch_id
+            ));
+        }
+        if branch.parent_branch == Some(branch.branch_id) {
+            return Err(anyhow!(
+                "replay bundle branch {:?} is its own parent",
+                branch.branch_id
+            ));
+        }
+    }
+    for branch in topology {
+        if let Some(parent) = branch.parent_branch
+            && !parents.contains_key(&parent)
+        {
+            return Err(anyhow!(
+                "replay bundle branch {:?} has unknown parent {:?}",
+                branch.branch_id,
+                parent
+            ));
+        }
+    }
+    let roots = topology
+        .iter()
+        .filter(|branch| branch.parent_branch.is_none())
+        .count();
+    if roots == 0 {
+        return Err(anyhow!("replay bundle branch graph has no root"));
+    }
+    if roots > 1 {
+        return Err(anyhow!(
+            "replay bundle branch graph has {roots} roots; exactly one is required"
+        ));
+    }
+    // Bounded lineage walk per branch: follow parent links with a per-chain
+    // visited set (cycle) and a depth cap (degenerate depth / hidden cycle).
+    for branch in topology {
+        let mut visited: HashSet<_> = HashSet::new();
+        visited.insert(branch.branch_id);
+        let mut current = branch.parent_branch;
+        let mut depth = 0usize;
+        while let Some(id) = current {
+            depth += 1;
+            if depth > MAX_IMPORT_LINEAGE_DEPTH {
+                return Err(anyhow!(
+                    "replay bundle branch {:?} lineage exceeds max depth of {MAX_IMPORT_LINEAGE_DEPTH}",
+                    branch.branch_id
+                ));
+            }
+            if !visited.insert(id) {
+                return Err(anyhow!(
+                    "replay bundle branch graph contains a parent-chain cycle at {id:?}"
+                ));
+            }
+            // `None` parents and unknown ids are handled above; unknown here
+            // is unreachable, so stop the walk defensively.
+            current = parents.get(&id).copied().flatten();
+        }
+    }
+    Ok(())
 }
 
 fn replay_bundle_from_legacy_log(env: &AgentApp, log: ReplayLog) -> Result<ReplayBundle> {
@@ -3509,6 +3621,133 @@ mod tests {
             current = current.get(part)?;
         }
         Some(current.clone())
+    }
+
+    #[test]
+    fn replay_topology_validation_accepts_legacy_and_single_root() {
+        // Legacy logs carry no topology.
+        let bundle = ReplayBundle {
+            format_version: ReplayBundle::FORMAT_VERSION,
+            log: ReplayLog::default(),
+            snapshots: Vec::new(),
+        };
+        assert!(validate_replay_bundle_topology(&bundle).is_ok());
+
+        // Single root with a linear child chain.
+        let root = bevy_agent_core::BranchId::new();
+        let child = bevy_agent_core::BranchId::new();
+        let log = ReplayLog {
+            timeline_topology: vec![
+                bevy_agent_replay::TimelineBranch {
+                    branch_id: root,
+                    parent_branch: None,
+                    fork_tick: 0,
+                    fork_snapshot: None,
+                    label: None,
+                    actions: Vec::new(),
+                },
+                bevy_agent_replay::TimelineBranch {
+                    branch_id: child,
+                    parent_branch: Some(root),
+                    fork_tick: 5,
+                    fork_snapshot: None,
+                    label: None,
+                    actions: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        let bundle = ReplayBundle {
+            format_version: ReplayBundle::FORMAT_VERSION,
+            log,
+            snapshots: Vec::new(),
+        };
+        assert!(validate_replay_bundle_topology(&bundle).is_ok());
+    }
+
+    #[test]
+    fn replay_topology_validation_rejects_malformed_graphs() {
+        fn bundle_with(branches: Vec<bevy_agent_replay::TimelineBranch>) -> ReplayBundle {
+            let log = ReplayLog {
+                timeline_topology: branches,
+                ..Default::default()
+            };
+            ReplayBundle {
+                format_version: ReplayBundle::FORMAT_VERSION,
+                log,
+                snapshots: Vec::new(),
+            }
+        }
+        fn branch(
+            id: bevy_agent_core::BranchId,
+            parent: Option<bevy_agent_core::BranchId>,
+        ) -> bevy_agent_replay::TimelineBranch {
+            bevy_agent_replay::TimelineBranch {
+                branch_id: id,
+                parent_branch: parent,
+                fork_tick: 0,
+                fork_snapshot: None,
+                label: None,
+                actions: Vec::new(),
+            }
+        }
+
+        // Self-parenting.
+        let id = bevy_agent_core::BranchId::new();
+        let err =
+            validate_replay_bundle_topology(&bundle_with(vec![branch(id, Some(id))])).unwrap_err();
+        assert!(err.to_string().contains("own parent"), "{err}");
+
+        // Two-node cycle also leaves the graph without a root.
+        let a = bevy_agent_core::BranchId::new();
+        let b = bevy_agent_core::BranchId::new();
+        let err = validate_replay_bundle_topology(&bundle_with(vec![
+            branch(a, Some(b)),
+            branch(b, Some(a)),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no root") || err.to_string().contains("cycle"),
+            "{err}"
+        );
+
+        // Longer cycle behind a valid root.
+        let root = bevy_agent_core::BranchId::new();
+        let x = bevy_agent_core::BranchId::new();
+        let y = bevy_agent_core::BranchId::new();
+        let err = validate_replay_bundle_topology(&bundle_with(vec![
+            branch(root, None),
+            branch(x, Some(y)),
+            branch(y, Some(x)),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("cycle"), "{err}");
+
+        // Unknown parent.
+        let orphan = bevy_agent_core::BranchId::new();
+        let missing = bevy_agent_core::BranchId::new();
+        let err =
+            validate_replay_bundle_topology(&bundle_with(vec![branch(orphan, Some(missing))]))
+                .unwrap_err();
+        assert!(err.to_string().contains("unknown parent"), "{err}");
+
+        // Multiple roots.
+        let r1 = bevy_agent_core::BranchId::new();
+        let r2 = bevy_agent_core::BranchId::new();
+        let err =
+            validate_replay_bundle_topology(&bundle_with(vec![branch(r1, None), branch(r2, None)]))
+                .unwrap_err();
+        assert!(err.to_string().contains("roots"), "{err}");
+
+        // Oversize graph.
+        let big: Vec<_> = (0..MAX_IMPORT_BRANCHES + 1)
+            .map(|_| {
+                let fresh = bevy_agent_core::BranchId::new();
+                branch(fresh, None)
+            })
+            .collect();
+        let err = validate_replay_bundle_topology(&bundle_with(big)).unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"), "{err}");
     }
 
     fn masked_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {

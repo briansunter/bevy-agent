@@ -70,8 +70,15 @@ cargo run -p sample_platformer --example agent_play
 Start a local HTTP/WebSocket remote server:
 
 ```sh
-cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
+cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000 --artifact-dir ./artifacts
 ```
+
+The example creates `./artifacts`, sets it as the artifact root, and grants
+the `FILESYSTEM` capability so screenshot captures and replay file exports
+work out of the box. All `path` / `output_dir` arguments stay confined under
+that root. The library default is restrictive (no `FILESYSTEM`); without it,
+filesystem-touching calls are rejected and replay bundles must be transferred
+inline as base64 (`bundle_base64` in `agent.replay.export`).
 
 The server exposes `POST /rpc`, `GET /health`, and `GET /ws`. For a command-by-command interaction guide, see [`docs/codex-interaction.md`](docs/codex-interaction.md).
 
@@ -119,11 +126,18 @@ cargo check --workspace --all-features
 Agents can play at their own pace by alternating structured steps with on-demand captures:
 
 ```sh
-cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
+cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000 --artifact-dir ./artifacts
 cargo run -p agentctl -- reset --seed 42
 cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
 cargo run -p agentctl -- capture --out-dir screenshots --label tick_1
+cargo run -p agentctl -- replay-export replay.json
 ```
+
+Capture output lands under the artifact root (`./artifacts/screenshots/`),
+and the replay file export under `./artifacts/replay.json`, because relative
+`output_dir` / `path` arguments resolve against `--artifact-dir`. To fetch a
+replay without filesystem access instead, omit the export path and save the
+inline base64 payload client-side.
 
 `agent.visual.capture` returns a PNG path plus tick/frame/size metadata. Set `source` to `software`, `primary_window`, or `auto`. Games can register a software capture renderer for headless runs, as the sample platformer does.
 
@@ -184,4 +198,4 @@ include all referenced initial and checkpoint snapshots.
 
 The sample platformer follows this contract: movement, gravity, collision, coin pickup, reward, terminal checks, observation extraction, snapshots, replay, and branches all run headlessly under explicit agent control.
 
-Commands that capture images or export replays write local runtime output such as `screenshots/` and `replay.json`. Those paths are ignored by Git; keep any intentional fixtures under an explicitly named test or example directory.
+Commands that capture images or export replays write local runtime output under the server's artifact root ( `./artifacts/` when using `--artifact-dir ./artifacts`, e.g. `artifacts/screenshots/` and `artifacts/replay.json`). Those paths are ignored by Git; keep any intentional fixtures under an explicitly named test or example directory.

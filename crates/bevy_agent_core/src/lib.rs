@@ -153,6 +153,30 @@ impl Default for BranchId {
     }
 }
 
+/// Execution context for the simulation.
+///
+/// Moved into `bevy_agent_core` (from the replay crate) so that
+/// `drain_agent_actions` can gate on a world resource instead of scanning
+/// the action queue for a caller-forgeable marker. The runner installs
+/// `Reconstructing` for the duration of history replay; policy systems and
+/// snapshot bookkeeping stay quiet while recorded ticks are rebuilt.
+/// The replay crate keeps a mirror enum for its own recording gate; the
+/// runner sets both during reconstruction.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionContext {
+    #[default]
+    Live,
+    Reconstructing,
+}
+
+/// Prefix reserved for internal custom-action markers.
+///
+/// [`validate_action_against_catalog`] rejects any `Custom` value containing
+/// this prefix so callers cannot forge internal privilege signals (the old
+/// `__bevy_agent_reconstructing__` queue sentinel is gone; reconstruction
+/// is signaled via the [`ExecutionContext`] resource instead).
+pub const RESERVED_CUSTOM_PREFIX: &str = "__bevy_agent_";
+
 #[derive(Resource, Clone, Debug, Serialize, Deserialize)]
 pub struct SimClock {
     pub tick: u64,
@@ -378,6 +402,9 @@ impl AgentActionCatalog {
 ///   rejected.
 /// * Bounded payloads are rejected when non-finite or out of range:
 ///   `Move.x/y` must be finite in `[-1, 1]`, `Look` deltas must be finite.
+/// * `Custom` values containing the reserved [`RESERVED_CUSTOM_PREFIX`]
+///   (`__bevy_agent_`) are rejected: that prefix is reserved for internal
+///   markers and must never be caller-forgeable.
 pub fn validate_action_against_catalog(
     catalog: &AgentActionCatalog,
     action: &AgentAction,
@@ -386,6 +413,13 @@ pub fn validate_action_against_catalog(
     if !catalog.supports(kind) {
         return Err(AgentControlError::InvalidAction(format!(
             "unsupported action kind {kind:?}"
+        )));
+    }
+    if let AgentAction::Custom { value } = action
+        && custom_value_is_reserved(value)
+    {
+        return Err(AgentControlError::InvalidAction(format!(
+            "Custom action value uses reserved prefix {RESERVED_CUSTOM_PREFIX:?}"
         )));
     }
     match action {
@@ -412,6 +446,34 @@ pub fn validate_action_against_catalog(
         _ => {}
     }
     Ok(())
+}
+
+/// Returns `true` when a `Custom` action value touches the reserved
+/// [`RESERVED_CUSTOM_PREFIX`] namespace (object keys or string payloads,
+/// searched recursively). Reserved keys can never be set by callers.
+fn custom_value_is_reserved(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, nested)| {
+            key.starts_with(RESERVED_CUSTOM_PREFIX) || custom_value_is_reserved(nested)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(custom_value_is_reserved),
+        serde_json::Value::String(text) => text.starts_with(RESERVED_CUSTOM_PREFIX),
+        _ => false,
+    }
+}
+
+/// Legacy reconstruction sentinel shape (pre-`ExecutionContext`).
+///
+/// The queue-marker mechanism is removed: reconstruction is signaled via the
+/// [`ExecutionContext`] resource. This helper only lets `drain_agent_actions`
+/// drop stale sentinels still present in old queues/snapshots; it never
+/// grants privilege.
+fn is_legacy_reconstructing_sentinel(action: &AgentAction) -> bool {
+    if let AgentAction::Custom { value } = action {
+        value.get("__bevy_agent_reconstructing__") == Some(&serde_json::Value::Bool(true))
+    } else {
+        false
+    }
 }
 
 #[derive(Resource, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1083,6 +1145,7 @@ impl Plugin for AgentControlPlugin {
             .init_resource::<RewardState>()
             .init_resource::<EpisodeState>()
             .init_resource::<LastStepResponse>()
+            .init_resource::<ExecutionContext>()
             .configure_sets(
                 AgentReset,
                 (
@@ -1168,31 +1231,22 @@ pub fn drain_agent_actions(
     mut queue: ResMut<AgentActionQueue>,
     mut input: ResMut<CurrentInputFrame>,
     mut control: ResMut<AgentControlState>,
+    context: Option<Res<ExecutionContext>>,
 ) {
     input.tick = clock.tick;
     input.actions.clear();
     input.sources.clear();
 
     let mode = control.mode.clone();
-    // Reconstruction bypass: when the runner rebuilds history it enqueues a
-    // sentinel `Custom` marker alongside the recorded frame for the tick.
-    // `ExecutionContext::Reconstructing` lives in the replay crate (core
-    // cannot depend on it without a cycle), so the marker is the cross-crate
-    // Reconstructing signal: if present, accept all recorded sources without
-    // mode arbitration, preserving inputs even in Paused/Replay modes.
-    let reconstructing = queue.pending.iter().any(|scheduled| {
-        if let AgentAction::Custom { value } = &scheduled.action {
-            value.get("__bevy_agent_reconstructing__") == Some(&serde_json::Value::Bool(true))
-        } else {
-            false
-        }
-    });
+    // Reconstruction bypass is gated on the `ExecutionContext` resource
+    // (installed by the runner during history replay), never on queue
+    // contents: no caller-forgeable marker can escalate privilege. Stale
+    // legacy sentinels are dropped as metadata, never treated as input.
+    let reconstructing = matches!(context.as_deref(), Some(ExecutionContext::Reconstructing));
     let mut remaining = VecDeque::new();
     while let Some(next) = queue.pending.pop_front() {
-        // Drop the Reconstructing sentinel itself; it is metadata, not input.
-        if let AgentAction::Custom { value } = &next.action
-            && value.get("__bevy_agent_reconstructing__") == Some(&serde_json::Value::Bool(true))
-        {
+        // Drop legacy Reconstructing sentinels; they are metadata, not input.
+        if is_legacy_reconstructing_sentinel(&next.action) {
             continue;
         }
         if next.tick == clock.tick {

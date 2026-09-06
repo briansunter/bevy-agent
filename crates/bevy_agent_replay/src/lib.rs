@@ -1,6 +1,6 @@
 //! Replay logs and timeline branches for deterministic agent-controlled games.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bevy::prelude::*;
 use bevy_agent_core::{
@@ -30,6 +30,40 @@ pub fn legacy_root_id() -> BranchId {
 #[must_use]
 pub fn is_legacy_branch(branch: BranchId) -> bool {
     branch.0 == Uuid::nil()
+}
+
+/// Canonical string key for [`ReplayLog::branch_checksums`].
+#[must_use]
+pub fn branch_checksum_key(branch: BranchId) -> String {
+    branch.0.to_string()
+}
+
+/// Every snapshot referenced by a replay log.
+///
+/// Collects `initial_snapshot`, all legacy `checkpoints` values, all
+/// `branch_checkpoints` snapshot ids, and every `timeline_topology`
+/// `fork_snapshot`. Snapshot retention (`prune_checkpoints_with_refs` /
+/// `delete_snapshot_checked` in `bevy_agent_snapshot`) must be called with
+/// this set so coordinated deletes never drop a snapshot another subsystem
+/// still needs.
+#[must_use]
+pub fn collect_replay_references(log: &ReplayLog) -> BTreeSet<SnapshotId> {
+    let mut referenced = BTreeSet::new();
+    if let Some(initial) = log.initial_snapshot {
+        referenced.insert(initial);
+    }
+    referenced.extend(log.checkpoints.values().copied());
+    referenced.extend(
+        log.branch_checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.snapshot_id),
+    );
+    referenced.extend(
+        log.timeline_topology
+            .iter()
+            .filter_map(|branch| branch.fork_snapshot),
+    );
+    referenced
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,8 +130,25 @@ pub struct ReplayLog {
     pub initial_snapshot: Option<SnapshotId>,
     pub records: Vec<ActionRecord>,
     pub checkpoints: BTreeMap<u64, SnapshotId>,
+    /// Legacy per-tick checksums (no branch tag).
+    ///
+    /// Kept for serde back-compat: old bundles only populate this map.
+    /// New code must write via [`ReplayLog::insert_branch_checksum`] (which
+    /// keeps this map consistent) and read via
+    /// [`ReplayLog::expected_checksum`] (branch map first, legacy fallback).
+    /// On load, legacy entries are visible to every branch through the
+    /// fallback until migrated.
     #[serde(default, alias = "checksums")]
     pub snapshot_checksums: BTreeMap<u64, SnapshotChecksum>,
+    /// Branch-aware expected checksums, keyed by `BranchId` string
+    /// (`branch.0.to_string()`) -> tick -> checksum.
+    ///
+    /// The legacy [`ReplayLog::snapshot_checksums`] map cannot hold two
+    /// checksums at the same tick on different branches; this map preserves
+    /// per-branch isolation. Use [`ReplayLog::expected_checksum`] for reads
+    /// and [`ReplayLog::insert_branch_checksum`] for writes.
+    #[serde(default)]
+    pub branch_checksums: BTreeMap<String, BTreeMap<u64, SnapshotChecksum>>,
     /// Branch-tagged checkpoints. Allows the same tick to hold distinct
     /// checkpoints per branch (parent/child isolation).
     #[serde(default)]
@@ -137,7 +188,8 @@ impl ReplayLog {
         !self.timeline_topology.is_empty()
     }
 
-    /// End of recorded history: max over records, checkpoints, and bounds.
+    /// End of recorded history: max over records, checkpoints, bounds,
+    /// and branch-aware checksums.
     #[must_use]
     pub fn log_end_tick(&self) -> u64 {
         let mut end = self.end_tick.max(self.cursor_tick).max(self.initial_tick);
@@ -150,7 +202,42 @@ impl ReplayLog {
         for checkpoint in &self.branch_checkpoints {
             end = end.max(checkpoint.tick);
         }
+        for tick in self.snapshot_checksums.keys() {
+            end = end.max(*tick);
+        }
+        for per_branch in self.branch_checksums.values() {
+            for tick in per_branch.keys() {
+                end = end.max(*tick);
+            }
+        }
         end
+    }
+
+    /// Branch-aware checksum lookup: per-branch map first, legacy per-tick
+    /// map as back-compat fallback (legacy entries predate branch tags and
+    /// are visible to every branch).
+    #[must_use]
+    pub fn expected_checksum(&self, branch: BranchId, tick: u64) -> Option<&SnapshotChecksum> {
+        self.branch_checksums
+            .get(&branch_checksum_key(branch))
+            .and_then(|per_branch| per_branch.get(&tick))
+            .or_else(|| self.snapshot_checksums.get(&tick))
+    }
+
+    /// Branch-aware checksum insert. Writes the per-branch map and keeps the
+    /// legacy per-tick map consistent (legacy aliases the latest write at
+    /// that tick for old readers).
+    pub fn insert_branch_checksum(
+        &mut self,
+        branch: BranchId,
+        tick: u64,
+        checksum: SnapshotChecksum,
+    ) {
+        self.branch_checksums
+            .entry(branch_checksum_key(branch))
+            .or_default()
+            .insert(tick, checksum.clone());
+        self.snapshot_checksums.insert(tick, checksum);
     }
 
     /// Populate topology fields from a live timeline (called on export).
@@ -293,17 +380,46 @@ impl ReplayLog {
     /// steps after `restore_tick` so stale future records can never be
     /// replayed or confused with the diverged history. Records on other
     /// branches are preserved.
+    ///
+    /// Checksum pruning mirrors checkpoint pruning: the diverged branch's
+    /// `branch_checksums` entries beyond `tick` are removed (dropping the
+    /// branch key when empty). Legacy `snapshot_checksums` entries beyond
+    /// `tick` are removed only when no branch checkpoint remains at that
+    /// tick, so a same-tick checkpoint on another branch keeps its alias.
     pub fn truncate_future(&mut self, branch: BranchId, tick: u64) {
         self.records
             .retain(|record| !(record.branch_id == branch && record.tick > tick));
         self.branch_checkpoints
             .retain(|checkpoint| !(checkpoint.branch_id == branch && checkpoint.tick > tick));
-        // Keep the legacy map consistent for entries that belong to this
-        // branch lineage only when branch-tagged data is absent; otherwise the
-        // legacy map may alias another branch's same-tick checkpoint.
+        // Branch-aware checksums: drop this branch's future.
+        let key = branch_checksum_key(branch);
+        if let Some(per_branch) = self.branch_checksums.get_mut(&key) {
+            per_branch.retain(|checkpoint_tick, _| *checkpoint_tick <= tick);
+        }
+        if self
+            .branch_checksums
+            .get(&key)
+            .is_some_and(|per_branch| per_branch.is_empty())
+        {
+            self.branch_checksums.remove(&key);
+        }
+        // Legacy map: legacy-only logs truncate unconditionally; logs with
+        // branch-tagged data keep a legacy entry while any branch checkpoint
+        // remains at that tick (same-tick isolation across branches).
         if self.branch_checkpoints.is_empty() {
             self.checkpoints
                 .retain(|checkpoint_tick, _| *checkpoint_tick <= tick);
+            self.snapshot_checksums
+                .retain(|checksum_tick, _| *checksum_tick <= tick);
+        } else {
+            self.snapshot_checksums.retain(|checksum_tick, _| {
+                if *checksum_tick <= tick {
+                    return true;
+                }
+                self.branch_checkpoints
+                    .iter()
+                    .any(|checkpoint| checkpoint.tick == *checksum_tick)
+            });
         }
     }
 
@@ -345,21 +461,14 @@ impl ReplayLog {
     /// Validates that every snapshot referenced by the log is present in
     /// `provided`. Used by bundle export/import to guarantee retention
     /// integrity after `prune_checkpoints` runs in the snapshot crate.
+    /// Covers [`collect_replay_references`]: initial, legacy + branch-tagged
+    /// checkpoints, and topology `fork_snapshot`s.
     #[must_use]
     pub fn missing_snapshot_reference(
         &self,
         provided: &std::collections::BTreeSet<SnapshotId>,
     ) -> Option<SnapshotId> {
-        let mut referenced = std::collections::BTreeSet::new();
-        if let Some(initial) = self.initial_snapshot {
-            referenced.insert(initial);
-        }
-        referenced.extend(self.checkpoints.values().copied());
-        referenced.extend(
-            self.branch_checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.snapshot_id),
-        );
+        let referenced = collect_replay_references(self);
         referenced.difference(provided).next().copied()
     }
 }

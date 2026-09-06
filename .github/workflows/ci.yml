@@ -33,3 +33,35 @@ jobs:
 
       - name: Python tests
         run: python3 -m unittest discover -s python/tests
+
+  extended:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.91
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: 1.91.0
+          override: true
+          components: rustfmt, clippy
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cargo tests (all targets)
+        run: cargo test --workspace --all-targets
+
+      - name: Visual feature compile check
+        run: cargo check -p sample_platformer --features visual
+
+      - name: Locked build
+        run: cargo build --workspace --locked
+
+      - name: Python tests
+        run: python3 -m unittest discover -s python/tests

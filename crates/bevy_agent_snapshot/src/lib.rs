@@ -120,6 +120,40 @@ pub enum SnapshotRole {
     Periodic,
 }
 
+impl SnapshotRole {
+    /// Routing helper for the reset path: the initial snapshot of an
+    /// episode/run. Always auto-pinned on creation.
+    ///
+    /// The runner reset path must use this (not a bare
+    /// [`SnapshotRole::Manual`]) so retention keeps the episode baseline.
+    #[must_use]
+    pub fn for_reset() -> Self {
+        Self::Initial
+    }
+
+    /// Routing helper for the fork/branch path: the snapshot a new timeline
+    /// branch forks from. Always auto-pinned on creation.
+    ///
+    /// The runner fork/branch path must use this so the fork point survives
+    /// `keep_last_n` enforcement while the branch lives.
+    #[must_use]
+    pub fn for_fork() -> Self {
+        Self::BranchFork
+    }
+
+    /// Routing helper for the recording baseline path: the snapshot a
+    /// recording/replay log references as its baseline. Always auto-pinned
+    /// on creation.
+    ///
+    /// The runner recording path must use this for the baseline snapshot so
+    /// replay retention (via `collect_replay_references` in
+    /// `bevy_agent_replay`) never evicts it.
+    #[must_use]
+    pub fn for_baseline() -> Self {
+        Self::RecordingBaseline
+    }
+}
+
 #[derive(Resource, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SnapshotStore {
     pub snapshots: HashMap<SnapshotId, Snapshot>,
@@ -138,6 +172,25 @@ pub struct SnapshotStore {
     /// the episode that produced them.
     #[serde(default)]
     pub episode_id: u64,
+}
+
+impl SnapshotStore {
+    /// Checkpoint-ordered ids that retention may evict: members of
+    /// [`SnapshotStore::checkpoints`] that are neither pinned nor present in
+    /// the caller-held `referenced` set.
+    ///
+    /// The `referenced` set is owned by the replay/timeline layer; callers
+    /// must pass `collect_replay_references(log)` from `bevy_agent_replay`
+    /// (initial + all checkpoint values + topology `fork_snapshot`s) so
+    /// coordinated deletes never drop a snapshot another subsystem needs.
+    #[must_use]
+    pub fn evictable_candidates(&self, referenced: &BTreeSet<SnapshotId>) -> Vec<SnapshotId> {
+        self.checkpoints
+            .iter()
+            .copied()
+            .filter(|id| can_evict(self, *id, referenced))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -544,6 +597,21 @@ pub fn create_snapshot(world: &mut World, label: Option<String>) -> Result<Snaps
     create_snapshot_with_role(world, label, SnapshotRole::Manual)
 }
 
+/// Role-tagged snapshot creation (preferred).
+///
+/// The `role` drives auto-pin + retention: [`SnapshotRole::Initial`],
+/// [`SnapshotRole::BranchFork`], and [`SnapshotRole::RecordingBaseline`]
+/// are pinned on creation (see [`SnapshotRole::for_reset`],
+/// [`SnapshotRole::for_fork`], [`SnapshotRole::for_baseline`], which the
+/// runner reset/fork/recording paths must use). `Manual`/`Periodic` are
+/// evictable unless pinned or replay-referenced.
+///
+/// Retention note: internal enforcement calls [`prune_checkpoints`] with an
+/// empty replay-reference set (this crate cannot depend on
+/// `bevy_agent_replay`). Owners of a [`ReplayLog`](bevy_agent_replay::ReplayLog)
+/// must follow up with [`prune_checkpoints_with_refs`] passing
+/// `collect_replay_references(log)` from `bevy_agent_replay`, so a snapshot
+/// referenced by a log or branch is never evicted by a later creation.
 pub fn create_snapshot_with_role(
     world: &mut World,
     label: Option<String>,
@@ -771,10 +839,92 @@ pub fn restore_snapshot_value(world: &mut World, snapshot: &Snapshot) -> Result<
     restore_snapshot_value_with_remap(world, snapshot, None)
 }
 
+/// Options controlling post-restore checksum verification.
+///
+/// The default (`RestoreOptions::default()`) performs a full checksum
+/// comparison: the re-captured world must equal the stored snapshot bit for
+/// bit (modulo canonical ordering).
+///
+/// # Remap / checksum interaction
+///
+/// Raw Bevy [`Entity`] ids are reallocated on every restore and are NOT
+/// stable across capture/restore. Components must reference other entities
+/// by [`StableEntityId`] (stable-id-first, e.g. `Attack { target:
+/// StableEntityId }`), which restores verbatim and verifies cleanly.
+///
+/// When a `remap` hook rewrites raw-`Entity` fields in place after restore,
+/// the rewritten values legitimately differ from the captured bytes, so a
+/// full checksum comparison would spuriously fail. Pass those component type
+/// names in `excluded_components` (and/or set `verify_without_entity_ids`)
+/// so verification recomputes both sides with
+/// [`checksum_snapshot_with_remap_exclusions`], excluding the remapped
+/// fix-up from the comparison. The prepare-phase checksum precondition still
+/// uses the full checksum; only post-restore verification honors exclusions.
+#[derive(Clone, Debug, Default)]
+pub struct RestoreOptions {
+    /// Component type names (as in [`ComponentSnapshot::type_name`]) to
+    /// exclude from post-restore checksum verification.
+    pub excluded_components: Vec<String>,
+    /// When true, post-restore verification ignores the components listed in
+    /// `excluded_components` (stable-payload comparison). When false with an
+    /// empty exclusion list, verification is the full checksum.
+    pub verify_without_entity_ids: bool,
+}
+
+impl RestoreOptions {
+    /// Verification that ignores raw-`Entity` fix-ups in the given
+    /// components (stable-payload comparison on both sides).
+    #[must_use]
+    pub fn without_entity_ids(excluded_components: &[&str]) -> Self {
+        Self {
+            excluded_components: excluded_components
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            verify_without_entity_ids: true,
+        }
+    }
+}
+
 pub fn restore_snapshot_value_with_remap(
     world: &mut World,
     snapshot: &Snapshot,
     remap: Option<&StableIdRemapHook>,
+) -> Result<SnapshotChecksum> {
+    restore_snapshot_value_with_options(world, snapshot, remap, &RestoreOptions::default())
+}
+
+/// Restore with explicit checksum exclusions for remapped raw-`Entity`
+/// components (see [`RestoreOptions`]).
+///
+/// Equivalent to [`restore_snapshot_value_with_options`] with
+/// `RestoreOptions::without_entity_ids(excluded_components)`.
+pub fn restore_snapshot_value_with_remap_and_exclusions(
+    world: &mut World,
+    snapshot: &Snapshot,
+    remap: Option<&StableIdRemapHook>,
+    excluded_components: &[&str],
+) -> Result<SnapshotChecksum> {
+    restore_snapshot_value_with_options(
+        world,
+        snapshot,
+        remap,
+        &RestoreOptions::without_entity_ids(excluded_components),
+    )
+}
+
+/// Canonical restore: two-phase apply plus configurable verification.
+///
+/// Behaves exactly like [`restore_snapshot_value_with_remap`] when `options`
+/// is default; when `options.verify_without_entity_ids` is set (or
+/// `excluded_components` is non-empty with the flag), post-restore
+/// verification compares [`checksum_snapshot_with_remap_exclusions`] on both
+/// the stored and re-captured snapshots instead of the full checksum.
+pub fn restore_snapshot_value_with_options(
+    world: &mut World,
+    snapshot: &Snapshot,
+    remap: Option<&StableIdRemapHook>,
+    options: &RestoreOptions,
 ) -> Result<SnapshotChecksum> {
     // ---- Phase 1: Prepare (no world mutation) ----
     let plan = prepare_restore_plan(world, snapshot)?;
@@ -804,8 +954,29 @@ pub fn restore_snapshot_value_with_remap(
     }
 
     // Post-restore verification: re-capture and compare checksums.
+    // With `verify_without_entity_ids`, both sides are recomputed with
+    // `checksum_snapshot_with_remap_exclusions` so raw-`Entity` fix-ups
+    // applied by the remap hook are excluded from the comparison.
     let verification = (|| -> Result<SnapshotChecksum> {
         let recaptured = capture_snapshot(world, snapshot.manifest.label.clone())?;
+        let excluded: Vec<&str> = options
+            .excluded_components
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if options.verify_without_entity_ids || !excluded.is_empty() {
+            let actual = checksum_snapshot_with_remap_exclusions(&recaptured, &excluded)?;
+            let expected = checksum_snapshot_with_remap_exclusions(snapshot, &excluded)?;
+            if actual.hash != expected.hash || actual.tick != expected.tick {
+                return Err(anyhow!(
+                    "restored checksum mismatch (excluding {:?}): expected {:?}, got {:?}",
+                    excluded,
+                    expected,
+                    actual
+                ));
+            }
+            return Ok(actual);
+        }
         let checksum = checksum_snapshot(&recaptured)?;
         if checksum.hash != snapshot.checksum.hash || checksum.tick != snapshot.checksum.tick {
             return Err(anyhow!(
@@ -1057,10 +1228,32 @@ pub fn lookup_snapshot_by_label(world: &World, label: &str) -> Option<SnapshotId
 }
 
 pub fn checksum_snapshot(snapshot: &Snapshot) -> Result<SnapshotChecksum> {
+    checksum_snapshot_with_remap_exclusions(snapshot, &[])
+}
+
+/// Stable-payload checksum excluding remapped raw-`Entity` components.
+///
+/// Full [`checksum_snapshot`] hashes every captured component value,
+/// including raw Bevy [`Entity`] ids when a component stores them directly.
+/// Raw `Entity` ids are reallocated on every restore, so a `remap` hook that
+/// rewrites them in place would always fail full verification. This variant
+/// skips the components named in `excluded_components` (matched against
+/// [`ComponentSnapshot::type_name`); pass the type names of components whose
+/// raw-`Entity` fields the remap hook fixes up.
+///
+/// Prefer stable-id-first components (references by [`StableEntityId`])
+/// which need no exclusion; use this only for the raw-`Entity` fix-up set
+/// passed to verification via [`RestoreOptions`]. An empty exclusion list is
+/// exactly [`checksum_snapshot`].
+pub fn checksum_snapshot_with_remap_exclusions(
+    snapshot: &Snapshot,
+    excluded_components: &[&str],
+) -> Result<SnapshotChecksum> {
     // Versioned canonical serialization: CHECKSUM_VERSION first, fixed-width
     // LE ints, explicit f32/f64 bits, sorted resources/entities/components
     // (capture already sorts; re-sort defensively for hand-built snapshots),
     // and sorted JSON object keys (via StableHasher::write_json).
+    let excluded: HashSet<&str> = excluded_components.iter().copied().collect();
     let mut hasher = StableHasher::new();
     hasher.write_u32(CHECKSUM_VERSION);
     hasher.write_u64(snapshot.clock.tick);
@@ -1085,6 +1278,9 @@ pub fn checksum_snapshot(snapshot: &Snapshot) -> Result<SnapshotChecksum> {
         let mut components = entity.components.iter().collect::<Vec<_>>();
         components.sort_by(|a, b| a.type_name.cmp(&b.type_name));
         for component in components {
+            if excluded.contains(component.type_name.as_str()) {
+                continue;
+            }
             hasher.write_string(&component.type_name);
             hasher.write_json(&component.value);
         }
@@ -1138,10 +1334,11 @@ pub fn maybe_take_snapshot(world: &mut World) {
 /// Returns false when `snapshot_id` is pinned or appears in the caller-held
 /// replay-reference set; such snapshots must never be evicted.
 ///
-/// The `referenced` set is owned by the replay/timeline layer (snapshots
-/// referenced by a [`ReplayLog`](bevy_agent_replay::ReplayLog) or an active
-/// branch). Retention enforcement threads it through so coordinated deletes
-/// never drop a snapshot another subsystem still needs.
+/// The `referenced` set is owned by the replay/timeline layer: pass
+/// `collect_replay_references(log)` from `bevy_agent_replay` (initial + all
+/// checkpoint values + topology `fork_snapshot`s). Retention enforcement
+/// threads it through so coordinated deletes never drop a snapshot another
+/// subsystem still needs.
 pub fn can_evict(
     store: &SnapshotStore,
     snapshot_id: SnapshotId,
@@ -1152,6 +1349,8 @@ pub fn can_evict(
 
 /// Coordinated delete: rejects snapshots that are pinned or referenced.
 ///
+/// `referenced` must be `collect_replay_references(log)` from
+/// `bevy_agent_replay` when a replay log exists (else an empty set).
 /// Returns an error when `id` is pinned or present in `referenced`; otherwise
 /// removes the snapshot from the store, checkpoint list, and label index.
 pub fn delete_snapshot_checked(
@@ -1178,18 +1377,31 @@ pub fn delete_snapshot_checked(
     Ok(())
 }
 
-fn prune_checkpoints(world: &mut World, keep_last_n: usize) {
+/// Legacy retention entry point (no replay references).
+///
+/// Prefer [`prune_checkpoints_with_refs`], the canonical enforcement used
+/// with `collect_replay_references(log)` from `bevy_agent_replay`. This
+/// wrapper passes an empty reference set and is kept so existing creation
+/// paths (which cannot depend on the replay crate) keep compiling; replay
+/// owners must follow up with the `_with_refs` variant after recording
+/// changes. See [`create_snapshot_with_role`] retention notes.
+pub fn prune_checkpoints(world: &mut World, keep_last_n: usize) {
     prune_checkpoints_with_refs(world, keep_last_n, &BTreeSet::new());
 }
 
-/// Retention over EVICTABLE checkpoints only.
+/// Canonical retention over EVICTABLE checkpoints only.
 ///
 /// Pinned snapshots (initial/fork/baseline) and caller-referenced snapshots
 /// are excluded from the `keep_last_n` count: enforcement counts only
-/// evictable checkpoints and evicts the oldest evictable checkpoint other
+/// evictable checkpoints (see [`SnapshotStore::evictable_candidates`] and
+/// [`can_evict`]) and evicts the oldest evictable checkpoint other
 /// than the most recently created one, so the newly created id always
 /// survives. When no evictable checkpoint other than the newest exists, the
 /// limit is exceeded rather than deleting the new snapshot.
+///
+/// Callers that own a [`ReplayLog`](bevy_agent_replay::ReplayLog) must pass
+/// `collect_replay_references(log)` from `bevy_agent_replay` as `referenced`
+/// (initial + all checkpoint values + topology `fork_snapshot`s).
 pub fn prune_checkpoints_with_refs(
     world: &mut World,
     keep_last_n: usize,
