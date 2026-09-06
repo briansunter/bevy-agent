@@ -1444,11 +1444,9 @@ fn replay_bundle_from_legacy_log(env: &AgentApp, log: ReplayLog) -> Result<Repla
         .world()
         .get_resource::<SnapshotStore>()
         .ok_or_else(|| anyhow!("AgentSnapshotPlugin is not installed"))?;
-    let referenced = log
-        .initial_snapshot
-        .into_iter()
-        .chain(log.checkpoints.values().copied())
-        .collect::<std::collections::BTreeSet<_>>();
+    // Single collector for the payload reference set (initial + legacy
+    // checkpoints + branch-tagged checkpoints + topology fork snapshots).
+    let referenced = collect_replay_references(&log);
     let snapshots = referenced
         .into_iter()
         .filter_map(|id| store.snapshots.get(&id).cloned())

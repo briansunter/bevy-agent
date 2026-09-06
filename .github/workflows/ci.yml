@@ -29,16 +29,13 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
 
       - name: Cargo tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Python tests
         run: python3 -m unittest discover -s python/tests
 
   extended:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
@@ -49,19 +46,41 @@ jobs:
           override: true
           components: rustfmt, clippy
 
+      - name: Cargo tests (all targets)
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Locked build
+        run: cargo build --workspace --locked
+
+  visual:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.91
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: 1.91.0
+          override: true
+
+      - name: Install Bevy Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++ pkg-config libx11-dev libasound2-dev libudev-dev libxkbcommon-x11-0 libwayland-dev libxkbcommon-dev
+
+      - name: Visual feature compile check
+        run: cargo check -p sample_platformer --features visual --locked
+
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Cargo tests (all targets)
-        run: cargo test --workspace --all-targets
-
-      - name: Visual feature compile check
-        run: cargo check -p sample_platformer --features visual
-
-      - name: Locked build
-        run: cargo build --workspace --locked
 
       - name: Python tests
         run: python3 -m unittest discover -s python/tests

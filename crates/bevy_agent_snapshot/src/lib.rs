@@ -475,7 +475,10 @@ impl Plugin for AgentSnapshotPlugin {
             .register_snapshot_resource::<EpisodeState>()
             .add_systems(
                 bevy_agent_core::AgentTick,
-                maybe_take_snapshot.in_set(AgentSet::Snapshot),
+                (|world: &mut World| {
+                    maybe_take_snapshot(world);
+                })
+                .in_set(AgentSet::Snapshot),
             );
     }
 }
@@ -599,19 +602,19 @@ pub fn create_snapshot(world: &mut World, label: Option<String>) -> Result<Snaps
 
 /// Role-tagged snapshot creation (preferred).
 ///
-/// The `role` drives auto-pin + retention: [`SnapshotRole::Initial`],
+/// The `role` drives auto-pin: [`SnapshotRole::Initial`],
 /// [`SnapshotRole::BranchFork`], and [`SnapshotRole::RecordingBaseline`]
 /// are pinned on creation (see [`SnapshotRole::for_reset`],
 /// [`SnapshotRole::for_fork`], [`SnapshotRole::for_baseline`], which the
 /// runner reset/fork/recording paths must use). `Manual`/`Periodic` are
 /// evictable unless pinned or replay-referenced.
 ///
-/// Retention note: internal enforcement calls [`prune_checkpoints`] with an
-/// empty replay-reference set (this crate cannot depend on
-/// `bevy_agent_replay`). Owners of a [`ReplayLog`](bevy_agent_replay::ReplayLog)
-/// must follow up with [`prune_checkpoints_with_refs`] passing
-/// `collect_replay_references(log)` from `bevy_agent_replay`, so a snapshot
-/// referenced by a log or branch is never evicted by a later creation.
+/// Retention note: creation never prunes. The owner must index the returned
+/// snapshot (replay log / timeline topology) and then call
+/// [`enforce_retention`] (or [`prune_checkpoints_with_refs`] directly) with
+/// the live reference set (`collect_replay_references(log)` from
+/// `bevy_agent_replay`). [`prune_checkpoints_with_refs`] is the single
+/// retention enforcement point.
 pub fn create_snapshot_with_role(
     world: &mut World,
     label: Option<String>,
@@ -630,7 +633,6 @@ pub fn create_snapshot_with_role(
         checksum: snapshot.checksum.clone(),
     };
 
-    let keep = world.resource::<SnapshotPolicy>().keep_last_n_checkpoints;
     {
         let mut store = world.resource_mut::<SnapshotStore>();
         let is_first = store.checkpoints.is_empty() && store.snapshots.is_empty();
@@ -643,9 +645,6 @@ pub fn create_snapshot_with_role(
             store.pinned.insert(result.snapshot_id);
         }
     }
-    // Pin-then-enforce: the new id was just pinned when applicable, and
-    // enforcement below never evicts the newly created id itself.
-    prune_checkpoints(world, keep);
 
     if let Some(mut control) = world.get_resource_mut::<AgentControlState>() {
         control.last_snapshot_created = Some(result.snapshot_id);
@@ -1309,25 +1308,35 @@ pub fn clear_snapshot_entities(world: &mut World) {
     }
 }
 
-pub fn maybe_take_snapshot(world: &mut World) {
-    let Some(policy) = world.get_resource::<SnapshotPolicy>().cloned() else {
-        return;
-    };
+/// Periodic auto-checkpoint.
+///
+/// Creates a [`SnapshotRole::Periodic`] snapshot when `tick != 0` and
+/// `tick % checkpoint_every_ticks == 0`. Never enforces retention: on
+/// success returns the new snapshot id so the owner can index it (replay
+/// log / timeline topology) and then call [`enforce_retention`] with the
+/// live reference set. Retention lives entirely in
+/// [`prune_checkpoints_with_refs`]; creation paths must not prune.
+pub fn maybe_take_snapshot(world: &mut World) -> Option<SnapshotId> {
+    let policy = world.get_resource::<SnapshotPolicy>().cloned()?;
     if policy.checkpoint_every_ticks == 0 {
-        return;
+        return None;
     }
 
     let tick = world.resource::<SimClock>().tick;
     if tick == 0 || !tick.is_multiple_of(policy.checkpoint_every_ticks) {
-        return;
+        return None;
     }
 
-    if let Err(error) = create_snapshot_with_role(
+    match create_snapshot_with_role(
         world,
         Some(format!("checkpoint-{tick}")),
         SnapshotRole::Periodic,
     ) {
-        bevy::log::warn!("periodic checkpoint failed: {error:?}");
+        Ok(result) => Some(result.snapshot_id),
+        Err(error) => {
+            bevy::log::warn!("periodic checkpoint failed: {error:?}");
+            None
+        }
     }
 }
 
@@ -1379,12 +1388,11 @@ pub fn delete_snapshot_checked(
 
 /// Legacy retention entry point (no replay references).
 ///
-/// Prefer [`prune_checkpoints_with_refs`], the canonical enforcement used
-/// with `collect_replay_references(log)` from `bevy_agent_replay`. This
-/// wrapper passes an empty reference set and is kept so existing creation
-/// paths (which cannot depend on the replay crate) keep compiling; replay
-/// owners must follow up with the `_with_refs` variant after recording
-/// changes. See [`create_snapshot_with_role`] retention notes.
+/// Prefer [`prune_checkpoints_with_refs`] or [`enforce_retention`], the
+/// canonical enforcement used with `collect_replay_references(log)` from
+/// `bevy_agent_replay`. This wrapper passes an empty reference set and is
+/// kept for explicit owner-driven enforcement without a replay log; no
+/// creation path calls it.
 pub fn prune_checkpoints(world: &mut World, keep_last_n: usize) {
     prune_checkpoints_with_refs(world, keep_last_n, &BTreeSet::new());
 }
@@ -1444,6 +1452,24 @@ pub fn prune_checkpoints_with_refs(
         store.snapshots.remove(&victim);
         store.labels.retain(|_, snapshot_id| *snapshot_id != victim);
     }
+}
+
+/// Explicit retention enforcement (owner-called).
+///
+/// Reads `SnapshotPolicy::keep_last_n_checkpoints` and enforces it via
+/// [`prune_checkpoints_with_refs`] with the caller-provided `referenced`
+/// set. Owners must call this after indexing a newly created snapshot
+/// (replay log / timeline topology) so referenced snapshots are never
+/// evicted by an empty-refs prune. Creation functions
+/// ([`create_snapshot`], [`create_snapshot_with_role`],
+/// [`maybe_take_snapshot`]) never prune; this function plus
+/// [`prune_checkpoints_with_refs`] are the only enforcement points.
+pub fn enforce_retention(world: &mut World, referenced: &BTreeSet<SnapshotId>) {
+    let keep = world
+        .get_resource::<SnapshotPolicy>()
+        .map(|policy| policy.keep_last_n_checkpoints)
+        .unwrap_or(usize::MAX);
+    prune_checkpoints_with_refs(world, keep, referenced);
 }
 
 #[cfg(test)]
@@ -1625,6 +1651,8 @@ mod tests {
         unpin_snapshot(app.world_mut(), old.snapshot_id);
         app.world_mut().resource_mut::<SimClock>().tick = 1;
         let new = create_snapshot(app.world_mut(), Some("new".to_string())).unwrap();
+        // Creation never prunes; the owner enforces retention after indexing.
+        enforce_retention(app.world_mut(), &BTreeSet::new());
 
         let store = app.world().resource::<SnapshotStore>();
         assert!(!store.snapshots.contains_key(&old.snapshot_id));
@@ -1693,6 +1721,8 @@ mod tests {
         // Newly created id always survives: evict oldest evictable OTHER
         // than the new id.
         let second_manual = create_snapshot(app.world_mut(), Some("m2".to_string())).unwrap();
+        // Creation never prunes; the owner enforces retention after indexing.
+        enforce_retention(app.world_mut(), &BTreeSet::new());
 
         let store = app.world().resource::<SnapshotStore>();
         assert!(store.snapshots.contains_key(&initial.snapshot_id));
@@ -1733,16 +1763,11 @@ mod tests {
         unpin_snapshot(app.world_mut(), first.snapshot_id);
         let mut referenced = BTreeSet::new();
         referenced.insert(first.snapshot_id);
-        // Enforce with the replay-reference set: referenced snapshot stays
-        // even though the evictable limit is exceeded by the next creation.
-        // Bump the policy limit so `create_snapshot`'s internal prune (which
-        // uses an empty ref set) does not evict `first` before the
-        // coordinated prune below.
-        app.world_mut()
-            .resource_mut::<SnapshotPolicy>()
-            .keep_last_n_checkpoints = 100;
+        // Creation never prunes, so no policy bump is needed: `first`
+        // survives creation even though it is referenced. The owner enforces
+        // retention after indexing via `enforce_retention`.
         let second = create_snapshot(app.world_mut(), Some("m2".to_string())).unwrap();
-        prune_checkpoints_with_refs(app.world_mut(), 0, &referenced);
+        enforce_retention(app.world_mut(), &referenced);
 
         let store = app.world().resource::<SnapshotStore>();
         assert!(!can_evict(store, first.snapshot_id, &referenced));

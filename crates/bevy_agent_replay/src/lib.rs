@@ -38,6 +38,12 @@ pub fn branch_checksum_key(branch: BranchId) -> String {
     branch.0.to_string()
 }
 
+/// Maximum ancestors walked when validating timeline lineage.
+///
+/// Traversal helpers loop over parent links; bounded validation rejects true
+/// cycles on import so a corrupt bundle can never hang lineage traversal.
+pub const MAX_LINEAGE_DEPTH: usize = 1024;
+
 /// Every snapshot referenced by a replay log.
 ///
 /// Collects `initial_snapshot`, all legacy `checkpoints` values, all
@@ -64,6 +70,17 @@ pub fn collect_replay_references(log: &ReplayLog) -> BTreeSet<SnapshotId> {
             .filter_map(|branch| branch.fork_snapshot),
     );
     referenced
+}
+
+/// Payload set for a portable replay bundle.
+///
+/// Covers the same set as [`collect_replay_references`]: `initial_snapshot`,
+/// legacy `checkpoints`, branch-tagged `branch_checkpoints`, and topology
+/// `fork_snapshot`s. Bundle export/import must thread this set through so
+/// every referenced snapshot is present in the payload.
+#[must_use]
+pub fn bundle_snapshot_ids(log: &ReplayLog) -> BTreeSet<SnapshotId> {
+    collect_replay_references(log)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,9 +152,10 @@ pub struct ReplayLog {
     /// Kept for serde back-compat: old bundles only populate this map.
     /// New code must write via [`ReplayLog::insert_branch_checksum`] (which
     /// keeps this map consistent) and read via
-    /// [`ReplayLog::expected_checksum`] (branch map first, legacy fallback).
-    /// On load, legacy entries are visible to every branch through the
-    /// fallback until migrated.
+    /// [`ReplayLog::expected_checksum`] (branch map only for modern
+    /// histories, legacy fallback for legacy histories). On load, call
+    /// [`ReplayLog::migrate_legacy_checksums`] to copy legacy entries into
+    /// the root branch explicitly.
     #[serde(default, alias = "checksums")]
     pub snapshot_checksums: BTreeMap<u64, SnapshotChecksum>,
     /// Branch-aware expected checksums, keyed by `BranchId` string
@@ -146,7 +164,8 @@ pub struct ReplayLog {
     /// The legacy [`ReplayLog::snapshot_checksums`] map cannot hold two
     /// checksums at the same tick on different branches; this map preserves
     /// per-branch isolation. Use [`ReplayLog::expected_checksum`] for reads
-    /// and [`ReplayLog::insert_branch_checksum`] for writes.
+    /// (no legacy fallback when [`ReplayLog::is_modern`] is true) and
+    /// [`ReplayLog::insert_branch_checksum`] for writes.
     #[serde(default)]
     pub branch_checksums: BTreeMap<String, BTreeMap<u64, SnapshotChecksum>>,
     /// Branch-tagged checkpoints. Allows the same tick to hold distinct
@@ -190,6 +209,13 @@ impl ReplayLog {
 
     /// End of recorded history: max over records, checkpoints, bounds,
     /// and branch-aware checksums.
+    ///
+    /// Deprecated in favor of [`ReplayLog::branch_end_tick`] for per-branch
+    /// bounds; this returns the global max across all branches. Kept for
+    /// back-compat callers that need a single upper bound.
+    #[deprecated(
+        note = "Prefer `branch_end_tick` / `recorded_range` for per-branch bounds; this returns the global max across branches."
+    )]
     #[must_use]
     pub fn log_end_tick(&self) -> u64 {
         let mut end = self.end_tick.max(self.cursor_tick).max(self.initial_tick);
@@ -213,15 +239,127 @@ impl ReplayLog {
         end
     }
 
-    /// Branch-aware checksum lookup: per-branch map first, legacy per-tick
-    /// map as back-compat fallback (legacy entries predate branch tags and
-    /// are visible to every branch).
+    /// Per-branch end of recorded history using fork-bounded lineage intervals.
+    ///
+    /// Returns the max tick visible on `branch` (own records plus ancestor
+    /// contributions bounded by fork ticks, visible checkpoints/checksums),
+    /// floored at `initial_tick`. Use with [`ReplayLog::recorded_range`].
+    #[must_use]
+    pub fn branch_end_tick(&self, timeline: &Timeline, branch: BranchId) -> u64 {
+        let modern = self.is_modern();
+        let mut end = self.initial_tick;
+        for record in &self.records {
+            if branch_record_visible(timeline, record.branch_id, record.tick, branch, modern) {
+                end = end.max(record.tick);
+            }
+        }
+        for checkpoint in &self.branch_checkpoints {
+            if branch_record_visible(
+                timeline,
+                checkpoint.branch_id,
+                checkpoint.tick,
+                branch,
+                modern,
+            ) {
+                end = end.max(checkpoint.tick);
+            }
+        }
+        // Legacy tick map carries no branch tag. For legacy logs (empty
+        // topology) every entry is visible to any branch; for modern logs the
+        // legacy map is only an old-reader alias and must not inflate
+        // per-branch bounds, so consult it only when no branch-tagged data
+        // exists.
+        if self.branch_checkpoints.is_empty() {
+            for tick in self.checkpoints.keys() {
+                end = end.max(*tick);
+            }
+        }
+        if modern {
+            for (key, per_branch) in &self.branch_checksums {
+                let checksum_branch = key.parse::<Uuid>().map(BranchId).unwrap_or(branch);
+                for tick in per_branch.keys() {
+                    if branch_record_visible(timeline, checksum_branch, *tick, branch, modern) {
+                        end = end.max(*tick);
+                    }
+                }
+            }
+        } else {
+            for per_branch in self.branch_checksums.values() {
+                for tick in per_branch.keys() {
+                    end = end.max(*tick);
+                }
+            }
+            for tick in self.snapshot_checksums.keys() {
+                end = end.max(*tick);
+            }
+        }
+        // Timeline actions mirror recorded frames; include visible ones so a
+        // log with topology-only progress still reports a bound.
+        if let Some(_info) = timeline.branches.get(&branch) {
+            for ancestor in timeline.lineage(branch) {
+                if let Some(info) = timeline.branches.get(&ancestor) {
+                    for record in &info.actions {
+                        if branch_record_visible(
+                            timeline,
+                            record.branch_id,
+                            record.tick,
+                            branch,
+                            modern,
+                        ) {
+                            end = end.max(record.tick);
+                        }
+                    }
+                }
+            }
+        }
+        end
+    }
+
+    /// Per-branch recorded range `(initial_tick, branch_end)`.
+    ///
+    /// Lower bound is the global recording baseline; upper bound is
+    /// [`ReplayLog::branch_end_tick`] (fork-bounded visibility).
+    #[must_use]
+    pub fn recorded_range(&self, timeline: &Timeline, branch: BranchId) -> (u64, u64) {
+        (self.initial_tick, self.branch_end_tick(timeline, branch))
+    }
+
+    /// Branch-aware checksum lookup.
+    ///
+    /// Modern histories (`timeline_topology` non-empty, see
+    /// [`ReplayLog::is_modern`]) return the per-branch entry only — the
+    /// legacy per-tick map is an old-reader alias and must not leak across
+    /// branches (same-tick parent/child isolation). Legacy histories (empty
+    /// topology) fall back to the per-tick map, which predates branch tags
+    /// and is visible to every branch.
     #[must_use]
     pub fn expected_checksum(&self, branch: BranchId, tick: u64) -> Option<&SnapshotChecksum> {
+        if self.is_modern() {
+            return self
+                .branch_checksums
+                .get(&branch_checksum_key(branch))
+                .and_then(|per_branch| per_branch.get(&tick));
+        }
         self.branch_checksums
             .get(&branch_checksum_key(branch))
             .and_then(|per_branch| per_branch.get(&tick))
             .or_else(|| self.snapshot_checksums.get(&tick))
+    }
+
+    /// Explicit legacy checksum migration run on bundle load.
+    ///
+    /// Copies every legacy `snapshot_checksums` entry into
+    /// `branch_checksums[root_branch]` where that tick has no branch entry
+    /// yet. Modern bundles already carry per-branch data and are untouched
+    /// beyond filling gaps; legacy bundles gain a branch-tagged view under
+    /// the single root without mutating the legacy map (old readers still
+    /// see it).
+    pub fn migrate_legacy_checksums(&mut self, root_branch: BranchId) {
+        let key = branch_checksum_key(root_branch);
+        let per_branch = self.branch_checksums.entry(key).or_default();
+        for (tick, checksum) in &self.snapshot_checksums {
+            per_branch.entry(*tick).or_insert_with(|| checksum.clone());
+        }
     }
 
     /// Branch-aware checksum insert. Writes the per-branch map and keeps the
@@ -381,11 +519,13 @@ impl ReplayLog {
     /// replayed or confused with the diverged history. Records on other
     /// branches are preserved.
     ///
-    /// Checksum pruning mirrors checkpoint pruning: the diverged branch's
-    /// `branch_checksums` entries beyond `tick` are removed (dropping the
-    /// branch key when empty). Legacy `snapshot_checksums` entries beyond
-    /// `tick` are removed only when no branch checkpoint remains at that
-    /// tick, so a same-tick checkpoint on another branch keeps its alias.
+    /// Prunes records, branch-tagged checkpoints, this branch's
+    /// `branch_checksums` entries beyond `tick` (dropping the branch key when
+    /// empty), and legacy `checkpoints` / `snapshot_checksums` entries beyond
+    /// `tick` that have no remaining branch checkpoint at that tick (so a
+    /// same-tick checkpoint on another branch keeps its alias). Cursor and
+    /// `end_tick` bounds are clamped down to `tick` when they point beyond
+    /// the new end.
     pub fn truncate_future(&mut self, branch: BranchId, tick: u64) {
         self.records
             .retain(|record| !(record.branch_id == branch && record.tick > tick));
@@ -403,23 +543,32 @@ impl ReplayLog {
         {
             self.branch_checksums.remove(&key);
         }
-        // Legacy map: legacy-only logs truncate unconditionally; logs with
-        // branch-tagged data keep a legacy entry while any branch checkpoint
-        // remains at that tick (same-tick isolation across branches).
-        if self.branch_checkpoints.is_empty() {
-            self.checkpoints
-                .retain(|checkpoint_tick, _| *checkpoint_tick <= tick);
-            self.snapshot_checksums
-                .retain(|checksum_tick, _| *checksum_tick <= tick);
-        } else {
-            self.snapshot_checksums.retain(|checksum_tick, _| {
-                if *checksum_tick <= tick {
-                    return true;
-                }
-                self.branch_checkpoints
-                    .iter()
-                    .any(|checkpoint| checkpoint.tick == *checksum_tick)
-            });
+        // Legacy maps: always drop entries beyond `tick` that have no
+        // remaining branch checkpoint at that tick (same-tick isolation
+        // across branches). No empty-vector special case: legacy-only logs
+        // (no branch checkpoints) truncate unconditionally, matching the
+        // rule because no checkpoint remains at any future tick.
+        self.checkpoints.retain(|checkpoint_tick, _| {
+            if *checkpoint_tick <= tick {
+                return true;
+            }
+            self.branch_checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.tick == *checkpoint_tick)
+        });
+        self.snapshot_checksums.retain(|checksum_tick, _| {
+            if *checksum_tick <= tick {
+                return true;
+            }
+            self.branch_checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.tick == *checksum_tick)
+        });
+        if self.cursor_tick > tick {
+            self.cursor_tick = tick;
+        }
+        if self.end_tick > tick {
+            self.end_tick = tick;
         }
     }
 
@@ -461,14 +610,15 @@ impl ReplayLog {
     /// Validates that every snapshot referenced by the log is present in
     /// `provided`. Used by bundle export/import to guarantee retention
     /// integrity after `prune_checkpoints` runs in the snapshot crate.
-    /// Covers [`collect_replay_references`]: initial, legacy + branch-tagged
-    /// checkpoints, and topology `fork_snapshot`s.
+    /// Covers [`bundle_snapshot_ids`] / [`collect_replay_references`]:
+    /// initial, legacy + branch-tagged checkpoints, and topology
+    /// `fork_snapshot`s.
     #[must_use]
     pub fn missing_snapshot_reference(
         &self,
         provided: &std::collections::BTreeSet<SnapshotId>,
     ) -> Option<SnapshotId> {
-        let referenced = collect_replay_references(self);
+        let referenced = bundle_snapshot_ids(self);
         referenced.difference(provided).next().copied()
     }
 }
@@ -568,6 +718,16 @@ impl Timeline {
         chain
     }
 
+    /// Bounded ancestry chain from `branch` up to the root.
+    ///
+    /// Walks at most [`MAX_LINEAGE_DEPTH`] (1024) parent links and rejects
+    /// cycles (repeated ids) and over-deep chains with an `Err`, so corrupt
+    /// topologies can never hang traversal. Returns the chain branch-first,
+    /// root-last on success.
+    pub fn ancestors_bounded(&self, branch: BranchId) -> Result<Vec<BranchId>, String> {
+        ancestors_bounded(self, branch)
+    }
+
     /// Truncates future actions on `branch` beyond `tick` (post-restore
     /// diverge policy, timeline side; see `ReplayLog::truncate_future`).
     pub fn truncate_future(&mut self, branch: BranchId, tick: u64) {
@@ -575,6 +735,38 @@ impl Timeline {
             branch_state.actions.retain(|record| record.tick <= tick);
         }
     }
+}
+
+/// Bounded ancestry chain from `branch` up to the root (branch first,
+/// root last).
+///
+/// Walks at most [`MAX_LINEAGE_DEPTH`] (1024) parent links; returns `Err` on
+/// a cycle (repeated id, including self-parents) or when the chain exceeds
+/// the depth bound (corrupt topology). Unknown ids terminate the walk with
+/// the chain collected so far.
+pub fn ancestors_bounded(timeline: &Timeline, branch: BranchId) -> Result<Vec<BranchId>, String> {
+    use std::collections::HashSet;
+    let mut chain = Vec::new();
+    let mut visited = HashSet::new();
+    let mut current = Some(branch);
+    for _ in 0..MAX_LINEAGE_DEPTH {
+        let Some(id) = current else {
+            return Ok(chain);
+        };
+        if !visited.insert(id) {
+            return Err(format!(
+                "timeline lineage for {branch:?} is cyclic at {id:?}"
+            ));
+        }
+        chain.push(id);
+        match timeline.branches.get(&id) {
+            None => return Ok(chain),
+            Some(info) => current = info.parent_branch,
+        }
+    }
+    Err(format!(
+        "timeline lineage for {branch:?} exceeds maximum depth {MAX_LINEAGE_DEPTH}"
+    ))
 }
 
 /// Returns true when `ancestor` equals `descendant` or appears in the

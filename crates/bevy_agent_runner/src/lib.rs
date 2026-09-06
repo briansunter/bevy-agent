@@ -18,7 +18,8 @@ use bevy_agent_core::{AgentPostTick, AgentPreTick};
 use bevy_agent_replay::{
     ActionRecord, AgentReplayPlugin, ExecutionContext as ReplayExecutionContext,
     MAX_RECONSTRUCTION_TICKS, ReplayLog, ReplayRecorder, Timeline, TimelineBranch,
-    branch_fork_from_ancestor, is_legacy_branch, legacy_root_id, lineage_contains, start_recording,
+    branch_fork_from_ancestor, collect_replay_references, is_legacy_branch, legacy_root_id,
+    lineage_contains, start_recording,
 };
 use bevy_agent_snapshot::{
     AgentSnapshotPlugin, FaultState, Snapshot, SnapshotCreateResult, SnapshotPolicy, SnapshotRole,
@@ -130,32 +131,20 @@ pub const MAX_LINEAGE_DEPTH: usize = 1024;
 /// set; always derive live refs from the current log.
 #[must_use]
 pub fn live_snapshot_refs(log: &ReplayLog) -> BTreeSet<SnapshotId> {
-    let mut refs = BTreeSet::new();
-    if let Some(initial) = log.initial_snapshot {
-        refs.insert(initial);
-    }
-    refs.extend(log.checkpoints.values().copied());
-    refs.extend(
-        log.branch_checkpoints
-            .iter()
-            .map(|checkpoint| checkpoint.snapshot_id),
-    );
-    refs
+    collect_replay_references(log)
 }
 
-/// Branch-aware expected checksum with legacy fallback.
-///
-/// No per-branch checksum map exists yet (back-compat: `snapshot_checksums`
-/// is keyed by tick), so every branch shares the tick-keyed entry. When a
-/// branch-aware map lands, prefer it here; until then the legacy tick map is
-/// the authoritative accessor for all branches.
+/// Branch-aware expected checksum: per-branch map only, no cross-branch
+/// fallback. Legacy tick-map entries are visible through
+/// `log.expected_checksum` only when they predate branch tags (back-compat);
+/// a checksum recorded on another branch must never satisfy this branch.
 #[must_use]
 pub fn expected_checksum_for_tick(
     log: &ReplayLog,
-    _branch: BranchId,
+    branch: BranchId,
     tick: u64,
 ) -> Option<SnapshotChecksum> {
-    log.snapshot_checksums.get(&tick).cloned()
+    log.expected_checksum(branch, tick).cloned()
 }
 
 /// Computes a snapshot checksum that excludes the pending action queue.
@@ -244,11 +233,101 @@ fn validate_import_topology_acyclic(topology: &[TimelineBranch]) -> Result<()> {
     Ok(())
 }
 
+/// Global end of recorded history (max over bounds, records, checkpoints,
+/// and checksums) computed directly from [`ReplayLog`] fields. Used for
+/// legacy / validation fallbacks where no per-branch bound applies.
+fn global_end_tick(log: &ReplayLog) -> u64 {
+    let mut end = log.end_tick.max(log.cursor_tick).max(log.initial_tick);
+    for record in &log.records {
+        end = end.max(record.tick);
+    }
+    for tick in log.checkpoints.keys() {
+        end = end.max(*tick);
+    }
+    for checkpoint in &log.branch_checkpoints {
+        end = end.max(checkpoint.tick);
+    }
+    for tick in log.snapshot_checksums.keys() {
+        end = end.max(*tick);
+    }
+    for per_branch in log.branch_checksums.values() {
+        for tick in per_branch.keys() {
+            end = end.max(*tick);
+        }
+    }
+    end
+}
+
+/// Per-branch recorded range `(start, end)` inclusive.
+///
+/// `start` is `log.initial_tick` (ancestors are visible from the baseline).
+/// `end` is the maximum tick visible on `branch` via fork-bounded intervals:
+/// visible records, visible branch checkpoints, and this branch's own
+/// `branch_checksums` entries. Legacy tick maps (`checkpoints` /
+/// `snapshot_checksums`) extend the range only for legacy logs without
+/// branch-tagged data; otherwise stale legacy ticks from other branches must
+/// not extend this branch's range.
+fn recorded_range(log: &ReplayLog, timeline: &Timeline, branch: BranchId) -> (u64, u64) {
+    use bevy_agent_replay::branch_record_visible;
+    let start = log.initial_tick;
+    // Legacy logs (no topology, no branch-tagged data): global end.
+    if !log.is_modern() && log.branch_checkpoints.is_empty() && log.branch_checksums.is_empty() {
+        return (start, global_end_tick(log));
+    }
+    let modern = log.is_modern();
+    let mut end = start;
+    for record in &log.records {
+        if record.tick <= end {
+            continue;
+        }
+        if branch_record_visible(timeline, record.branch_id, record.tick, branch, modern) {
+            end = end.max(record.tick);
+        }
+    }
+    for checkpoint in &log.branch_checkpoints {
+        if checkpoint.tick <= end {
+            continue;
+        }
+        if branch_record_visible(
+            timeline,
+            checkpoint.branch_id,
+            checkpoint.tick,
+            branch,
+            modern,
+        ) {
+            end = end.max(checkpoint.tick);
+        }
+    }
+    // Own branch checksums only; never other branches' entries.
+    if let Some(per_branch) = log
+        .branch_checksums
+        .get(&bevy_agent_replay::branch_checksum_key(branch))
+    {
+        for tick in per_branch.keys() {
+            end = end.max(*tick);
+        }
+    }
+    // Legacy maps count only when no branch-tagged data exists at all
+    // (pure legacy log); otherwise they are stale aliases from other branches.
+    if log.branch_checkpoints.is_empty() && log.branch_checksums.is_empty() {
+        for tick in log.checkpoints.keys().chain(log.snapshot_checksums.keys()) {
+            end = end.max(*tick);
+        }
+    }
+    // Initial snapshot covers the baseline even with no other data.
+    if log.initial_snapshot.is_some() {
+        end = end.max(start);
+    }
+    (start, end)
+}
+
 /// Bounds + lineage visibility check for history navigation targets.
 ///
-/// Rejects `tick < log.initial_tick` (lower bound), `tick > log_end_tick`
-/// (upper bound), unknown branches, and over-deep/cyclic lineages — all
-/// BEFORE any world mutation so failed navigation leaves state untouched.
+/// Rejects `tick < start` (lower bound), `tick > end` (per-branch upper
+/// bound from [`recorded_range`]), unknown branches, and over-deep/cyclic
+/// lineages — all BEFORE any world mutation so failed navigation leaves
+/// state untouched. Stale legacy ticks beyond this branch's recorded range
+/// are rejected even when the global log extends further on other branches.
 fn validate_history_target(
     log: &ReplayLog,
     timeline: &Timeline,
@@ -261,13 +340,12 @@ fn validate_history_target(
             "history target {tick} references unknown branch {branch:?}"
         ));
     }
-    if tick < log.initial_tick {
+    let (start, end) = recorded_range(log, timeline, branch);
+    if tick < start {
         return Err(anyhow!(
-            "history target {tick} precedes recording baseline {}",
-            log.initial_tick
+            "history target {tick} precedes recording baseline {start}"
         ));
     }
-    let end = log.log_end_tick();
     if tick > end {
         return Err(anyhow!(
             "restore target {tick} is beyond recorded end {end}"
@@ -857,27 +935,18 @@ impl AgentApp {
             .get_resource::<SnapshotStore>()
             .ok_or_else(|| anyhow!("AgentSnapshotPlugin is not installed"))?;
 
-        // Retention integrity: every snapshot referenced by the log (initial,
-        // legacy checkpoints, and branch-tagged checkpoints) must be present.
-        // `prune_checkpoints` in the snapshot crate can evict store entries, so
-        // validate up front with a precise error instead of exporting a bundle
-        // that fails to import.
+        // Retention integrity: every snapshot referenced by the log
+        // (initial, legacy + branch-tagged checkpoints, and topology fork
+        // snapshots) must be present. Built from `collect_replay_references`
+        // so fork snapshots are included.
         let provided = store.snapshots.keys().copied().collect::<BTreeSet<_>>();
         if let Some(missing) = log.missing_snapshot_reference(&provided) {
             return Err(anyhow!("replay references missing snapshot {missing:?}"));
         }
 
-        let mut ids = log.checkpoints.values().copied().collect::<Vec<_>>();
-        ids.extend(
-            log.branch_checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.snapshot_id),
-        );
-        if let Some(initial) = log.initial_snapshot {
-            ids.push(initial);
-        }
-        ids.sort();
-        ids.dedup();
+        let ids = collect_replay_references(&log)
+            .into_iter()
+            .collect::<Vec<_>>();
 
         let snapshots = ids
             .into_iter()
@@ -889,6 +958,18 @@ impl AgentApp {
                     .ok_or_else(|| anyhow!("replay references missing snapshot {id:?}"))
             })
             .collect::<Result<Vec<_>>>()?;
+
+        // Bundle self-containment: every referenced id must be in the payload.
+        let payload = snapshots
+            .iter()
+            .map(|snapshot| snapshot.manifest.snapshot_id)
+            .collect::<BTreeSet<_>>();
+        let referenced = collect_replay_references(&log);
+        if let Some(missing) = referenced.difference(&payload).next() {
+            return Err(anyhow!(
+                "replay bundle is missing referenced snapshot {missing:?}"
+            ));
+        }
 
         Ok(ReplayBundle {
             format_version: ReplayBundle::FORMAT_VERSION,
@@ -1003,19 +1084,7 @@ impl AgentApp {
             }
         }
 
-        let referenced = bundle
-            .log
-            .initial_snapshot
-            .into_iter()
-            .chain(bundle.log.checkpoints.values().copied())
-            .chain(
-                bundle
-                    .log
-                    .branch_checkpoints
-                    .iter()
-                    .map(|checkpoint| checkpoint.snapshot_id),
-            )
-            .collect::<BTreeSet<_>>();
+        let referenced = collect_replay_references(&bundle.log);
         let provided = bundle
             .snapshots
             .iter()
@@ -1027,6 +1096,153 @@ impl AgentApp {
             ));
         }
 
+        // Decode check BEFORE installing: every referenced snapshot payload
+        // must recompute its checksum, carry a valid clock, and reference
+        // only registered resource/component types. Failures return Err
+        // without touching world state (transactional import).
+        for snapshot in &bundle.snapshots {
+            if !referenced.contains(&snapshot.manifest.snapshot_id) {
+                continue;
+            }
+            snapshot.clock.validate().map_err(|error| {
+                anyhow!(
+                    "replay bundle snapshot {:?} has invalid clock: {error}",
+                    snapshot.manifest.snapshot_id
+                )
+            })?;
+            let recomputed = checksum_snapshot(snapshot).map_err(|error| {
+                anyhow!(
+                    "replay bundle snapshot {:?} failed decode check: {error:?}",
+                    snapshot.manifest.snapshot_id
+                )
+            })?;
+            if recomputed.hash != snapshot.checksum.hash
+                || recomputed.tick != snapshot.checksum.tick
+            {
+                return Err(anyhow!(
+                    "replay bundle snapshot {:?} checksum precondition failed: stored {:?}, recomputed {:?}",
+                    snapshot.manifest.snapshot_id,
+                    snapshot.checksum,
+                    recomputed
+                ));
+            }
+        }
+        // Registry decode check (no mutation): referenced payloads must only
+        // name registered resources/components.
+        if let Some(registry) = self
+            .app
+            .world()
+            .get_resource::<bevy_agent_snapshot::SnapshotRegistry>()
+        {
+            for snapshot in &bundle.snapshots {
+                if !referenced.contains(&snapshot.manifest.snapshot_id) {
+                    continue;
+                }
+                for resource in &snapshot.resources {
+                    if !registry
+                        .resource_serializers
+                        .contains_key(resource.type_name.as_str())
+                    {
+                        return Err(anyhow!(
+                            "replay bundle snapshot {:?} references unregistered resource {}",
+                            snapshot.manifest.snapshot_id,
+                            resource.type_name
+                        ));
+                    }
+                }
+                for absent in &snapshot.absent_resources {
+                    if !registry.resource_serializers.contains_key(absent.as_str()) {
+                        return Err(anyhow!(
+                            "replay bundle snapshot {:?} references unregistered absent resource {absent}",
+                            snapshot.manifest.snapshot_id,
+                        ));
+                    }
+                }
+                for entity in &snapshot.entities {
+                    for component in &entity.components {
+                        if !registry
+                            .component_serializers
+                            .contains_key(component.type_name.as_str())
+                        {
+                            return Err(anyhow!(
+                                "replay bundle snapshot {:?} references unregistered component {}",
+                                snapshot.manifest.snapshot_id,
+                                component.type_name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Preconditions requiring plugins: checked BEFORE any mutation so a
+        // missing plugin returns Err without touching fault/reset state.
+        if !self.app.world().contains_resource::<SnapshotStore>() {
+            return Err(anyhow!("AgentSnapshotPlugin is not installed"));
+        }
+        if !self.app.world().contains_resource::<ReplayRecorder>() {
+            return Err(anyhow!("AgentReplayPlugin is not installed"));
+        }
+        // World backup for transactional rollback (entities/resources/clock).
+        // Captured before mutation; a capture failure aborts without install.
+        let world_backup = if self.has_snapshot_support() {
+            match capture_snapshot(self.app.world_mut(), None) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    return Err(anyhow!("replay import backup failed: {error:?}"));
+                }
+            }
+        } else {
+            None
+        };
+        let store_backup = self.app.world().get_resource::<SnapshotStore>().cloned();
+        let recorder_backup = self.app.world().get_resource::<ReplayRecorder>().cloned();
+        let timeline_backup = self.app.world().get_resource::<Timeline>().cloned();
+        let control_backup = self
+            .app
+            .world()
+            .get_resource::<AgentControlState>()
+            .cloned();
+        let last_backup = self.app.world().get_resource::<LastStepResponse>().cloned();
+        let reset_once_backup = self.reset_once;
+
+        // Install helper with rollback on activation failure.
+        let rollback = |agent: &mut AgentApp| {
+            if let Some(store) = store_backup.clone()
+                && let Some(mut live) = agent.app.world_mut().get_resource_mut::<SnapshotStore>()
+            {
+                *live = store;
+            }
+            if let Some(recorder) = recorder_backup.clone()
+                && let Some(mut live) = agent.app.world_mut().get_resource_mut::<ReplayRecorder>()
+            {
+                *live = recorder;
+            }
+            if let Some(timeline) = timeline_backup.clone()
+                && let Some(mut live) = agent.app.world_mut().get_resource_mut::<Timeline>()
+            {
+                *live = timeline;
+            }
+            if let Some(control) = control_backup.clone()
+                && let Some(mut live) = agent
+                    .app
+                    .world_mut()
+                    .get_resource_mut::<AgentControlState>()
+            {
+                *live = control;
+            }
+            if let Some(last) = last_backup.clone()
+                && let Some(mut live) = agent.app.world_mut().get_resource_mut::<LastStepResponse>()
+            {
+                *live = last;
+            }
+            agent.reset_once = reset_once_backup;
+            if let Some(backup) = world_backup.clone() {
+                let _ = restore_snapshot_value(agent.app.world_mut(), &backup);
+            }
+        };
+
+        // ---- Install log + store + timeline ----
         {
             let mut store = self
                 .app
@@ -1041,19 +1257,11 @@ impl AgentApp {
                 store.snapshots.insert(id, snapshot);
             }
             // Install the checkpoint list so retention bookkeeping matches the
-            // imported log (deduplicated, ordered by log tick).
-            let mut checkpoint_ids = bundle
-                .log
-                .checkpoints
-                .values()
-                .copied()
-                .chain(
-                    bundle
-                        .log
-                        .branch_checkpoints
-                        .iter()
-                        .map(|checkpoint| checkpoint.snapshot_id),
-                )
+            // imported log (deduplicated, ordered by log tick). Covers all
+            // referenced ids (initial, checkpoints, branch checkpoints, fork
+            // snapshots) so retention sees the full live set.
+            let mut checkpoint_ids = collect_replay_references(&bundle.log)
+                .into_iter()
                 .collect::<Vec<_>>();
             checkpoint_ids.sort();
             checkpoint_ids.dedup();
@@ -1097,16 +1305,16 @@ impl AgentApp {
         if let Some(mut recorder) = self.app.world_mut().get_resource_mut::<ReplayRecorder>() {
             recorder.recording = recording;
         }
-        // Initialize control/timeline from the imported log and mark the app
-        // initialized so stepping continues history instead of resetting.
-        // A fresh import clears any fault: the store/log were just replaced.
-        self.app.world_mut().remove_resource::<FaultState>();
+        // Initialize control/timeline from the imported log. Do NOT clear
+        // faults and do NOT set `reset_once` yet: both happen only on
+        // successful activation below.
         self.sync_timeline_with_log();
-        self.reset_once = true;
-        // Position on the exported cursor when snapshots are present: the
-        // bundle carries `cursor_tick` + topology, so auto-restore to the
-        // active branch cursor. Failures are non-fatal (explicit positioning
-        // via `restore_tick` remains available before stepping).
+        // Position on the exported cursor when snapshots are present,
+        // INCLUDING cursor-zero (restore the initial snapshot at tick 0).
+        // Any activation failure returns Err WITHOUT clearing FaultState and
+        // WITHOUT setting `reset_once=true`; the install above is rolled
+        // back so stepping cannot proceed on half-activated state (leave
+        // `reset_once=false` when activation is deferred/failed).
         let cursor = self
             .app
             .world()
@@ -1118,14 +1326,25 @@ impl AgentApp {
             .world()
             .get_resource::<SnapshotStore>()
             .is_some_and(|store| !store.snapshots.is_empty());
-        if cursor > 0 && has_snapshots {
-            let _ = self.restore_tick(cursor);
-            // A failed auto-restore must not leave a fault that blocks
-            // explicit positioning; faults only gate until reset, and the
-            // import itself is a valid reset point.
-            self.app.world_mut().remove_resource::<FaultState>();
+        if has_snapshots {
+            // `restore_tick` gates on `reset_once` via `ensure_reset` (which
+            // would wipe the just-installed log). Temporarily mark active so
+            // the restore runs against the imported history; on failure the
+            // backup (usually `false`) is restored, rejecting stepping until
+            // an explicit successful activation.
+            let saved_reset_once = self.reset_once;
             self.reset_once = true;
+            let restore_result = self.restore_tick(cursor);
+            if let Err(error) = restore_result {
+                self.reset_once = saved_reset_once;
+                rollback(self);
+                // Do NOT clear FaultState; do NOT set reset_once=true.
+                return Err(error);
+            }
         }
+        // Success: mark activated and clear any prior fault.
+        self.reset_once = true;
+        self.app.world_mut().remove_resource::<FaultState>();
         Ok(())
     }
 
@@ -1191,7 +1410,9 @@ impl AgentApp {
                 recorder.log.end_tick = recorder.log.end_tick.max(current);
                 if let (Some(branch), Some(checksum)) = (branch, checksum) {
                     recorder.log.push_checkpoint(branch, current, snapshot_id);
-                    recorder.log.snapshot_checksums.insert(current, checksum);
+                    recorder
+                        .log
+                        .insert_branch_checksum(branch, current, checksum);
                 }
             }
             self.sync_auto_checkpoints();
@@ -1375,7 +1596,7 @@ impl AgentApp {
                 checkpoint.branch_id = root;
             }
         }
-        let end = recorder.log.log_end_tick().max(cursor);
+        let end = global_end_tick(&recorder.log).max(cursor);
         recorder.log.timeline_topology = topology;
         let mut min_tick = u64::MAX;
         for record in &recorder.log.records {
@@ -1486,10 +1707,9 @@ impl AgentApp {
 
     /// Truncates recorded future actions/checkpoints/checksums on the current
     /// branch beyond the current tick (explicit diverge after restore).
-    /// Records on other branches are preserved. This is the runner-side
-    /// equivalent of `log.truncate_branch_data`: the legacy
-    /// `truncate_future` leaves `snapshot_checksums` behind, so entries
-    /// beyond the tick are cleared here too.
+    /// Records on other branches are preserved, including their
+    /// branch-aware checksum expectations: only the current branch's future
+    /// beyond `tick` is dropped via `log.truncate_branch_data` semantics.
     fn enforce_diverge_truncation(&mut self) {
         let (branch, tick) = match (
             self.app.world().get_resource::<AgentControlState>(),
@@ -1500,10 +1720,6 @@ impl AgentApp {
         };
         if let Some(mut recorder) = self.app.world_mut().get_resource_mut::<ReplayRecorder>() {
             recorder.log.truncate_future(branch, tick);
-            recorder
-                .log
-                .snapshot_checksums
-                .retain(|tick_key, _| *tick_key <= tick);
         }
         if let Some(mut timeline) = self.app.world_mut().get_resource_mut::<Timeline>() {
             timeline.truncate_future(branch, tick);
@@ -1515,6 +1731,10 @@ impl AgentApp {
     /// set by `create_snapshot` inside `AgentTick`) into the replay log.
     /// No scan-all-store behavior: stale cross-episode checkpoints never
     /// contaminate the fresh log. Tagged with (episode, branch, tick).
+    ///
+    /// Owner-side indexing: after `maybe_take_snapshot` creates an id, it is
+    /// immediately indexed into the log and retention is enforced with live
+    /// refs (the snapshot crate no longer prunes with replay visibility).
     fn sync_auto_checkpoints(&mut self) {
         let (branch, created, episode) = match (
             self.app.world().get_resource::<AgentControlState>(),
@@ -1569,8 +1789,12 @@ impl AgentApp {
             recorder
                 .log
                 .push_checkpoint_with_episode(branch, tick, id, current_episode);
-            recorder.log.snapshot_checksums.insert(tick, checksum);
+            recorder.log.insert_branch_checksum(branch, tick, checksum);
         }
+        // Owner-side retention: the snapshot creation path no longer prunes
+        // with replay visibility, so enforce here with live refs immediately
+        // after indexing.
+        self.prune_with_live_refs();
     }
 
     /// Honors `SnapshotPolicy::checkpoint_on_terminal`: snapshots terminal
@@ -1631,9 +1855,9 @@ impl AgentApp {
                 .push_checkpoint(branch, result.tick, result.snapshot_id);
             recorder
                 .log
-                .snapshot_checksums
-                .insert(result.tick, checksum);
+                .insert_branch_checksum(branch, result.tick, checksum);
         }
+        self.prune_with_live_refs();
         Ok(())
     }
 
@@ -1718,7 +1942,9 @@ impl AgentApp {
                     .push((record.source.clone(), record.action.clone()));
             }
         }
-        // Branch-aware expected checksums (legacy tick-map fallback).
+        // Branch-aware expected checksums via `expected_checksum`: own
+        // branch map first, legacy tick map as back-compat fallback. Never
+        // consult other branches' maps (no cross-branch fallback).
         let checksums = self
             .app
             .world()
@@ -1726,9 +1952,14 @@ impl AgentApp {
             .map(|recorder| recorder.log.clone())
             .map(|log| {
                 let mut map = BTreeMap::new();
-                for tick in log.snapshot_checksums.keys() {
-                    if let Some(expected) = expected_checksum_for_tick(&log, branch, *tick) {
-                        map.insert(*tick, expected);
+                let mut ticks = BTreeSet::new();
+                ticks.extend(log.snapshot_checksums.keys().copied());
+                for per_branch in log.branch_checksums.values() {
+                    ticks.extend(per_branch.keys().copied());
+                }
+                for tick in ticks {
+                    if let Some(expected) = expected_checksum_for_tick(&log, branch, tick) {
+                        map.insert(tick, expected);
                     }
                 }
                 map
@@ -1973,16 +2204,19 @@ impl AgentEnvironment for AgentApp {
                     recorder
                         .log
                         .push_checkpoint(branch, snapshot.tick, snapshot.snapshot_id);
+                    recorder
+                        .log
+                        .insert_branch_checksum(branch, snapshot.tick, checksum);
                 } else {
                     recorder
                         .log
                         .checkpoints
                         .insert(snapshot.tick, snapshot.snapshot_id);
+                    recorder
+                        .log
+                        .snapshot_checksums
+                        .insert(snapshot.tick, checksum);
                 }
-                recorder
-                    .log
-                    .snapshot_checksums
-                    .insert(snapshot.tick, checksum);
             }
             response.info.snapshot_created = Some(snapshot.snapshot_id);
         }
@@ -2057,16 +2291,19 @@ impl AgentEnvironment for AgentApp {
                 recorder
                     .log
                     .push_checkpoint(branch, result.tick, result.snapshot_id);
+                recorder
+                    .log
+                    .insert_branch_checksum(branch, result.tick, checksum);
             } else {
                 recorder
                     .log
                     .checkpoints
                     .insert(result.tick, result.snapshot_id);
+                recorder
+                    .log
+                    .snapshot_checksums
+                    .insert(result.tick, checksum);
             }
-            recorder
-                .log
-                .snapshot_checksums
-                .insert(result.tick, checksum);
         }
         Ok(result)
     }
@@ -2145,10 +2382,18 @@ impl AgentEnvironment for AgentApp {
             ));
         }
 
-        // Failure atomicity: capture a backup before mutating so a checksum
+        // Failure atomicity: capture backups before mutating so a checksum
         // (or any replay) error can roll history navigation back instead of
-        // leaving a half-replayed world.
+        // leaving a half-replayed world. Back up the world snapshot alongside
+        // control state, last response, and the reset flag.
         let backup = capture_snapshot(self.app.world_mut(), None)?;
+        let control_backup = self
+            .app
+            .world()
+            .get_resource::<AgentControlState>()
+            .cloned();
+        let last_backup = self.app.world().get_resource::<LastStepResponse>().cloned();
+        let reset_once_backup = self.reset_once;
 
         // Preserve actions scheduled beyond the restore target BEFORE the
         // checkpoint restore: `restore_snapshot` overwrites the queue with the
@@ -2192,12 +2437,24 @@ impl AgentEnvironment for AgentApp {
         let replay_result = self.replay_tick_interval(branch, &records, checkpoint_tick, tick);
 
         // Re-apply pre-restore futures lost by the checkpoint restore.
+        // Multiset merge (multiplicity-preserving): an identical entry is
+        // skipped only when the live queue already holds that many copies;
+        // otherwise it is appended (duplicates allowed).
         if !pending_future_before.is_empty()
             && let Some(mut queue) = self.app.world_mut().get_resource_mut::<AgentActionQueue>()
         {
-            for scheduled in pending_future_before {
-                if !queue.pending.contains(&scheduled) {
-                    queue.pending.push_back(scheduled);
+            for (index, scheduled) in pending_future_before.iter().enumerate() {
+                let needed = pending_future_before[..=index]
+                    .iter()
+                    .filter(|candidate| *candidate == scheduled)
+                    .count();
+                let present = queue
+                    .pending
+                    .iter()
+                    .filter(|candidate| *candidate == scheduled)
+                    .count();
+                if present < needed {
+                    queue.pending.push_back(scheduled.clone());
                 }
             }
             // Keep tick order stable for future actions.
@@ -2210,14 +2467,29 @@ impl AgentEnvironment for AgentApp {
             recorder.recording = old_recording;
         }
         if let Err(error) = replay_result {
-            // Atomic navigation: roll back to the pre-restore backup.
+            // Atomic navigation: roll back world snapshot plus control
+            // state, last response, and reset flag.
             let original = format!("{error:?}");
-            if let Err(rollback_error) = restore_snapshot_value(self.app.world_mut(), &backup) {
+            let mut rollback_error: Option<String> = None;
+            if let Err(rollback_err) = restore_snapshot_value(self.app.world_mut(), &backup) {
+                rollback_error = Some(format!("{rollback_err:?}"));
+            }
+            if let Some(control) = control_backup.clone()
+                && let Some(mut live) = self.app.world_mut().get_resource_mut::<AgentControlState>()
+            {
+                *live = control;
+            }
+            if let Some(last) = last_backup.clone()
+                && let Some(mut live) = self.app.world_mut().get_resource_mut::<LastStepResponse>()
+            {
+                *live = last;
+            }
+            self.reset_once = reset_once_backup;
+            if let Some(rollback) = rollback_error {
                 return Err(anyhow!(
-                    "restore_tick to {tick} failed ({original}) and rollback failed ({rollback_error:?}); world may be faulted"
+                    "restore_tick to {tick} failed ({original}) and rollback failed ({rollback}); world may be faulted"
                 ));
             }
-            collect_observation(self.app.world_mut());
             return Err(anyhow!(
                 "restore_tick to {tick} failed; rolled back: {original}"
             ));
@@ -2254,7 +2526,7 @@ impl AgentEnvironment for AgentApp {
                 .app
                 .world()
                 .get_resource::<ReplayRecorder>()
-                .map(|recorder| recorder.log.log_end_tick())
+                .map(|recorder| global_end_tick(&recorder.log))
                 && from_tick > end
             {
                 return Err(anyhow!(
@@ -2308,7 +2580,9 @@ impl AgentEnvironment for AgentApp {
                 .unwrap_or_else(|| result.checksum.clone());
             if let Some(mut recorder) = self.app.world_mut().get_resource_mut::<ReplayRecorder>() {
                 recorder.log.push_checkpoint(branch_id, tick, id);
-                recorder.log.snapshot_checksums.insert(tick, checksum);
+                recorder
+                    .log
+                    .insert_branch_checksum(branch_id, tick, checksum);
             }
             self.prune_with_live_refs();
         }
