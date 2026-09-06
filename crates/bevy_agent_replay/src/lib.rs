@@ -10,11 +10,37 @@ use bevy_agent_core::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Maximum ticks allowed in a single reconstruction interval (work-budget).
+pub const MAX_RECONSTRUCTION_TICKS: u64 = 100_000;
+
+/// Legacy branch id for records deserialized without a branch tag.
+/// `Uuid::nil()` is used so legacy detection is stable (unlike
+/// `BranchId::default()` which generates a fresh random id per call).
+#[must_use]
+pub fn legacy_branch_default() -> BranchId {
+    BranchId(Uuid::nil())
+}
+
+/// Single legacy root id that all default/None legacy records migrate to.
+#[must_use]
+pub fn legacy_root_id() -> BranchId {
+    BranchId(Uuid::nil())
+}
+
+#[must_use]
+pub fn is_legacy_branch(branch: BranchId) -> bool {
+    branch.0 == Uuid::nil()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplayManifest {
     pub replay_id: Uuid,
     pub game_id: String,
     pub game_version: String,
+    /// Episode id incremented on every reset. Checkpoints are tagged with the
+    /// episode that created them; sync only installs matching episodes.
+    #[serde(default)]
+    pub episode_id: u64,
 }
 
 impl Default for ReplayManifest {
@@ -23,6 +49,7 @@ impl Default for ReplayManifest {
             replay_id: Uuid::new_v4(),
             game_id: "unknown-game".to_string(),
             game_version: env!("CARGO_PKG_VERSION").to_string(),
+            episode_id: 0,
         }
     }
 }
@@ -30,7 +57,7 @@ impl Default for ReplayManifest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ActionRecord {
     pub tick: u64,
-    #[serde(default)]
+    #[serde(default = "legacy_branch_default")]
     pub branch_id: BranchId,
     pub source: ActionSource,
     pub action: AgentAction,
@@ -43,9 +70,12 @@ pub struct ActionRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BranchCheckpoint {
     pub tick: u64,
-    #[serde(default)]
+    #[serde(default = "legacy_branch_default")]
     pub branch_id: BranchId,
     pub snapshot_id: SnapshotId,
+    /// Episode that created this checkpoint. Legacy entries default to 0.
+    #[serde(default)]
+    pub episode: u64,
 }
 
 /// Execution context for the simulation. `Reconstructing` is installed for the
@@ -72,6 +102,21 @@ pub struct ReplayLog {
     /// checkpoints per branch (parent/child isolation).
     #[serde(default)]
     pub branch_checkpoints: Vec<BranchCheckpoint>,
+    /// Exported timeline topology. Modern bundles populate this verbatim;
+    /// legacy logs leave it empty and fall back to single-root migration.
+    #[serde(default)]
+    pub timeline_topology: Vec<TimelineBranch>,
+    /// Active branch at export time.
+    #[serde(default)]
+    pub active_branch: Option<BranchId>,
+    /// Cursor tick at export time.
+    #[serde(default)]
+    pub cursor_tick: u64,
+    /// Recording bounds.
+    #[serde(default)]
+    pub initial_tick: u64,
+    #[serde(default)]
+    pub end_tick: u64,
 }
 
 impl ReplayLog {
@@ -84,13 +129,64 @@ impl ReplayLog {
             .collect()
     }
 
-    /// Actions visible on `branch`, i.e. records whose `branch_id` is the
-    /// branch itself or one of its ancestors in `timeline`, restricted to
-    /// `(start_exclusive, end_inclusive]`. Records predating a fork stay
-    /// visible on the child; records on unrelated branches do not. Records
-    /// tagged with a branch unknown to `timeline` (e.g. logs recorded before
-    /// branch tagging existed) are treated as universally visible for
-    /// back-compat replay.
+    /// Modern logs carry `timeline_topology`; unknown branch ids are rejected.
+    /// Legacy logs (empty topology) treat unknown ids as universally visible
+    /// for back-compat, with nil (`legacy_root_id`) migrated to a single root.
+    #[must_use]
+    pub fn is_modern(&self) -> bool {
+        !self.timeline_topology.is_empty()
+    }
+
+    /// End of recorded history: max over records, checkpoints, and bounds.
+    #[must_use]
+    pub fn log_end_tick(&self) -> u64 {
+        let mut end = self.end_tick.max(self.cursor_tick).max(self.initial_tick);
+        for record in &self.records {
+            end = end.max(record.tick);
+        }
+        for tick in self.checkpoints.keys() {
+            end = end.max(*tick);
+        }
+        for checkpoint in &self.branch_checkpoints {
+            end = end.max(checkpoint.tick);
+        }
+        end
+    }
+
+    /// Populate topology fields from a live timeline (called on export).
+    pub fn sync_topology(&mut self, timeline: &Timeline, cursor_tick: u64) {
+        self.timeline_topology = timeline.branches.values().cloned().collect();
+        // Deterministic export order.
+        self.timeline_topology
+            .sort_by_key(|branch| (branch.fork_tick, branch.branch_id.0));
+        self.active_branch = Some(timeline.current_branch);
+        self.cursor_tick = cursor_tick;
+        let mut min_tick = u64::MAX;
+        let mut max_tick = 0u64;
+        for record in &self.records {
+            min_tick = min_tick.min(record.tick);
+            max_tick = max_tick.max(record.tick);
+        }
+        for checkpoint in &self.branch_checkpoints {
+            min_tick = min_tick.min(checkpoint.tick);
+            max_tick = max_tick.max(checkpoint.tick);
+        }
+        for tick in self.checkpoints.keys() {
+            min_tick = min_tick.min(*tick);
+            max_tick = max_tick.max(*tick);
+        }
+        if min_tick == u64::MAX {
+            min_tick = cursor_tick;
+        }
+        self.initial_tick = min_tick.min(cursor_tick);
+        self.end_tick = max_tick.max(cursor_tick);
+    }
+
+    /// Actions visible on `branch` using fork-bounded intervals: for lineage
+    /// root->...->target, each ancestor contributes
+    /// `(own_fork, child_fork]` where `child_fork` is the fork tick of the
+    /// child towards the target, and the target contributes all its own
+    /// records. Parent-future records beyond the fork are excluded.
     #[must_use]
     pub fn actions_for_branch(
         &self,
@@ -99,13 +195,19 @@ impl ReplayLog {
         start_exclusive: u64,
         end_inclusive: u64,
     ) -> Vec<ActionRecord> {
+        let modern = self.is_modern();
         self.records
             .iter()
             .filter(|record| {
                 record.tick > start_exclusive
                     && record.tick <= end_inclusive
-                    && (lineage_contains(timeline, record.branch_id, branch)
-                        || !timeline.branches.contains_key(&record.branch_id))
+                    && branch_record_visible(
+                        timeline,
+                        record.branch_id,
+                        record.tick,
+                        branch,
+                        modern,
+                    )
             })
             .cloned()
             .collect()
@@ -119,10 +221,9 @@ impl ReplayLog {
             .map(|(tick, snapshot_id)| (*tick, *snapshot_id))
     }
 
-    /// Branch-aware checkpoint selection: the nearest checkpoint at-or-before
-    /// `tick` whose branch is the requested branch or an ancestor of it. A
-    /// checkpoint recorded on an ancestor *after* the fork point is not
-    /// visible to the child (parent future beyond the fork is excluded).
+    /// Branch-aware checkpoint selection using the SAME fork-bounded
+    /// visibility helper as [`ReplayLog::actions_for_branch`]: the nearest
+    /// checkpoint at-or-before `tick` visible in the branch's intervals.
     /// Falls back to the legacy tick map for logs without branch-tagged data.
     #[must_use]
     pub fn nearest_checkpoint_for_branch(
@@ -131,21 +232,13 @@ impl ReplayLog {
         branch: BranchId,
         tick: u64,
     ) -> Option<(u64, SnapshotId)> {
+        let modern = self.is_modern();
         let mut best: Option<(u64, BranchId, SnapshotId)> = None;
         let mut consider = |candidate_tick: u64, candidate_branch: BranchId, id: SnapshotId| {
             if candidate_tick > tick {
                 return;
             }
-            if !lineage_contains(timeline, candidate_branch, branch) {
-                return;
-            }
-            // Ancestor checkpoints beyond the fork are parent-future state the
-            // child never shared; exclude them.
-            if candidate_branch != branch
-                && let Some(fork_tick) =
-                    branch_fork_from_ancestor(timeline, candidate_branch, branch)
-                && candidate_tick > fork_tick
-            {
+            if !branch_record_visible(timeline, candidate_branch, candidate_tick, branch, modern) {
                 return;
             }
             // Nearest tick wins; ties prefer the deepest branch (self over
@@ -217,6 +310,20 @@ impl ReplayLog {
     /// Records a checkpoint on a branch, keeping both the legacy tick map and
     /// the branch-tagged vector consistent.
     pub fn push_checkpoint(&mut self, branch: BranchId, tick: u64, snapshot_id: SnapshotId) {
+        let episode = self.manifest.episode_id;
+        self.push_checkpoint_with_episode(branch, tick, snapshot_id, episode);
+    }
+
+    /// Episode-tagged checkpoint insert. Only checkpoints matching the current
+    /// episode are synced; `reset` bumps `manifest.episode_id` so stale
+    /// cross-episode checkpoints never contaminate a fresh log.
+    pub fn push_checkpoint_with_episode(
+        &mut self,
+        branch: BranchId,
+        tick: u64,
+        snapshot_id: SnapshotId,
+        episode: u64,
+    ) {
         self.checkpoints.insert(tick, snapshot_id);
         if let Some(existing) = self
             .branch_checkpoints
@@ -224,11 +331,13 @@ impl ReplayLog {
             .find(|checkpoint| checkpoint.tick == tick && checkpoint.branch_id == branch)
         {
             existing.snapshot_id = snapshot_id;
+            existing.episode = episode;
         } else {
             self.branch_checkpoints.push(BranchCheckpoint {
                 tick,
                 branch_id: branch,
                 snapshot_id,
+                episode,
             });
         }
     }
@@ -397,6 +506,53 @@ pub fn branch_fork_from_ancestor(
             None => return None,
         }
     }
+}
+
+/// Fork-bounded visibility shared by [`ReplayLog::actions_for_branch`] and
+/// [`ReplayLog::nearest_checkpoint_for_branch`].
+///
+/// For lineage root->...->target, each ancestor `A` contributes
+/// `(own_fork, child_fork]` where `own_fork` is `A`'s own fork tick and
+/// `child_fork` is the fork tick of the child towards `target`; the target
+/// itself contributes all its own records (including its fork-tick
+/// checkpoint for same-tick isolation). Unknown branch ids are rejected in
+/// modern bundles (`modern == true`, i.e. `timeline_topology` present) and
+/// treated as universally visible only for legacy logs; nil ids migrate to
+/// the single legacy root.
+#[must_use]
+pub fn branch_record_visible(
+    timeline: &Timeline,
+    record_branch: BranchId,
+    record_tick: u64,
+    target: BranchId,
+    modern: bool,
+) -> bool {
+    if record_branch == target {
+        return true;
+    }
+    if lineage_contains(timeline, record_branch, target) {
+        let own_fork = timeline
+            .branches
+            .get(&record_branch)
+            .map(|branch| branch.fork_tick)
+            .unwrap_or(0);
+        if let Some(child_fork) = branch_fork_from_ancestor(timeline, record_branch, target) {
+            return record_tick > own_fork && record_tick <= child_fork;
+        }
+        return false;
+    }
+    // Not an ancestor: sibling/subtree records are invisible.
+    if timeline.branches.contains_key(&record_branch) {
+        return false;
+    }
+    // Unknown branch id.
+    if modern {
+        return false;
+    }
+    // Legacy: nil (missing tag) migrates to single root -> visible; other
+    // unknown ids preserved as universal for back-compat.
+    let _ = is_legacy_branch(record_branch);
+    true
 }
 
 pub struct AgentReplayPlugin;
@@ -662,6 +818,51 @@ mod tests {
             log.nearest_checkpoint_for_branch(&timeline, root, 5),
             Some((5, parent_snap))
         );
+    }
+
+    #[test]
+    fn parent_future_excluded_via_fork_bounded_intervals() {
+        // Parent tick2 MoveRight must not leak into a child forked at tick1.
+        let mut timeline = Timeline::default();
+        let root = timeline.current_branch;
+        let child = timeline.create_branch(1, None, None);
+        let move_right = AgentAction::Move { x: 1.0, y: 0.0 };
+        let log = ReplayLog {
+            records: vec![
+                record_on(root, 1, AgentAction::Noop),
+                record_on(root, 2, move_right.clone()),
+                record_on(child, 2, AgentAction::Noop),
+            ],
+            ..Default::default()
+        };
+        let child_actions = log.actions_for_branch(&timeline, child, 0, 2);
+        // Shared tick1 + child-only tick2; parent tick2 excluded.
+        assert_eq!(child_actions.len(), 2);
+        assert!(child_actions.iter().any(|r| r.tick == 1));
+        let tick2: Vec<_> = child_actions.iter().filter(|r| r.tick == 2).collect();
+        assert_eq!(tick2.len(), 1);
+        assert_eq!(tick2[0].action, AgentAction::Noop);
+        assert_eq!(tick2[0].branch_id, child);
+    }
+
+    #[test]
+    fn modern_unknown_branch_ids_are_rejected() {
+        let mut timeline = Timeline::default();
+        let root = timeline.current_branch;
+        let child = timeline.create_branch(1, None, None);
+        let unknown = BranchId::new();
+        let mut log = ReplayLog {
+            records: vec![
+                record_on(root, 1, AgentAction::Noop),
+                record_on(unknown, 2, AgentAction::Jump),
+            ],
+            ..Default::default()
+        };
+        // Legacy (empty topology): unknown treated universal for back-compat.
+        assert_eq!(log.actions_for_branch(&timeline, child, 0, 2).len(), 2);
+        // Modern (topology present): unknown rejected.
+        log.sync_topology(&timeline, 2);
+        assert_eq!(log.actions_for_branch(&timeline, child, 0, 2).len(), 1);
     }
 
     #[test]

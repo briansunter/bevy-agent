@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import select
 import socket
 import subprocess
 import threading
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypedDict
@@ -16,6 +18,8 @@ from urllib.error import HTTPError, URLError
 
 HTTP_TIMEOUT_SECONDS = 30.0
 STDIO_READ_TIMEOUT_SECONDS = 30.0
+# Upper bound for a single JSON-RPC line on stdio (8 MiB).
+MAX_LINE_BYTES = 8 * 1024 * 1024
 
 
 class AgentError(RuntimeError):
@@ -288,6 +292,7 @@ class StdioAgentClient:
         self._next_id = 1
         self.timeout = timeout
         self._closed = False
+        self._pending = bytearray()
 
     def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
         if self._closed:
@@ -328,30 +333,87 @@ class StdioAgentClient:
     def _readline_with_timeout(self) -> str:
         stdout = self.process.stdout
         assert stdout is not None
-        # Prefer select() on POSIX for a true read timeout; fall back to a
-        # reader thread on platforms without selectable pipes (e.g. Windows).
+        # Prefer select() on POSIX for a true read timeout with an absolute
+        # deadline covering the full line. Reads incrementally (os.read byte
+        # chunks) so a partial single-byte write followed by a hang still
+        # hits the deadline instead of blocking forever in readline().
+        # Falls back to a reader thread on platforms without selectable pipes
+        # (e.g. Windows).
         try:
             fileno = stdout.fileno()
         except Exception:
             fileno = -1
         if fileno >= 0:
             try:
-                ready, _, _ = select.select([fileno], [], [], self.timeout)
-            except (OSError, ValueError):
-                ready = []
+                deadline = time.monotonic() + self.timeout
+                buf = bytearray(getattr(self, "_pending", b""))
+                # Fast path: a previous over-read already buffered a full line.
+                if b"\n" in buf:
+                    newline_idx = buf.index(b"\n") + 1
+                    line_bytes = bytes(buf[:newline_idx])
+                    self._pending = bytearray(buf[newline_idx:])
+                    try:
+                        return line_bytes.decode("utf-8")
+                    except UnicodeDecodeError as error:
+                        raise AgentError(
+                            f"invalid UTF-8 in stdio response: {error}"
+                        ) from error
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._pending = bytearray(buf)
+                        raise AgentError(
+                            f"stdio read timed out after {self.timeout}s waiting for response"
+                        )
+                    try:
+                        ready, _, _ = select.select([fileno], [], [], remaining)
+                    except (OSError, ValueError):
+                        fileno = -1
+                        break
+                    if not ready:
+                        self._pending = bytearray(buf)
+                        raise AgentError(
+                            f"stdio read timed out after {self.timeout}s waiting for response"
+                        )
+                    try:
+                        chunk = os.read(fileno, 4096)
+                    except OSError as error:
+                        raise AgentError(f"stdio read failed: {error}") from error
+                    if not chunk:
+                        if buf:
+                            self._pending = bytearray()
+                            raise AgentError(
+                                "stdio process hit EOF before newline "
+                                f"(returncode {self.process.poll()})"
+                            )
+                        raise AgentError(
+                            "stdio process hit EOF "
+                            f"(returncode {self.process.poll()})"
+                        )
+                    buf.extend(chunk)
+                    if len(buf) > MAX_LINE_BYTES:
+                        self._pending = bytearray()
+                        raise AgentError(
+                            f"stdio line exceeds {MAX_LINE_BYTES} bytes"
+                        )
+                    if b"\n" in buf:
+                        # Return up to and including the first newline to
+                        # preserve readline() semantics; stash any over-read
+                        # bytes for the next call.
+                        newline_idx = buf.index(b"\n") + 1
+                        line_bytes = bytes(buf[:newline_idx])
+                        self._pending = bytearray(buf[newline_idx:])
+                        try:
+                            return line_bytes.decode("utf-8")
+                        except UnicodeDecodeError as error:
+                            raise AgentError(
+                                f"invalid UTF-8 in stdio response: {error}"
+                            ) from error
+                # fileno became unusable; fall through to thread path.
+            except AgentError:
+                raise
+            except Exception:  # pragma: no cover - defensive
                 fileno = -1
-            if fileno >= 0:
-                if not ready:
-                    raise AgentError(
-                        f"stdio read timed out after {self.timeout}s waiting for response"
-                    )
-                line = stdout.readline()
-                if line == "":
-                    raise AgentError(
-                        "stdio process hit EOF "
-                        f"(returncode {self.process.poll()})"
-                    )
-                return line
         result: queue.Queue[str] = queue.Queue()
 
         def _read() -> None:

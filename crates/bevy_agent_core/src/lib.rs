@@ -1174,12 +1174,32 @@ pub fn drain_agent_actions(
     input.sources.clear();
 
     let mode = control.mode.clone();
+    // Reconstruction bypass: when the runner rebuilds history it enqueues a
+    // sentinel `Custom` marker alongside the recorded frame for the tick.
+    // `ExecutionContext::Reconstructing` lives in the replay crate (core
+    // cannot depend on it without a cycle), so the marker is the cross-crate
+    // Reconstructing signal: if present, accept all recorded sources without
+    // mode arbitration, preserving inputs even in Paused/Replay modes.
+    let reconstructing = queue.pending.iter().any(|scheduled| {
+        if let AgentAction::Custom { value } = &scheduled.action {
+            value.get("__bevy_agent_reconstructing__") == Some(&serde_json::Value::Bool(true))
+        } else {
+            false
+        }
+    });
     let mut remaining = VecDeque::new();
     while let Some(next) = queue.pending.pop_front() {
+        // Drop the Reconstructing sentinel itself; it is metadata, not input.
+        if let AgentAction::Custom { value } = &next.action
+            && value.get("__bevy_agent_reconstructing__") == Some(&serde_json::Value::Bool(true))
+        {
+            continue;
+        }
         if next.tick == clock.tick {
             // Enforce the source/mode matrix at input resolution: actions
             // from rejected sources are dropped (not applied, not counted).
-            if mode.accepts_source(&next.source) {
+            // During Reconstructing all recorded sources are accepted.
+            if reconstructing || mode.accepts_source(&next.source) {
                 input.sources.push(next.source);
                 input.actions.push(next.action);
             }

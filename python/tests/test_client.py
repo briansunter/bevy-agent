@@ -223,5 +223,153 @@ class StdioClientTests(unittest.TestCase):
         self.assertTrue(process.stdin.close.called)
 
 
+class StdioPartialLineTests(unittest.TestCase):
+    """Incremental deadline: a partial single-byte write then hang must timeout."""
+
+    def _pipe_client(self, timeout: float):
+        import os as _os
+
+        read_fd, write_fd = _os.pipe()
+        # Partial line: single "{" byte, writer stays open (no EOF).
+        _os.write(write_fd, b"{")
+        with patch("bevy_agent_client.subprocess.Popen") as popen:
+            process = MagicMock()
+            process.stdin = MagicMock()
+            # Text-mode read end with a real selectable fileno.
+            process.stdout = _os.fdopen(read_fd, "r", buffering=1)
+            process.poll.return_value = None
+            process.returncode = None
+            popen.return_value = process
+            client = StdioAgentClient(argv=["fake"], timeout=timeout)
+        self.assertIs(client.process, process)
+        return client, process, write_fd
+
+    def test_partial_single_byte_then_hang_times_out(self):
+        import os as _os
+
+        client, process, write_fd = self._pipe_client(timeout=0.3)
+        try:
+            with self.assertRaises(AgentError) as ctx:
+                client._readline_with_timeout()
+            self.assertIn("timed out", str(ctx.exception))
+        finally:
+            client._closed = True  # avoid terminate on fake MagicMock
+            try:
+                process.stdout.close()
+            except Exception:
+                pass
+            _os.close(write_fd)
+
+    def test_incremental_chunks_assemble_full_line(self):
+        import os as _os
+        import threading as _threading
+        import time as _time
+
+        read_fd, write_fd = _os.pipe()
+
+        def _writer():
+            _time.sleep(0.02)
+            _os.write(write_fd, b'{"json')
+            _time.sleep(0.02)
+            _os.write(write_fd, b'rpc": 2}\n')
+
+        thread = _threading.Thread(target=_writer, daemon=True)
+        thread.start()
+        with patch("bevy_agent_client.subprocess.Popen") as popen:
+            process = MagicMock()
+            process.stdin = MagicMock()
+            process.stdout = _os.fdopen(read_fd, "r", buffering=1)
+            process.poll.return_value = None
+            popen.return_value = process
+            client = StdioAgentClient(argv=["fake"], timeout=5.0)
+        try:
+            line = client._readline_with_timeout()
+            self.assertEqual(line.strip(), '{"jsonrpc": 2}')
+        finally:
+            client._closed = True
+            try:
+                process.stdout.close()
+            except Exception:
+                pass
+            _os.close(write_fd)
+        thread.join(timeout=2)
+
+    def test_line_exceeding_max_bytes_raises(self):
+        import os as _os
+
+        import bevy_agent_client as _client_mod
+
+        read_fd, write_fd = _os.pipe()
+        _os.write(write_fd, b"A" * 64 + b"\n")
+        with patch("bevy_agent_client.subprocess.Popen") as popen:
+            process = MagicMock()
+            process.stdin = MagicMock()
+            process.stdout = _os.fdopen(read_fd, "r", buffering=1)
+            process.poll.return_value = None
+            popen.return_value = process
+            client = StdioAgentClient(argv=["fake"], timeout=5.0)
+        old_max = _client_mod.MAX_LINE_BYTES
+        _client_mod.MAX_LINE_BYTES = 16
+        try:
+            with self.assertRaises(AgentError) as ctx:
+                client._readline_with_timeout()
+            self.assertIn("exceeds", str(ctx.exception))
+        finally:
+            _client_mod.MAX_LINE_BYTES = old_max
+            client._closed = True
+            try:
+                process.stdout.close()
+            except Exception:
+                pass
+            _os.close(write_fd)
+
+    def test_real_subprocess_partial_write_times_out_and_cleans_up(self):
+        # Real process writes "{" then sleeps; the client must hit its
+        # absolute deadline and terminate the child on close().
+        client = StdioAgentClient(
+            argv=[
+                "python3",
+                "-c",
+                "import sys,time; sys.stdout.write('{'); sys.stdout.flush(); time.sleep(30)",
+            ],
+            timeout=0.5,
+        )
+        try:
+            with self.assertRaises(AgentError) as ctx:
+                client.call("agent.info")
+            self.assertIn("timed out", str(ctx.exception))
+            self.assertIsNone(client.process.poll(), "child should still be alive after timeout")
+        finally:
+            client.close()
+        self.assertIsNotNone(
+            client.process.poll(), "close() must reap/terminate the hung child"
+        )
+
+
+class ValidateEnvelopeExtraTests(unittest.TestCase):
+    def test_wrong_version_raises(self):
+        with self.assertRaises(AgentError):
+            validate_envelope({"jsonrpc": "1.0", "id": 1, "result": {}}, 1)
+
+    def test_missing_version_raises(self):
+        with self.assertRaises(AgentError):
+            validate_envelope({"id": 1, "result": {}}, 1)
+
+    def test_error_non_dict_raises(self):
+        with self.assertRaises(AgentError):
+            validate_envelope(
+                {"jsonrpc": "2.0", "id": 1, "error": "boom"}, 1
+            )
+
+    def test_result_none_passes_through(self):
+        self.assertIsNone(
+            validate_envelope({"jsonrpc": "2.0", "id": 1, "result": None}, 1)
+        )
+
+    def test_id_none_mismatch_raises(self):
+        with self.assertRaises(AgentError):
+            validate_envelope({"jsonrpc": "2.0", "id": None, "result": {}}, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

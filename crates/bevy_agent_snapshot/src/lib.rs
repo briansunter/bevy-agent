@@ -5,6 +5,7 @@
 //! resources/components are serialized and restored.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::hash::Hasher;
 
 use anyhow::{Context, Result, anyhow};
@@ -95,6 +96,30 @@ impl Default for SnapshotPolicy {
     }
 }
 
+/// Semantic role of a snapshot checkpoint.
+///
+/// Retention and auto-pinning are driven by this enum, never by label
+/// substrings: [`SnapshotRole::Initial`], [`SnapshotRole::BranchFork`], and
+/// [`SnapshotRole::RecordingBaseline`] are pinned on creation and excluded
+/// from the `keep_last_n` evictable count, while [`SnapshotRole::Manual`] and
+/// [`SnapshotRole::Periodic`] are evictable (unless explicitly pinned or
+/// referenced by a replay log).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRole {
+    /// First snapshot of an episode/run; always pinned.
+    Initial,
+    /// Fork/branch point referenced by a timeline branch.
+    BranchFork,
+    /// Baseline snapshot referenced by a recording/replay log.
+    RecordingBaseline,
+    /// Explicit user-requested snapshot; evictable by default.
+    #[default]
+    Manual,
+    /// Automatic periodic checkpoint; evictable by default.
+    Periodic,
+}
+
 #[derive(Resource, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SnapshotStore {
     pub snapshots: HashMap<SnapshotId, Snapshot>,
@@ -106,6 +131,13 @@ pub struct SnapshotStore {
     /// callers may additionally pin any snapshot referenced by a [`ReplayLog`](bevy_agent_replay::ReplayLog).
     #[serde(default)]
     pub pinned: BTreeSet<SnapshotId>,
+    /// Current episode identifier used to tag new checkpoints.
+    ///
+    /// Set via [`set_snapshot_episode`]; [`create_snapshot`] copies this into
+    /// [`SnapshotManifest::episode_id`] so checkpoints can be correlated with
+    /// the episode that produced them.
+    #[serde(default)]
+    pub episode_id: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -136,7 +168,53 @@ pub struct SnapshotManifest {
     pub agent_control_version: String,
     pub schema_hash: String,
     pub created_from_timeline: TimelineId,
+    /// Semantic checkpoint role driving auto-pin and retention.
+    ///
+    /// Defaults to [`SnapshotRole::Manual`] for snapshots serialized before
+    /// the role field existed (back-compat).
+    #[serde(default)]
+    pub role: SnapshotRole,
+    /// Episode that produced this checkpoint (copied from
+    /// [`SnapshotStore::episode_id`] at creation).
+    #[serde(default)]
+    pub episode_id: u64,
 }
+
+/// Marker inserted when a restore rollback itself fails.
+///
+/// A failed rollback means the world may hold a partially applied snapshot;
+/// callers must treat the presence of this resource as "world state is
+/// undefined until re-initialized", rather than assuming the pre-restore
+/// state was recovered.
+#[derive(Resource, Clone, Debug)]
+pub struct FaultState {
+    pub message: String,
+}
+
+/// Distinct error returned when a restore apply/verification failure is
+/// followed by a rollback failure.
+///
+/// `original` is the apply/verification error; `rollback` is the error from
+/// attempting to restore the pre-mutation backup. When this error is
+/// returned the world also carries a [`FaultState`] resource describing the
+/// failure.
+#[derive(Debug)]
+pub struct RollbackFailed {
+    pub original: String,
+    pub rollback: String,
+}
+
+impl fmt::Display for RollbackFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RollbackFailed {{ original: {}, rollback: {} }}",
+            self.original, self.rollback
+        )
+    }
+}
+
+impl std::error::Error for RollbackFailed {}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SnapshotReplayState {
@@ -292,6 +370,16 @@ impl SnapshotRegistry {
 
     #[must_use]
     pub fn schema_hash(&self) -> String {
+        // Compatibility proxy, NOT a full field-layout hash: this hashes the
+        // sorted registration type names plus the snapshot crate version, so
+        // adding/removing a registered component or resource (or bumping the
+        // crate) changes the hash and rejects cross-schema restores.
+        //
+        // It does NOT hash per-field layouts or game-side component versions;
+        // game breaking changes must additionally bump the game component
+        // version surfaced via `SnapshotMetadata::game_version`
+        // (checked in `prepare_restore_plan`), which is the authoritative
+        // per-game compatibility gate.
         let mut names: Vec<_> = self
             .component_serializers
             .keys()
@@ -435,24 +523,39 @@ pub fn unpin_snapshot(world: &mut World, snapshot_id: SnapshotId) {
     }
 }
 
-fn should_auto_pin(label: &Option<String>, is_first: bool) -> bool {
+/// Set the episode id used to tag subsequently created checkpoints.
+pub fn set_snapshot_episode(world: &mut World, episode_id: u64) {
+    if let Some(mut store) = world.get_resource_mut::<SnapshotStore>() {
+        store.episode_id = episode_id;
+    }
+}
+
+fn should_auto_pin(role: SnapshotRole, is_first: bool) -> bool {
     if is_first {
         return true;
     }
-    let Some(label) = label.as_deref() else {
-        return false;
-    };
-    let lower = label.to_ascii_lowercase();
-    lower.starts_with("reset-")
-        || lower.starts_with("initial")
-        || lower.starts_with("branch")
-        || lower.starts_with("fork")
-        || lower.contains("branch")
-        || lower.contains("fork")
+    matches!(
+        role,
+        SnapshotRole::Initial | SnapshotRole::BranchFork | SnapshotRole::RecordingBaseline
+    )
 }
 
 pub fn create_snapshot(world: &mut World, label: Option<String>) -> Result<SnapshotCreateResult> {
-    let snapshot = capture_snapshot(world, label.clone())?;
+    create_snapshot_with_role(world, label, SnapshotRole::Manual)
+}
+
+pub fn create_snapshot_with_role(
+    world: &mut World,
+    label: Option<String>,
+    role: SnapshotRole,
+) -> Result<SnapshotCreateResult> {
+    let mut snapshot = capture_snapshot(world, label.clone())?;
+    snapshot.manifest.role = role;
+    // Episode tagging: checkpoints record the store's current episode.
+    // (Checksum covers the gameplay payload; role/episode travel in the
+    // manifest alongside the checksum, not inside it.)
+    let episode_id = world.resource::<SnapshotStore>().episode_id;
+    snapshot.manifest.episode_id = episode_id;
     let result = SnapshotCreateResult {
         snapshot_id: snapshot.manifest.snapshot_id,
         tick: snapshot.manifest.tick,
@@ -468,10 +571,12 @@ pub fn create_snapshot(world: &mut World, label: Option<String>) -> Result<Snaps
         }
         store.checkpoints.push(result.snapshot_id);
         store.snapshots.insert(result.snapshot_id, snapshot);
-        if should_auto_pin(&label, is_first) {
+        if should_auto_pin(role, is_first) {
             store.pinned.insert(result.snapshot_id);
         }
     }
+    // Pin-then-enforce: the new id was just pinned when applicable, and
+    // enforcement below never evicts the newly created id itself.
     prune_checkpoints(world, keep);
 
     if let Some(mut control) = world.get_resource_mut::<AgentControlState>() {
@@ -567,6 +672,10 @@ pub fn capture_snapshot(world: &mut World, label: Option<String>) -> Result<Snap
         .unwrap_or_default();
 
     let snapshot_id = SnapshotId::new();
+    let episode_id = world
+        .get_resource::<SnapshotStore>()
+        .map(|store| store.episode_id)
+        .unwrap_or_default();
     let manifest = SnapshotManifest {
         snapshot_id,
         tick: clock.tick,
@@ -576,6 +685,8 @@ pub fn capture_snapshot(world: &mut World, label: Option<String>) -> Result<Snap
         agent_control_version: metadata.agent_control_version,
         schema_hash,
         created_from_timeline: control.timeline_id,
+        role: SnapshotRole::Manual,
+        episode_id,
     };
 
     let mut snapshot = Snapshot {
@@ -626,26 +737,36 @@ pub fn restore_snapshot_with_remap(
 /// # Entity references
 ///
 /// Bevy [`Entity`] ids are reallocated on every restore; only
-/// [`StableEntityId`] is preserved. Components should reference other
-/// entities by [`StableEntityId`] (for example `Attack { target }`), which
-/// needs no remapping because stable ids are restored verbatim.
+/// [`StableEntityId`] is preserved. Prefer stable-id-first components that
+/// reference other entities by [`StableEntityId`] (for example
+/// `Attack { target }`), which need no remapping because stable ids are
+/// restored verbatim.
 ///
-/// Restore uses two-pass allocation: pass 1 spawns one empty entity per
-/// snapshot entry with `(SnapshotEntity, StableEntityId)` and builds a
-/// `StableEntityId -> Entity` map; pass 2 inserts the remaining components.
-/// The optional `remap` hook runs between the passes so games with raw
-/// `Entity` references can rewrite them using the map.
+/// Restore allocates one entity per snapshot entry with
+/// `(SnapshotEntity, StableEntityId)`, inserts ALL restored components, and
+/// only then runs the optional `remap` hook as a fix-up pass over the live
+/// components. The hook receives the `StableEntityId -> Entity` map and
+/// should rewrite raw `Entity` fields in place (query live components and
+/// patch them); it must not assume components are absent.
+///
+/// Resolve-phase integration: timeline/branch resolve flows that need
+/// cross-timeline entity identity should run their id-resolution through
+/// this same hook after components are installed, so fix-ups always observe
+/// the final restored component values.
 ///
 /// # Atomicity
 ///
 /// Phase 1 (prepare) performs every fallible check *without touching the
-/// world*: schema hash, game/version metadata, duplicate stable ids,
-/// registration resolution, typed `serde_json::from_value` validation of all
-/// resources/components, and checksum preconditions. Phase 2 (apply) clears
-/// entities and replaces resources/entities only after prepare succeeds. If
-/// apply fails late (including the post-restore checksum verification), the
-/// world is rolled back to a backup captured before mutation, leaving the
-/// original semantic state unchanged.
+/// world*: clock validation, schema hash, game/version metadata, duplicate
+/// stable ids, registration resolution, typed `serde_json::from_value`
+/// validation of all resources/components, and checksum preconditions.
+/// Phase 2 (apply) clears entities and replaces resources/entities only
+/// after prepare succeeds. If apply fails late (including the post-restore
+/// checksum verification), the world is rolled back to a backup captured
+/// before mutation, leaving the original semantic state unchanged. If the
+/// rollback itself fails, a [`RollbackFailed`] error (carrying both the
+/// original and rollback errors) is returned and the world is marked with a
+/// [`FaultState`] resource instead of claiming success.
 pub fn restore_snapshot_value(world: &mut World, snapshot: &Snapshot) -> Result<SnapshotChecksum> {
     restore_snapshot_value_with_remap(world, snapshot, None)
 }
@@ -664,8 +785,22 @@ pub fn restore_snapshot_value_with_remap(
 
     // ---- Phase 2: Apply ----
     if let Err(apply_error) = apply_restore_plan(world, &plan, remap) {
-        let _ = apply_snapshot_unchecked(world, &backup);
-        return Err(apply_error.context("restore apply failed; rolled back"));
+        let original = format!("{apply_error:?}");
+        match apply_snapshot_unchecked(world, &backup) {
+            Ok(()) => {
+                return Err(apply_error.context("restore apply failed; rolled back"));
+            }
+            Err(rollback_error) => {
+                let rollback = format!("{rollback_error:?}");
+                world.insert_resource(FaultState {
+                    message: format!(
+                        "restore apply failed ({original}) and rollback failed ({rollback})"
+                    ),
+                });
+                return Err(anyhow!(RollbackFailed { original, rollback })
+                    .context("restore apply failed; rollback failed"));
+            }
+        }
     }
 
     // Post-restore verification: re-capture and compare checksums.
@@ -684,8 +819,20 @@ pub fn restore_snapshot_value_with_remap(
     match verification {
         Ok(checksum) => Ok(checksum),
         Err(error) => {
-            let _ = apply_snapshot_unchecked(world, &backup);
-            Err(error.context("restore verification failed; rolled back"))
+            let original = format!("{error:?}");
+            match apply_snapshot_unchecked(world, &backup) {
+                Ok(()) => Err(error.context("restore verification failed; rolled back")),
+                Err(rollback_error) => {
+                    let rollback = format!("{rollback_error:?}");
+                    world.insert_resource(FaultState {
+                        message: format!(
+                            "restore verification failed ({original}) and rollback failed ({rollback})"
+                        ),
+                    });
+                    Err(anyhow!(RollbackFailed { original, rollback })
+                        .context("restore verification failed; rollback failed"))
+                }
+            }
         }
     }
 }
@@ -698,6 +845,14 @@ struct RestorePlan {
 }
 
 fn prepare_restore_plan(world: &World, snapshot: &Snapshot) -> Result<RestorePlan> {
+    // Clock validation: typed deserialization already produced `SimClock`;
+    // run its semantic check to reject tick/dt anomalies (zero/NaN/infinite
+    // dt, negative/non-finite elapsed, absurd tick) before touching the world.
+    snapshot
+        .clock
+        .validate()
+        .map_err(|error| anyhow!("invalid snapshot clock: {error}"))?;
+
     // Schema hash.
     {
         let registry = world.resource::<SnapshotRegistry>().schema_hash();
@@ -856,16 +1011,16 @@ fn apply_restore_plan(
         remove(world);
     }
 
-    // Two-pass entity allocation: pass 1 spawns stable ids, pass 2 inserts
-    // components. The remap hook runs between passes with the id map.
+    // Allocate entities, insert restored components first, then run the
+    // remap hook as a fix-up pass over live components. The hook observes
+    // installed component values via the StableEntityId -> Entity map, so
+    // raw-`Entity` fix-ups (and resolve-phase id resolution) always see the
+    // final restored state.
     let mut id_map: HashMap<StableEntityId, Entity> =
         HashMap::with_capacity(plan.entity_restores.len());
     for (stable_id, _) in &plan.entity_restores {
         let entity = world.spawn((SnapshotEntity, *stable_id)).id();
         id_map.insert(*stable_id, entity);
-    }
-    if let Some(remap) = remap {
-        remap(world, &id_map);
     }
     for (stable_id, components) in &plan.entity_restores {
         let entity_id = id_map
@@ -878,6 +1033,9 @@ fn apply_restore_plan(
         for (restore, value) in components {
             restore(&mut entity, value)?;
         }
+    }
+    if let Some(remap) = remap {
+        remap(world, &id_map);
     }
 
     if let Some(mut queue) = world.get_resource_mut::<AgentActionQueue>() {
@@ -968,34 +1126,107 @@ pub fn maybe_take_snapshot(world: &mut World) {
         return;
     }
 
-    let _ = create_snapshot(world, Some(format!("checkpoint-{tick}")));
+    if let Err(error) = create_snapshot_with_role(
+        world,
+        Some(format!("checkpoint-{tick}")),
+        SnapshotRole::Periodic,
+    ) {
+        bevy::log::warn!("periodic checkpoint failed: {error:?}");
+    }
 }
 
-/// Returns false when `snapshot_id` is pinned or is referenced by replay
-/// state held outside the store; such snapshots must never be evicted.
-pub fn can_evict(store: &SnapshotStore, snapshot_id: SnapshotId) -> bool {
-    !store.pinned.contains(&snapshot_id)
+/// Returns false when `snapshot_id` is pinned or appears in the caller-held
+/// replay-reference set; such snapshots must never be evicted.
+///
+/// The `referenced` set is owned by the replay/timeline layer (snapshots
+/// referenced by a [`ReplayLog`](bevy_agent_replay::ReplayLog) or an active
+/// branch). Retention enforcement threads it through so coordinated deletes
+/// never drop a snapshot another subsystem still needs.
+pub fn can_evict(
+    store: &SnapshotStore,
+    snapshot_id: SnapshotId,
+    referenced: &BTreeSet<SnapshotId>,
+) -> bool {
+    !store.pinned.contains(&snapshot_id) && !referenced.contains(&snapshot_id)
+}
+
+/// Coordinated delete: rejects snapshots that are pinned or referenced.
+///
+/// Returns an error when `id` is pinned or present in `referenced`; otherwise
+/// removes the snapshot from the store, checkpoint list, and label index.
+pub fn delete_snapshot_checked(
+    world: &mut World,
+    id: SnapshotId,
+    referenced: &BTreeSet<SnapshotId>,
+) -> Result<()> {
+    let store = world.resource::<SnapshotStore>();
+    if store.pinned.contains(&id) {
+        return Err(anyhow!("snapshot {id:?} is pinned and cannot be deleted"));
+    }
+    if referenced.contains(&id) {
+        return Err(anyhow!(
+            "snapshot {id:?} is referenced and cannot be deleted"
+        ));
+    }
+    if !store.snapshots.contains_key(&id) {
+        return Err(anyhow!("snapshot {id:?} not found"));
+    }
+    let mut store = world.resource_mut::<SnapshotStore>();
+    store.checkpoints.retain(|candidate| *candidate != id);
+    store.snapshots.remove(&id);
+    store.labels.retain(|_, snapshot_id| *snapshot_id != id);
+    Ok(())
 }
 
 fn prune_checkpoints(world: &mut World, keep_last_n: usize) {
-    if keep_last_n == 0 {
-        return;
-    }
+    prune_checkpoints_with_refs(world, keep_last_n, &BTreeSet::new());
+}
 
-    let mut store = world.resource_mut::<SnapshotStore>();
-    while store.checkpoints.len() > keep_last_n {
-        let evictable = store
-            .checkpoints
-            .iter()
-            .copied()
-            .find(|id| can_evict(&store, *id));
-        let Some(victim) = evictable else {
-            // Every remaining checkpoint is pinned: retain all.
+/// Retention over EVICTABLE checkpoints only.
+///
+/// Pinned snapshots (initial/fork/baseline) and caller-referenced snapshots
+/// are excluded from the `keep_last_n` count: enforcement counts only
+/// evictable checkpoints and evicts the oldest evictable checkpoint other
+/// than the most recently created one, so the newly created id always
+/// survives. When no evictable checkpoint other than the newest exists, the
+/// limit is exceeded rather than deleting the new snapshot.
+pub fn prune_checkpoints_with_refs(
+    world: &mut World,
+    keep_last_n: usize,
+    referenced: &BTreeSet<SnapshotId>,
+) {
+    // Newest checkpoint is the just-created id; never evict it here.
+    let newest = world
+        .resource::<SnapshotStore>()
+        .checkpoints
+        .last()
+        .copied();
+    loop {
+        let victim = {
+            let store = world.resource::<SnapshotStore>();
+            let evictable_count = store
+                .checkpoints
+                .iter()
+                .filter(|id| can_evict(store, **id, referenced))
+                .count();
+            if evictable_count <= keep_last_n {
+                break;
+            }
+            store
+                .checkpoints
+                .iter()
+                .copied()
+                .find(|id| Some(*id) != newest && can_evict(store, *id, referenced))
+        };
+        let Some(victim) = victim else {
+            // No evictable checkpoint besides the newest (or all remaining
+            // are pinned/referenced): exceed the limit rather than delete.
             break;
         };
+        let mut store = world.resource_mut::<SnapshotStore>();
         store.checkpoints.retain(|id| *id != victim);
         // Never delete pinned snapshots even if they somehow left checkpoints.
-        if store.pinned.contains(&victim) {
+        if store.pinned.contains(&victim) || referenced.contains(&victim) {
             continue;
         }
         store.snapshots.remove(&victim);
@@ -1202,14 +1433,16 @@ mod tests {
             TestComponent { value: 5 },
         ));
 
-        let initial = create_snapshot(app.world_mut(), Some("reset-0".to_string())).unwrap();
+        let initial =
+            create_snapshot_with_role(app.world_mut(), None, SnapshotRole::Initial).unwrap();
         assert!(
             app.world()
                 .resource::<SnapshotStore>()
                 .pinned
                 .contains(&initial.snapshot_id)
         );
-        let branch = create_snapshot(app.world_mut(), Some("branch-try".to_string())).unwrap();
+        let branch =
+            create_snapshot_with_role(app.world_mut(), None, SnapshotRole::BranchFork).unwrap();
         assert!(
             app.world()
                 .resource::<SnapshotStore>()
@@ -1217,11 +1450,110 @@ mod tests {
                 .contains(&branch.snapshot_id)
         );
 
+        let empty_refs = BTreeSet::new();
         let store = app.world().resource::<SnapshotStore>();
         assert!(store.snapshots.contains_key(&initial.snapshot_id));
         assert!(store.snapshots.contains_key(&branch.snapshot_id));
-        assert!(!can_evict(store, initial.snapshot_id));
-        assert!(!can_evict(store, branch.snapshot_id));
+        assert!(!can_evict(store, initial.snapshot_id, &empty_refs));
+        assert!(!can_evict(store, branch.snapshot_id, &empty_refs));
+    }
+
+    #[test]
+    fn retention_limit_one_with_pinned_initial_keeps_new_manual() {
+        let mut app = app_with_snapshot();
+        app.world_mut()
+            .resource_mut::<SnapshotPolicy>()
+            .keep_last_n_checkpoints = 1;
+        app.world_mut().spawn((
+            SnapshotEntity,
+            StableEntityId(10),
+            TestComponent { value: 5 },
+        ));
+
+        // Pinned initial is excluded from the keep_last_n evictable count.
+        let initial = create_snapshot_with_role(
+            app.world_mut(),
+            Some("initial".to_string()),
+            SnapshotRole::Initial,
+        )
+        .unwrap();
+        let first_manual = create_snapshot(app.world_mut(), Some("m1".to_string())).unwrap();
+        // Newly created id always survives: evict oldest evictable OTHER
+        // than the new id.
+        let second_manual = create_snapshot(app.world_mut(), Some("m2".to_string())).unwrap();
+
+        let store = app.world().resource::<SnapshotStore>();
+        assert!(store.snapshots.contains_key(&initial.snapshot_id));
+        assert!(
+            store.snapshots.contains_key(&second_manual.snapshot_id),
+            "newly created snapshot must survive enforcement"
+        );
+        assert!(
+            !store.snapshots.contains_key(&first_manual.snapshot_id),
+            "oldest evictable should be evicted once evictable count exceeds keep_last_n"
+        );
+        // Pinned initial does not count toward the limit: exactly one
+        // evictable checkpoint remains.
+        let empty_refs = BTreeSet::new();
+        let evictable = store
+            .checkpoints
+            .iter()
+            .filter(|id| can_evict(store, **id, &empty_refs))
+            .count();
+        assert_eq!(evictable, 1);
+    }
+
+    #[test]
+    fn referenced_snapshot_is_not_evicted_and_delete_is_rejected() {
+        let mut app = app_with_snapshot();
+        app.world_mut()
+            .resource_mut::<SnapshotPolicy>()
+            .keep_last_n_checkpoints = 1;
+        app.world_mut().spawn((
+            SnapshotEntity,
+            StableEntityId(10),
+            TestComponent { value: 5 },
+        ));
+
+        let first = create_snapshot(app.world_mut(), Some("m1".to_string())).unwrap();
+        // First snapshot is auto-pinned via is_first; unpin so retention is
+        // driven by the referenced set in this test.
+        unpin_snapshot(app.world_mut(), first.snapshot_id);
+        let mut referenced = BTreeSet::new();
+        referenced.insert(first.snapshot_id);
+        // Enforce with the replay-reference set: referenced snapshot stays
+        // even though the evictable limit is exceeded by the next creation.
+        // Bump the policy limit so `create_snapshot`'s internal prune (which
+        // uses an empty ref set) does not evict `first` before the
+        // coordinated prune below.
+        app.world_mut()
+            .resource_mut::<SnapshotPolicy>()
+            .keep_last_n_checkpoints = 100;
+        let second = create_snapshot(app.world_mut(), Some("m2".to_string())).unwrap();
+        prune_checkpoints_with_refs(app.world_mut(), 0, &referenced);
+
+        let store = app.world().resource::<SnapshotStore>();
+        assert!(!can_evict(store, first.snapshot_id, &referenced));
+        assert!(store.snapshots.contains_key(&first.snapshot_id));
+        assert!(store.snapshots.contains_key(&second.snapshot_id));
+
+        // Coordinated delete rejects pinned and referenced snapshots.
+        pin_snapshot(app.world_mut(), second.snapshot_id);
+        let err =
+            delete_snapshot_checked(app.world_mut(), second.snapshot_id, &referenced).unwrap_err();
+        assert!(err.to_string().contains("pinned"));
+        let err =
+            delete_snapshot_checked(app.world_mut(), first.snapshot_id, &referenced).unwrap_err();
+        assert!(err.to_string().contains("referenced"));
+        // Unpinned + unreferenced delete succeeds.
+        unpin_snapshot(app.world_mut(), second.snapshot_id);
+        delete_snapshot_checked(app.world_mut(), second.snapshot_id, &referenced).unwrap();
+        assert!(
+            !app.world()
+                .resource::<SnapshotStore>()
+                .snapshots
+                .contains_key(&second.snapshot_id)
+        );
     }
 
     #[derive(Component, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1284,10 +1616,19 @@ mod tests {
         restore_snapshot_value_with_remap(
             app.world_mut(),
             &snapshot,
-            Some(&|_world, map| {
-                // Two-pass hook observes the stable-id -> fresh Entity map.
+            Some(&|world, map| {
+                // Fix-up pass runs after components are installed, so the
+                // hook observes live component values.
                 assert_eq!(map.len(), 2);
                 assert!(map.contains_key(&StableEntityId(1)));
+                let mut query = world.query::<(&StableEntityId, Option<&RefComponent>)>();
+                let found = query.iter(world).any(|(_, reference)| {
+                    *reference.unwrap()
+                        == RefComponent {
+                            target: StableEntityId(1),
+                        }
+                });
+                assert!(found, "remap hook must see installed components");
             }),
         )
         .unwrap();
@@ -1417,7 +1758,7 @@ mod tests {
         let good = checksum_snapshot(&tampered).unwrap();
         tampered.checksum = good;
         tampered.checksum.hash ^= 1;
-        let _ = snapshot;
+        drop(snapshot);
 
         app.world_mut().resource_mut::<TestResource>().value = "live".to_string();
         let before = capture_snapshot(app.world_mut(), None).unwrap();
@@ -1500,5 +1841,88 @@ mod tests {
         let error = capture_snapshot(app.world_mut(), None).unwrap_err();
 
         assert!(error.to_string().contains("missing StableEntityId"));
+    }
+
+    #[test]
+    fn restore_rejects_invalid_clock() {
+        let mut app = app_with_snapshot();
+        app.world_mut().spawn((
+            SnapshotEntity,
+            StableEntityId(10),
+            TestComponent { value: 5 },
+        ));
+        let created = create_snapshot(app.world_mut(), None).unwrap();
+        let mut snapshot = app
+            .world()
+            .resource::<SnapshotStore>()
+            .snapshots
+            .get(&created.snapshot_id)
+            .cloned()
+            .unwrap();
+        // Poison the clock (NaN dt + absurd tick) and re-sign so the failure
+        // surfaces at semantic clock validation, not the checksum gate.
+        snapshot.clock.dt_seconds = f32::NAN;
+        snapshot.clock.tick = u64::MAX;
+        snapshot.checksum = checksum_snapshot(&snapshot).unwrap();
+
+        let before = capture_snapshot(app.world_mut(), None).unwrap();
+        let error = restore_snapshot_value(app.world_mut(), &snapshot).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid snapshot clock"),
+            "unexpected error: {error:?}"
+        );
+        // Prepare-phase failure: world untouched.
+        let after = capture_snapshot(app.world_mut(), None).unwrap();
+        assert_eq!(
+            checksum_snapshot(&after).unwrap().hash,
+            checksum_snapshot(&before).unwrap().hash
+        );
+    }
+
+    #[test]
+    fn rollback_failure_surfaces_distinctly_and_marks_fault() {
+        fn failing_restore(
+            _entity: &mut EntityWorldMut<'_>,
+            _value: &serde_json::Value,
+        ) -> Result<()> {
+            Err(anyhow!("injected restore failure"))
+        }
+
+        let mut app = app_with_snapshot();
+        app.world_mut().spawn((
+            SnapshotEntity,
+            StableEntityId(10),
+            TestComponent { value: 5 },
+        ));
+        let created = create_snapshot(app.world_mut(), None).unwrap();
+        let snapshot = app
+            .world()
+            .resource::<SnapshotStore>()
+            .snapshots
+            .get(&created.snapshot_id)
+            .cloned()
+            .unwrap();
+
+        // Swap the TestComponent restore fn for one that always fails, so
+        // both the initial apply and the rollback apply fail.
+        {
+            let mut registry = app.world_mut().resource_mut::<SnapshotRegistry>();
+            let type_name = std::any::type_name::<TestComponent>();
+            if let Some(registration) = registry.component_serializers.get_mut(type_name) {
+                registration.restore = failing_restore;
+            }
+        }
+
+        let error = restore_snapshot_value(app.world_mut(), &snapshot).unwrap_err();
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("RollbackFailed"),
+            "expected distinct RollbackFailed context, got: {message}"
+        );
+        let fault = app
+            .world()
+            .get_resource::<FaultState>()
+            .unwrap_or_else(|| panic!("expected FaultState after rollback failure"));
+        assert!(fault.message.contains("rollback failed"));
     }
 }

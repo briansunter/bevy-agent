@@ -5,7 +5,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant};
@@ -16,9 +16,10 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bevy::prelude::*;
 use bevy_agent_core::{
     AgentAction, AgentActionCatalog, AgentActionKind, AgentObservationCatalog, ControlMode,
-    EnvironmentMetadata, ObservationMode, SnapshotId,
+    EnvironmentMetadata, LastStepResponse, ObservationConfig, ObservationMode, SnapshotId,
+    collect_observation_with_mode,
 };
-use bevy_agent_replay::{ReplayLog, start_recording, stop_recording};
+use bevy_agent_replay::{ReplayLog, stop_recording};
 use bevy_agent_runner::{
     AgentApp, AgentEnvironment, CaptureSource, ReplayBundle, ResetOptions, VisualCaptureOptions,
 };
@@ -63,6 +64,10 @@ bitflags! {
         const CONTROL = 1 << 9;
         /// Exporting replay bundles / snapshots to the caller.
         const SNAPSHOT_EXPORT = 1 << 10;
+        /// Touching the local filesystem (replay export/load `path`,
+        /// visual capture `output_dir`). NOT in the default set so
+        /// restricted deployments deny filesystem access by default.
+        const FILESYSTEM = 1 << 11;
     }
 }
 
@@ -137,52 +142,125 @@ impl RemoteSecurity {
     }
 }
 
+/// Symlink-safe confined path resolution.
+///
+/// - The artifact `root` is canonicalized once. When the root does not exist
+///   yet it is created (`create_dir_all`) so the canonical form covers the
+///   real location (symlinked roots resolve to their target).
+/// - The destination's nearest existing ancestor is canonicalized, the
+///   non-existent remainder is joined back lexically, and the result must
+///   stay under the canonical root. `..` components and absolute paths are
+///   rejected up front unless `allow_absolute` is set.
+/// - With `allow_absolute`, absolute destinations bypass root confinement but
+///   still resolve through the nearest-existing-ancestor canonicalization.
+///
+/// TOCTOU limits: validation and later file creation are not atomic. A
+/// concurrent rename/symlink swap between `resolve_*` and file creation can
+/// still redirect the final open. Callers writing files must open with
+/// exclusive creation (`create_new`, see `write_bundle_exclusive`) and
+/// callers with strict integrity needs should additionally open with
+/// `O_NOFOLLOW`-style guards / re-validate the parent file id after open.
+/// Reads should prefer opening the parent dir and validating before read.
 fn resolve_confined_path(root: &PathBuf, raw: &str, allow_absolute: bool) -> Result<PathBuf> {
+    use std::path::{Component, Path};
+    if raw.is_empty() {
+        return Err(anyhow!("empty path is not allowed"));
+    }
     let candidate = PathBuf::from(raw);
     if !allow_absolute {
         if raw.split(['/', '\\']).any(|comp| comp == "..") {
             return Err(anyhow!("path traversal (`..`) is not allowed: {raw}"));
         }
         if candidate.is_absolute() {
-            // Confine absolute paths to the artifact root or the OS temp dir
-            // (tests and tooling stage replay bundles / captures under
-            // `std::env::temp_dir()` siblings of the default artifact root).
-            let temp = std::env::temp_dir();
-            if !(candidate.starts_with(root) || candidate.starts_with(&temp)) {
-                return Err(anyhow!("absolute paths are not allowed: {raw}"));
-            }
+            return Err(anyhow!("absolute paths are not allowed: {raw}"));
         }
     }
-    let joined = if candidate.is_absolute() {
+    let joined: PathBuf = if candidate.is_absolute() {
         candidate
     } else {
         root.join(candidate)
     };
-    // Best-effort canonicalization guard: if both resolve, the result must
-    // stay under the (canonicalized) root or the OS temp dir.
-    if let (Ok(root_c), Ok(joined_c)) = (root.canonicalize(), joined.canonicalize()) {
-        let temp_c = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
-        if !joined_c.starts_with(&root_c) && !joined_c.starts_with(&temp_c) {
-            return Err(anyhow!("path escapes artifact root: {raw}"));
-        }
-        return Ok(joined_c);
-    }
-    // Lexical guard for non-existent paths: reject any `..` that survives join.
+    // Reject lexical escape for non-existent paths.
     let mut depth: i32 = 0;
+    let mut rooted = false;
     for comp in joined.components() {
-        use std::path::Component;
         match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                depth = 0;
+                rooted = true;
+            }
             Component::ParentDir => depth -= 1,
             Component::Normal(_) => depth += 1,
-            _ => {}
+            Component::CurDir => {}
         }
-        if depth < 0 {
+        if rooted && depth < 0 {
             return Err(anyhow!("path escapes artifact root: {raw}"));
         }
     }
-    Ok(joined)
+    // Canonicalize the root once (create it so symlinked roots resolve).
+    let root_canon: PathBuf = match root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            std::fs::create_dir_all(root)
+                .with_context(|| format!("creating artifact root {}", root.display()))?;
+            root.canonicalize()
+                .with_context(|| format!("canonicalizing artifact root {}", root.display()))?
+        }
+    };
+    // Absolute destinations with explicit opt-in bypass confinement.
+    if allow_absolute && Path::new(raw).is_absolute() {
+        return Ok(canonicalize_nearest_ancestor(&joined).unwrap_or(joined));
+    }
+    let resolved = canonicalize_nearest_ancestor(&joined).unwrap_or(joined);
+    // `starts_with` on canonical prefix covers symlink-redirected ancestors;
+    // the lexical depth check above covers non-existent `..` remainder.
+    if !resolved.starts_with(&root_canon) {
+        return Err(anyhow!("path escapes artifact root: {raw}"));
+    }
+    Ok(resolved)
+}
+
+/// Canonicalize the nearest existing ancestor of `path` and re-append the
+/// non-existent remainder lexically. Returns `None` when no ancestor exists
+/// (caller falls back to the lexical path).
+fn canonicalize_nearest_ancestor(path: &std::path::Path) -> Option<PathBuf> {
+    let mut ancestor: &std::path::Path = path;
+    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if ancestor.exists() {
+            let canon = ancestor.canonicalize().ok()?;
+            let mut out = canon;
+            for comp in remainder.iter().rev() {
+                out.push(comp);
+            }
+            return Some(out);
+        }
+        let parent = ancestor.parent()?;
+        if let Some(file_name) = ancestor.file_name() {
+            remainder.push(file_name.to_owned());
+        }
+        // Reached filesystem root without finding an existing ancestor.
+        if parent.as_os_str().is_empty() {
+            return None;
+        }
+        ancestor = parent;
+    }
+}
+
+/// Exclusive file creation (`create_new`): fails when the destination already
+/// exists instead of truncating it. Narrows (but does not close) the
+/// resolve-vs-open TOCTOU window; callers should still resolve via
+/// [`resolve_confined_path`] immediately before calling this.
+fn write_bundle_exclusive(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::fs::OpenOptions;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("exclusively creating {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// Centralized per-operation authorization descriptor.
@@ -539,17 +617,10 @@ impl JsonRpcBridge {
                     serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
                 self.check_token(params.session_token.as_deref())
                     .map_err(into_auth)?;
-                self.authorize_operation(&OperationRequires {
-                    mutation: Some(AgentCapability::STEP),
-                    observation_visibility: Some(capability_for_observation_mode(
-                        &params.options.observation_mode,
-                    )),
-                    snapshot_export: false,
-                    restore_import: false,
-                    filesystem: false,
-                    control: None,
-                })
-                .map_err(into_auth)?;
+                self.require_capability(AgentCapability::STEP)
+                    .map_err(into_auth)?;
+                self.authorize_observation_mode(&params.options.observation_mode)
+                    .map_err(into_auth)?;
                 let options = params.options.clone();
                 env.reset_with_response(options)
                     .map_err(into_internal)
@@ -560,29 +631,21 @@ impl JsonRpcBridge {
                     serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
                 self.check_token(params.session_token.as_deref())
                     .map_err(into_auth)?;
-                let active_mode = params.observation_mode.clone().unwrap_or_else(|| {
-                    env.world()
-                        .get_resource::<bevy_agent_core::ObservationConfig>()
-                        .map(|c| c.mode.clone())
-                        .unwrap_or_default()
-                });
-                self.authorize_operation(&OperationRequires {
-                    mutation: Some(AgentCapability::STEP),
-                    observation_visibility: Some(capability_for_observation_mode(&active_mode)),
-                    snapshot_export: false,
-                    restore_import: false,
-                    filesystem: false,
-                    control: None,
-                })
-                .map_err(into_auth)?;
-                if let Some(mode) = params.observation_mode {
-                    env.world_mut()
-                        .resource_mut::<bevy_agent_core::ObservationConfig>()
-                        .mode = mode;
-                }
-                env.step(params.action)
-                    .map_err(into_internal)
-                    .and_then(|v| serde_json::to_value(v).map_err(into_internal))
+                // Request-local mode: read-only snapshot of the requested mode
+                // (never mutate the global ObservationConfig here). The same
+                // `requested` mode is used for authorization AND for rendering
+                // the response after `ensure_initialized_with_mode`, so a
+                // first-step implicit reset cannot serve an unauthorized mode.
+                let requested = params
+                    .observation_mode
+                    .clone()
+                    .unwrap_or_else(|| current_observation_mode(env));
+                self.require_capability(AgentCapability::STEP)
+                    .map_err(into_auth)?;
+                self.authorize_observation_mode(&requested)
+                    .map_err(into_auth)?;
+                ensure_initialized_with_mode(env, &requested).map_err(into_internal)?;
+                step_with_request_mode(env, params.action, &requested).map_err(into_internal)
             }
             "agent.step_many" => {
                 let params: StepManyParams =
@@ -595,20 +658,12 @@ impl JsonRpcBridge {
                         params.actions.len()
                     )));
                 }
-                let active_mode = env
-                    .world()
-                    .get_resource::<bevy_agent_core::ObservationConfig>()
-                    .map(|c| c.mode.clone())
-                    .unwrap_or_default();
-                self.authorize_operation(&OperationRequires {
-                    mutation: Some(AgentCapability::STEP),
-                    observation_visibility: Some(capability_for_observation_mode(&active_mode)),
-                    snapshot_export: false,
-                    restore_import: false,
-                    filesystem: false,
-                    control: None,
-                })
-                .map_err(into_auth)?;
+                let active_mode = current_observation_mode(env);
+                self.require_capability(AgentCapability::STEP)
+                    .map_err(into_auth)?;
+                self.authorize_observation_mode(&active_mode)
+                    .map_err(into_auth)?;
+                ensure_initialized_with_mode(env, &active_mode).map_err(into_internal)?;
                 if !matches!(params.return_observations.as_str(), "none" | "last" | "all") {
                     return Err(invalid_params(
                         "return_observations must be one of: none, last, all",
@@ -637,20 +692,12 @@ impl JsonRpcBridge {
                         params.ticks
                     )));
                 }
-                let active_mode = env
-                    .world()
-                    .get_resource::<bevy_agent_core::ObservationConfig>()
-                    .map(|c| c.mode.clone())
-                    .unwrap_or_default();
-                self.authorize_operation(&OperationRequires {
-                    mutation: Some(AgentCapability::STEP),
-                    observation_visibility: Some(capability_for_observation_mode(&active_mode)),
-                    snapshot_export: false,
-                    restore_import: false,
-                    filesystem: false,
-                    control: None,
-                })
-                .map_err(into_auth)?;
+                let active_mode = current_observation_mode(env);
+                self.require_capability(AgentCapability::STEP)
+                    .map_err(into_auth)?;
+                self.authorize_observation_mode(&active_mode)
+                    .map_err(into_auth)?;
+                ensure_initialized_with_mode(env, &active_mode).map_err(into_internal)?;
                 env.fast_forward(params.ticks)
                     .map_err(into_internal)
                     .and_then(|v| serde_json::to_value(v).map_err(into_internal))
@@ -660,20 +707,12 @@ impl JsonRpcBridge {
                     serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
                 self.check_token(params.session_token.as_deref())
                     .map_err(into_auth)?;
-                self.authorize_operation(&OperationRequires {
-                    mutation: None,
-                    observation_visibility: Some(capability_for_observation_mode(
-                        &params.observation_mode,
-                    )),
-                    snapshot_export: false,
-                    restore_import: false,
-                    filesystem: false,
-                    control: None,
-                })
-                .map_err(into_auth)?;
-                env.observe(params.observation_mode)
-                    .map_err(into_internal)
-                    .and_then(|v| serde_json::to_value(v).map_err(into_internal))
+                // Request-local: authorize the SAME post-init mode that
+                // `observe_with_request_mode` renders, without mutating the
+                // global ObservationConfig.
+                self.authorize_observation_mode(&params.observation_mode)
+                    .map_err(into_auth)?;
+                observe_with_request_mode(env, &params.observation_mode).map_err(into_internal)
             }
             "agent.visual.capture" => {
                 let params: VisualCaptureParams =
@@ -812,6 +851,8 @@ impl JsonRpcBridge {
                     .map_err(into_auth)?;
                 self.require_capability(AgentCapability::BRANCH)
                     .map_err(into_auth)?;
+                validate_history_target(env, params.from_tick, "branch")
+                    .map_err(|e| invalid_params(e.to_string()))?;
                 let branch_id = env
                     .branch(params.from_tick, params.label)
                     .map_err(into_internal)?;
@@ -837,6 +878,8 @@ impl JsonRpcBridge {
                 .map_err(into_auth)?;
                 self.require_capability(AgentCapability::RESTORE)
                     .map_err(into_auth)?;
+                validate_history_target(env, params.tick, "restore_tick")
+                    .map_err(|e| invalid_params(e.to_string()))?;
                 env.restore_tick(params.tick).map_err(into_internal)?;
                 Ok(json!({ "current_tick": env.current_tick() }))
             }
@@ -898,8 +941,14 @@ impl JsonRpcBridge {
                     .map_err(into_auth)?;
                 self.require_capability(AgentCapability::STEP)
                     .map_err(into_auth)?;
+                // Route through `AgentApp::start_recording` (baseline snapshot
+                // capture + timeline pinning), not the free recording fn.
+                // Ensure initialization first so the baseline tick is valid.
+                let init_mode = current_observation_mode(env);
+                ensure_initialized_with_mode(env, &init_mode).map_err(into_internal)?;
                 let initial_snapshot = env.replay_log().and_then(|log| log.initial_snapshot);
-                start_recording(env.world_mut(), initial_snapshot);
+                env.start_recording(initial_snapshot)
+                    .map_err(into_internal)?;
                 Ok(json!({ "recording": true }))
             }
             "agent.replay.stop" => {
@@ -951,9 +1000,7 @@ impl JsonRpcBridge {
                     if let Some(parent) = resolved.parent() {
                         std::fs::create_dir_all(parent).map_err(into_internal)?;
                     }
-                    std::fs::write(&resolved, encoded)
-                        .with_context(|| format!("writing replay bundle to {}", resolved.display()))
-                        .map_err(into_internal)?;
+                    write_bundle_exclusive(&resolved, encoded.as_bytes()).map_err(into_internal)?;
                     Some(resolved.to_string_lossy().to_string())
                 } else {
                     None
@@ -1086,13 +1133,116 @@ impl JsonRpcBridge {
         if requires.restore_import {
             self.require_capability(AgentCapability::RESTORE)?;
         }
+        if requires.filesystem {
+            self.require_capability(AgentCapability::FILESYSTEM)?;
+        }
         if let Some(cap) = requires.control {
             self.require_capability(cap)?;
         }
-        // `filesystem` is enforced at path-resolution time via
-        // `resolve_artifact_path`; the flag documents intent.
         Ok(())
     }
+
+    /// Authorize the observation-visibility gate for a single requested mode.
+    /// All response-returning methods (reset/step/step_many/fast_forward/
+    /// observe) must authorize through this helper with the SAME post-init
+    /// mode that produces the response, so a first-step implicit reset can
+    /// never serve a mode the caller was not authorized for.
+    fn authorize_observation_mode(&self, mode: &ObservationMode) -> Result<()> {
+        self.authorize_operation(&OperationRequires {
+            mutation: None,
+            observation_visibility: Some(capability_for_observation_mode(mode)),
+            snapshot_export: false,
+            restore_import: false,
+            filesystem: false,
+            control: None,
+        })
+    }
+}
+
+/// Read-only view of the current global observation mode (no mutation).
+fn current_observation_mode(env: &AgentApp) -> ObservationMode {
+    env.world()
+        .get_resource::<ObservationConfig>()
+        .map(|c| c.mode.clone())
+        .unwrap_or_default()
+}
+
+/// Ensure the app is initialized, pinning the post-init mode to `mode` when a
+/// first-step implicit reset is required. Must run BEFORE authorization-mode
+/// selection is finalized by callers: after this returns, the mode that will
+/// produce the response is `mode`, so authorization must use `mode`.
+fn ensure_initialized_with_mode(env: &mut AgentApp, mode: &ObservationMode) -> Result<()> {
+    if env.has_reset() {
+        return Ok(());
+    }
+    env.reset_with_response(ResetOptions {
+        observation_mode: mode.clone(),
+        ..ResetOptions::default()
+    })?;
+    Ok(())
+}
+
+/// Step request-locally: advance the simulation, then re-render the
+/// observation in `mode` via [`collect_observation_with_mode`] without
+/// mutating the global [`ObservationConfig`]. Returns the patched response.
+fn step_with_request_mode(
+    env: &mut AgentApp,
+    action: AgentAction,
+    mode: &ObservationMode,
+) -> Result<Value> {
+    let mut response = env.step(action)?;
+    collect_observation_with_mode(env.world_mut(), mode.clone());
+    let refreshed = env
+        .world()
+        .get_resource::<LastStepResponse>()
+        .and_then(|last| last.0.clone());
+    if let Some(mut patched) = refreshed {
+        // Preserve step bookkeeping (reward/done/info/checksum/tick) from the
+        // just-executed step; only the observation rendering is request-local.
+        // `collect_observation_with_mode` rebuilds from identical world state,
+        // so these already match, but copy explicitly to guard against
+        // checkpoint-patching drift (e.g. terminal snapshots).
+        patched.tick = response.tick;
+        patched.reward = response.reward;
+        patched.done = response.done;
+        patched.truncated = response.truncated;
+        patched.info = response.info.clone();
+        patched.checksum = response.checksum.clone();
+        response.observation = patched.observation;
+    }
+    serde_json::to_value(response).map_err(anyhow::Error::from)
+}
+
+/// Observe request-locally without touching the global [`ObservationConfig`].
+fn observe_with_request_mode(env: &mut AgentApp, mode: &ObservationMode) -> Result<Value> {
+    ensure_initialized_with_mode(env, mode)?;
+    collect_observation_with_mode(env.world_mut(), mode.clone());
+    let observation = env
+        .world()
+        .get_resource::<LastStepResponse>()
+        .and_then(|last| last.0.clone().map(|r| r.observation))
+        .ok_or_else(|| anyhow!("observation produced no response"))?;
+    serde_json::to_value(observation).map_err(anyhow::Error::from)
+}
+
+/// Validate a restore/branch target tick: it must lie within recorded bounds
+/// (at or before the current tick) and the replay interval back to it must
+/// fit [`MAX_TICKS_PER_REQUEST`]. `fast_forward` enforces the same tick
+/// budget on the forward interval.
+fn validate_history_target(env: &AgentApp, target_tick: u64, what: &str) -> Result<()> {
+    let current = env.current_tick();
+    if target_tick > current {
+        return Err(anyhow!(
+            "{what} target tick {target_tick} is beyond recorded bounds (current tick {current})"
+        ));
+    }
+    if current.saturating_sub(target_tick) > MAX_TICKS_PER_REQUEST {
+        return Err(anyhow!(
+            "{what} interval {} exceeds limit {MAX_TICKS_PER_REQUEST}",
+            current - target_tick
+        ));
+    }
+    Ok(())
 }
 
 fn auth_error(message: impl Into<String>) -> JsonRpcError {
@@ -1560,13 +1710,17 @@ pub fn visual_capture_schema() -> Value {
     })
 }
 
-/// Single-simulation-owner HTTP server: each accepted connection is handled
-/// inline with bounded headers/body ([`MAX_HTTP_HEADER_BYTES`] /
-/// [`MAX_HTTP_BODY_BYTES`]), per-request action/tick budgets
-/// ([`MAX_ACTIONS_PER_REQUEST`] / [`MAX_TICKS_PER_REQUEST`]), a 30s
-/// read/write timeout, and an overall [`HTTP_REQUEST_DEADLINE`]. Only one
-/// `AgentApp` owner executes simulation work; concurrent connections queue on
-/// the listener and are served sequentially.
+/// Single-owner simulation over serial connections.
+///
+/// Only one `AgentApp` owner executes simulation work. Concurrent TCP
+/// connections queue on the listener and are served sequentially (no async
+/// executor; a full async refactor is out of scope). Every connection is
+/// bounded: HTTP reads/writes carry [`HTTP_READ_TIMEOUT`] /
+/// [`HTTP_WRITE_TIMEOUT`], each request carries an overall
+/// [`HTTP_REQUEST_DEADLINE`], and per-request action/tick budgets
+/// ([`MAX_ACTIONS_PER_REQUEST`] / [`MAX_TICKS_PER_REQUEST`], including
+/// `restore_tick`/`branch` history intervals) cap main-thread work so one
+/// connection cannot starve the pump.
 #[derive(Clone, Debug)]
 pub struct HttpRemoteServer {
     pub bind_addr: String,
@@ -1678,12 +1832,23 @@ impl HttpRemoteServer {
     }
 }
 
+/// Atomic lifecycle for a main-thread remote request.
+///
+/// `Queued(0) -> Running(1) -> Done(2)`, with `Cancelled(3)` reachable only
+/// from `Queued`. The pump claims `Queued -> Running` via `compare_exchange`;
+/// the HTTP side cancels `Queued -> Cancelled` on timeout. A timeout racing a
+/// claimed (`Running`) request reports `Unknown` execution with the operation
+/// id instead of `Cancelled`, because the mutation may still execute.
+pub const REQ_QUEUED: u32 = 0;
+pub const REQ_RUNNING: u32 = 1;
+pub const REQ_DONE: u32 = 2;
+pub const REQ_CANCELLED: u32 = 3;
+
 struct MainThreadRemoteRequest {
-    #[allow(dead_code)]
-    seq: u64,
+    op_id: u64,
     body: String,
     reply: mpsc::Sender<String>,
-    cancelled: Arc<AtomicBool>,
+    state: Arc<AtomicU32>,
 }
 
 #[derive(Resource)]
@@ -1703,6 +1868,10 @@ struct MainThreadRemoteState {
 /// that touches Bevy state is pumped from `Update` on Bevy's main thread. This
 /// keeps the winit/render runner alive and makes real primary-window captures
 /// work in remote visual sessions.
+///
+/// Single-owner + serial semantics (same as [`HttpRemoteServer`]): one
+/// simulation owner, connections served sequentially with per-connection
+/// deadlines ([`HTTP_REQUEST_DEADLINE`]) and tick budgets. No async refactor.
 pub struct BevyRemoteControlPlugin {
     listener: Arc<TcpListener>,
     bridge: JsonRpcBridge,
@@ -1783,7 +1952,11 @@ fn handle_main_thread_connection(
     security: &RemoteSecurity,
     stream: &mut TcpStream,
 ) -> Result<()> {
+    // Bounded per-connection deadline: the whole connection (read + pump +
+    // write) must fit inside HTTP_REQUEST_DEADLINE.
+    let deadline = Instant::now() + HTTP_REQUEST_DEADLINE;
     let request = read_http_request(stream)?;
+    check_deadline(deadline)?;
     if request.method == "OPTIONS" {
         return write_preflight_response(stream, &request, security);
     }
@@ -1825,6 +1998,7 @@ fn handle_main_thread_connection(
     if request.method == "POST" && request.path == "/rpc" {
         validate_http_rpc(&request, security)?;
         let response = request_on_main_thread(sender, request.body)?;
+        check_deadline(deadline)?;
         return write_http_response(stream, 200, "OK", "application/json", &response);
     }
     write_http_response(
@@ -1860,26 +2034,61 @@ fn request_on_main_thread_with_status(
     body: String,
 ) -> Result<(MainThreadRequestStatus, Result<String>)> {
     let (reply, receiver) = mpsc::channel();
-    let seq = MAIN_THREAD_SEQ.fetch_add(1, Ordering::Relaxed);
-    let cancelled = Arc::new(AtomicBool::new(false));
+    let op_id = MAIN_THREAD_SEQ.fetch_add(1, Ordering::Relaxed);
+    let state = Arc::new(AtomicU32::new(REQ_QUEUED));
     sender
         .send(MainThreadRemoteRequest {
-            seq,
+            op_id,
             body,
             reply,
-            cancelled: Arc::clone(&cancelled),
+            state: Arc::clone(&state),
         })
         .map_err(|_| anyhow!("Bevy main-thread remote pump has stopped"))?;
     match receiver.recv_timeout(HTTP_REQUEST_DEADLINE) {
         Ok(response) => Ok((MainThreadRequestStatus::Completed, Ok(response))),
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Mark cancelled so the pump skips execution instead of running
-            // the mutation late (no double-execute after timeout).
-            cancelled.store(true, Ordering::SeqCst);
-            Ok((
-                MainThreadRequestStatus::Cancelled,
-                Err(anyhow!("timed out waiting for Bevy main thread")),
-            ))
+            // Try to cancel before execution. Success => the pump will skip
+            // it (CancelledBeforeExecution). Failure => the pump already
+            // claimed Running, so execution outcome is unknown: report
+            // Unknown with the op id, NOT Cancelled.
+            match state.compare_exchange(
+                REQ_QUEUED,
+                REQ_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => Ok((
+                    MainThreadRequestStatus::Cancelled,
+                    Err(anyhow!(
+                        "timed out waiting for Bevy main thread (op {op_id} cancelled before execution)"
+                    )),
+                )),
+                Err(current) if current == REQ_RUNNING => Ok((
+                    MainThreadRequestStatus::Unknown,
+                    Err(anyhow!(
+                        "timed out waiting for Bevy main thread; execution state unknown for operation {op_id}"
+                    )),
+                )),
+                Err(current) if current == REQ_DONE => {
+                    // Finished racing the timeout; try a final non-blocking
+                    // receive before reporting.
+                    match receiver.try_recv() {
+                        Ok(response) => Ok((MainThreadRequestStatus::Completed, Ok(response))),
+                        Err(_) => Ok((
+                            MainThreadRequestStatus::Unknown,
+                            Err(anyhow!(
+                                "request finished racing timeout; execution state unknown for operation {op_id}"
+                            )),
+                        )),
+                    }
+                }
+                Err(_) => Ok((
+                    MainThreadRequestStatus::Cancelled,
+                    Err(anyhow!(
+                        "timed out waiting for Bevy main thread (op {op_id})"
+                    )),
+                )),
+            }
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => Ok((
             MainThreadRequestStatus::Rejected,
@@ -1899,19 +2108,34 @@ fn pump_main_thread_remote(world: &mut World) {
     };
 
     for request in requests {
-        // Sequence id + cancel flag: if the HTTP side timed out, skip
-        // execution so a mutation is never double-executed late.
-        if request.cancelled.load(Ordering::SeqCst) {
+        // Atomic claim Queued -> Running: if CAS fails the HTTP side already
+        // cancelled (timeout), so skip execution (CancelledBeforeExecution)
+        // and report instead of running the mutation late.
+        if request
+            .state
+            .compare_exchange(REQ_QUEUED, REQ_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            let _ = request.reply.send(error_json_rpc_response_fallback(
+                request.op_id,
+                "cancelled before execution",
+            ));
             continue;
         }
         #[cfg(feature = "visual")]
         if try_schedule_primary_window_capture(world, &request) {
+            request.state.store(REQ_DONE, Ordering::SeqCst);
             continue;
         }
-        if request.cancelled.load(Ordering::SeqCst) {
+        // Re-check after the (possibly expensive) visual-capture scheduling
+        // probe: a concurrent timeout-cancel can only have happened from
+        // Queued, but the claim above already moved us to Running, so a
+        // Cancelled here is impossible; keep the Running guard explicit.
+        if request.state.load(Ordering::SeqCst) == REQ_CANCELLED {
             continue;
         }
         let response = dispatch_json_on_world(world, &request.body);
+        request.state.store(REQ_DONE, Ordering::SeqCst);
         let _ = request.reply.send(response);
     }
 }
@@ -1978,6 +2202,7 @@ fn try_schedule_primary_window_capture(
     let bridge = world.resource::<MainThreadRemoteState>().bridge.clone();
     let authorization = bridge
         .require_capability(AgentCapability::VISUAL_CAPTURE)
+        .and_then(|()| bridge.require_capability(AgentCapability::FILESYSTEM))
         .and_then(|()| bridge.check_token(params.session_token.as_deref()));
     if let Err(error) = authorization {
         let _ = request.reply.send(error_json_rpc_response(
@@ -2076,7 +2301,7 @@ fn try_schedule_primary_window_capture(
         }
     };
     let reply = request.reply.clone();
-    let cancelled = Arc::clone(&request.cancelled);
+    let req_state = Arc::clone(&request.state);
     let id = rpc.id;
     let result_path = path.clone();
     let mut save = save_to_disk(path.clone());
@@ -2090,7 +2315,7 @@ fn try_schedule_primary_window_capture(
             // If the capture file never materialized/validated, report expiry.
             if verify_visual_capture_file(&result_path).is_err()
                 && started.elapsed() >= deadline
-                && !cancelled.load(Ordering::SeqCst)
+                && req_state.load(Ordering::SeqCst) != REQ_CANCELLED
             {
                 let _ = reply.send(error_json_rpc_response(
                     id,
@@ -2132,7 +2357,6 @@ fn try_schedule_primary_window_capture(
     true
 }
 
-#[cfg(feature = "visual")]
 fn error_json_rpc_response(id: Value, code: i32, message: String) -> String {
     serde_json::to_string(&JsonRpcResponse::Error {
         jsonrpc: "2.0",
@@ -2140,6 +2364,12 @@ fn error_json_rpc_response(id: Value, code: i32, message: String) -> String {
         error: JsonRpcError { code, message },
     })
     .expect("JSON-RPC error response is serializable")
+}
+
+/// Fallback error payload for pump-side cancellation when no request id is
+/// available (uses the operation id as the JSON-RPC id).
+fn error_json_rpc_response_fallback(op_id: u64, message: &str) -> String {
+    error_json_rpc_response(Value::from(op_id), RPC_INTERNAL_ERROR, message.to_string())
 }
 
 fn validate_websocket_handshake(request: &HttpRequest, security: &RemoteSecurity) -> Result<()> {
@@ -2485,6 +2715,7 @@ fn write_websocket_pong(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
 }
 
 fn write_websocket_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> Result<()> {
+    let _ = stream.set_write_timeout(Some(HTTP_WRITE_TIMEOUT));
     let mut frame = Vec::with_capacity(payload.len() + 10);
     frame.push(0x80 | opcode);
     if payload.len() < 126 {

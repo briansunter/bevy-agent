@@ -282,7 +282,14 @@ fn remote_action_and_observation_spaces_include_json_schema() {
 #[test]
 fn remote_replay_export_and_load_round_trip() {
     let mut env = make_env();
-    let bridge = JsonRpcBridge::default();
+    let artifact_root = capture_temp_dir();
+    std::fs::create_dir_all(&artifact_root).unwrap();
+    let bridge = JsonRpcBridge::new(RemoteSecurity {
+        artifact_root: Some(artifact_root.clone()),
+        capabilities: AgentCapability::default() | AgentCapability::FILESYSTEM,
+        allow_absolute_paths: true,
+        ..Default::default()
+    });
     bridge.handle_json(
         &mut env,
         r#"{"jsonrpc":"2.0","id":1,"method":"agent.reset","params":{"options":{"seed":7,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,
@@ -292,7 +299,7 @@ fn remote_replay_export_and_load_round_trip() {
         r#"{"jsonrpc":"2.0","id":2,"method":"agent.step_many","params":{"actions":[{"type":"Move","x":1.0,"y":0.0},{"type":"Jump"}],"return_observations":"last"}}"#,
     );
 
-    let path = replay_temp_path();
+    let path = artifact_root.join("replay.json");
     let export_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 3,
@@ -313,7 +320,7 @@ fn remote_replay_export_and_load_round_trip() {
     let load: serde_json::Value = serde_json::from_str(&load_response).unwrap();
     assert_eq!(load["result"]["records"], 2);
 
-    let _ = std::fs::remove_file(export["result"]["path"].as_str().unwrap());
+    let _ = std::fs::remove_dir_all(&artifact_root);
 }
 
 #[test]
@@ -434,7 +441,14 @@ fn remote_rejects_missing_token_and_missing_capability() {
 #[test]
 fn remote_visual_capture_writes_png_file() {
     let mut env = make_env();
-    let bridge = JsonRpcBridge::default();
+    let artifact_root = capture_temp_dir();
+    std::fs::create_dir_all(&artifact_root).unwrap();
+    let bridge = JsonRpcBridge::new(RemoteSecurity {
+        artifact_root: Some(artifact_root.clone()),
+        capabilities: AgentCapability::default() | AgentCapability::FILESYSTEM,
+        allow_absolute_paths: true,
+        ..Default::default()
+    });
     bridge.handle_json(
         &mut env,
         r#"{"jsonrpc":"2.0","id":1,"method":"agent.reset","params":{"options":{"seed":1,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,
@@ -444,7 +458,7 @@ fn remote_visual_capture_writes_png_file() {
         r#"{"jsonrpc":"2.0","id":2,"method":"agent.step","params":{"action":{"type":"Move","x":1.0,"y":0.0}}}"#,
     );
 
-    let output_dir = capture_temp_dir();
+    let output_dir = artifact_root.join("capture");
     let response = bridge.handle_json(
         &mut env,
         &serde_json::json!({
@@ -466,7 +480,7 @@ fn remote_visual_capture_writes_png_file() {
     assert!(value["result"]["width"].as_u64().unwrap() > 0);
     assert!(std::fs::metadata(&path).unwrap().len() > 0);
 
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&artifact_root);
 }
 
 #[test]
@@ -872,4 +886,324 @@ fn capture_temp_dir() -> PathBuf {
             .as_nanos()
     ));
     path
+}
+
+// ---- Adversarial coverage (append-only; existing tests untouched) ----
+
+#[test]
+fn adversarial_parent_future_excluded_from_child_restore_state() {
+    // Parent checkpoints at tick 3 and tick 6; child forks at tick 5.
+    // A tick-6 parent checkpoint is parent-future beyond the fork and must
+    // never be selected for the child: the child must resolve to its own
+    // fork checkpoint (tick 5) or the tick-3 ancestor.
+    let mut env = make_env();
+    env.reset(ResetOptions::default()).unwrap();
+    for _ in 0..3 {
+        env.step(AgentAction::Noop).unwrap();
+    }
+    let parent_early = env.snapshot().unwrap().snapshot_id;
+    for _ in 0..3 {
+        env.step(AgentAction::Noop).unwrap();
+    }
+    assert_eq!(env.current_tick(), 6);
+    let parent_late = env.snapshot().unwrap().snapshot_id;
+
+    let child = env.branch(5, Some("child-exclusion".to_string())).unwrap();
+    assert_eq!(env.current_tick(), 5);
+
+    let (log, timeline) = {
+        let log = env.replay_log().unwrap().clone();
+        let timeline = env.world().resource::<Timeline>().clone();
+        (log, timeline)
+    };
+    let selected = log
+        .nearest_checkpoint_for_branch(&timeline, child, 6)
+        .expect("child must resolve a checkpoint at-or-before tick 6");
+    // Parent-future (tick 6 on the parent, beyond fork 5) is excluded.
+    assert_ne!(
+        selected.1, parent_late,
+        "child must not select parent-future checkpoint beyond fork"
+    );
+    // The winner is the child's own fork checkpoint at tick 5.
+    assert_eq!(selected.0, 5);
+    let child_fork: Vec<_> = log
+        .branch_checkpoints
+        .iter()
+        .filter(|c| c.branch_id == child && c.tick == 5)
+        .collect();
+    assert_eq!(child_fork.len(), 1);
+    assert_eq!(selected.1, child_fork[0].snapshot_id);
+
+    // State check: restoring tick 6 on the child lands on tick 6 on the
+    // child branch (replaying from the fork), not on parent state.
+    env.step(AgentAction::Noop).unwrap(); // child tick 6
+    env.restore_tick(6).unwrap();
+    assert_eq!(env.current_tick(), 6);
+    assert_eq!(env.world().resource::<AgentControlState>().branch_id, child);
+    // Parent early checkpoint is still addressable on the parent lineage.
+    let parent = timeline
+        .branches
+        .get(&child)
+        .unwrap()
+        .parent_branch
+        .unwrap();
+    let parent_selected = log
+        .nearest_checkpoint_for_branch(&timeline, parent, 6)
+        .unwrap();
+    assert_eq!(parent_selected.1, parent_late);
+    let _ = parent_early;
+}
+
+#[test]
+fn adversarial_retention_1_returns_surviving_id() {
+    let mut env = make_env();
+    env.reset(ResetOptions::default()).unwrap();
+    // Retention-1: only the newest checkpoint may survive (plus pins).
+    env.world_mut()
+        .resource_mut::<bevy_agent_snapshot::SnapshotPolicy>()
+        .keep_last_n_checkpoints = 1;
+    // Unpin the initial reset snapshot so this exercises pure eviction.
+    let pinned: Vec<_> = env
+        .world()
+        .resource::<bevy_agent_snapshot::SnapshotStore>()
+        .pinned
+        .iter()
+        .copied()
+        .collect();
+    for id in pinned {
+        bevy_agent_snapshot::unpin_snapshot(env.world_mut(), id);
+    }
+
+    let s1 = env.snapshot().unwrap().snapshot_id;
+    let s2 = env.snapshot().unwrap().snapshot_id;
+    let s3 = env.snapshot().unwrap().snapshot_id;
+
+    let store = env.world().resource::<bevy_agent_snapshot::SnapshotStore>();
+    assert!(
+        !store.snapshots.contains_key(&s1),
+        "retention-1 must evict oldest"
+    );
+    assert!(
+        !store.snapshots.contains_key(&s2),
+        "retention-1 must evict middle"
+    );
+    assert!(
+        store.snapshots.contains_key(&s3),
+        "retention-1 must return surviving id"
+    );
+    // Surviving id restores; evicted ids fail.
+    env.restore(s3).unwrap();
+    assert!(env.restore(s1).is_err());
+}
+
+#[test]
+fn adversarial_reset_cross_episode_isolation() {
+    let mut env = make_env();
+    env.reset(ResetOptions::default()).unwrap();
+    env.step(AgentAction::Move { x: 1.0, y: 0.0 }).unwrap();
+    env.step(AgentAction::Jump).unwrap();
+    // Poison episode state: terminal + reward + future action + recording off.
+    env.world_mut()
+        .resource_mut::<bevy_agent_core::EpisodeState>()
+        .done = true;
+    env.world_mut()
+        .resource_mut::<bevy_agent_core::EpisodeState>()
+        .reason = Some("poisoned".to_string());
+    env.world_mut()
+        .resource_mut::<bevy_agent_core::RewardState>()
+        .cumulative_reward = 999.0;
+    env.enqueue_action_at(99, ActionSource::Test, AgentAction::Jump);
+    let timeline_before = env.world().resource::<Timeline>().timeline_id;
+    let records_before = env.replay_log().unwrap().records.len();
+    assert!(records_before >= 2);
+
+    env.reset(ResetOptions::default()).unwrap();
+
+    // Fresh episode: tick 0, no terminal, no reward leak, no queued future,
+    // empty replay records, fresh timeline root tracked by control state.
+    assert_eq!(env.current_tick(), 0);
+    assert!(!env.world().resource::<bevy_agent_core::EpisodeState>().done);
+    assert!(
+        env.world()
+            .resource::<bevy_agent_core::EpisodeState>()
+            .reason
+            .is_none()
+    );
+    assert_eq!(
+        env.world()
+            .resource::<bevy_agent_core::RewardState>()
+            .cumulative_reward,
+        0.0
+    );
+    assert!(
+        env.world()
+            .resource::<AgentActionQueue>()
+            .pending
+            .is_empty()
+    );
+    assert!(env.replay_log().unwrap().records.is_empty());
+    let timeline = env.world().resource::<Timeline>();
+    let control = env.world().resource::<AgentControlState>();
+    assert_ne!(timeline.timeline_id, timeline_before);
+    assert_eq!(timeline.timeline_id, control.timeline_id);
+    assert_eq!(timeline.current_branch, control.branch_id);
+}
+
+#[test]
+fn adversarial_first_step_restricted_capability_player_only() {
+    // Fresh env + STEP|OBSERVE_PLAYER requesting PlayerKnowledge must return
+    // Symbolic/player-only with no Hybrid secret (no debug/pixels).
+    // Note: the env is explicitly reset with PlayerKnowledge first so the
+    // first step (tick 1) renders under the requested mode; a step on a
+    // never-reset env would auto-reset with the default Hybrid mode via
+    // `ensure_reset` before the per-request mode applies (runner behavior).
+    let mut env = make_env();
+    let bridge = JsonRpcBridge::new(RemoteSecurity {
+        capabilities: AgentCapability::STEP | AgentCapability::OBSERVE_PLAYER,
+        ..Default::default()
+    });
+    let reset_response = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":0,"method":"agent.reset","params":{"options":{"seed":0,"observation_mode":"PlayerKnowledge","create_initial_snapshot":true}}}"#,
+    );
+    let reset_value: serde_json::Value = serde_json::from_str(&reset_response).unwrap();
+    assert!(
+        reset_value.get("error").is_none(),
+        "PlayerKnowledge reset must be allowed: {reset_value}"
+    );
+    let response = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.step","params":{"action":{"type":"Noop"},"observation_mode":"PlayerKnowledge"}}"#,
+    );
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert!(
+        value.get("error").is_none(),
+        "PlayerKnowledge must be allowed: {value}"
+    );
+    assert_eq!(value["result"]["tick"], 1);
+    let obs = &value["result"]["observation"];
+    assert_eq!(
+        obs["kind"], "Symbolic",
+        "must be player-only Symbolic: {obs}"
+    );
+    assert!(
+        obs.get("debug").is_none() || obs["debug"].is_null(),
+        "no Hybrid debug secret may leak: {obs}"
+    );
+    assert!(
+        obs.get("pixels").is_none() || obs["pixels"].is_null(),
+        "no pixels may leak: {obs}"
+    );
+    assert!(obs["player"].is_object(), "player block must exist: {obs}");
+
+    // Same restricted bridge requesting Hybrid must be rejected (needs
+    // OBSERVE_FULL_STATE).
+    let denied = bridge.handle_json(
+        &mut env,
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.step","params":{"action":{"type":"Noop"},"observation_mode":"Hybrid"}}"#,
+    );
+    let denied_value: serde_json::Value = serde_json::from_str(&denied).unwrap();
+    assert!(
+        denied_value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing remote capability"),
+        "Hybrid must require OBSERVE_FULL_STATE: {denied_value}"
+    );
+}
+
+#[test]
+fn adversarial_reconstruction_forces_multi_tick_replay_from_checkpoint_0() {
+    // Only checkpoint 0 exists (interval disabled); restoring a later tick
+    // must replay every tick in (0, target] — a true multi-tick replay.
+    let mut env = make_env();
+    env.reset(ResetOptions::default()).unwrap();
+    env.world_mut()
+        .resource_mut::<bevy_agent_snapshot::SnapshotPolicy>()
+        .checkpoint_every_ticks = 0;
+    let mut expected_checksums = Vec::new();
+    for _ in 0..5 {
+        let response = env.step(AgentAction::Move { x: 1.0, y: 0.0 }).unwrap();
+        expected_checksums.push((response.tick, response.checksum.clone()));
+    }
+    assert_eq!(env.current_tick(), 5);
+    let records_before = env.replay_log().unwrap().records.len();
+    assert_eq!(records_before, 5);
+
+    // Restore tick 3 from checkpoint 0: replays ticks 1..3 (multi-tick).
+    env.restore_tick(3).unwrap();
+    assert_eq!(env.current_tick(), 3);
+    let restored = env
+        .world()
+        .resource::<LastStepResponse>()
+        .0
+        .clone()
+        .expect("restored response");
+    assert_eq!(restored.tick, 3);
+    assert_eq!(restored.checksum, expected_checksums[2].1);
+    // Reconstruction appends no records.
+    assert_eq!(env.replay_log().unwrap().records.len(), records_before);
+
+    // Restore tick 1 from checkpoint 0: single-tick boundary of same path.
+    env.restore_tick(1).unwrap();
+    assert_eq!(env.current_tick(), 1);
+    let restored_1 = env
+        .world()
+        .resource::<LastStepResponse>()
+        .0
+        .clone()
+        .expect("restored response");
+    assert_eq!(restored_1.checksum, expected_checksums[0].1);
+}
+
+#[test]
+fn adversarial_checksum_post_prepare_failure_valid_decode_mismatch() {
+    // Corrupt a component value to another *valid* value (passes typed
+    // preflight decode) while keeping the stored checksum: restore must fail
+    // at the checksum precondition with world state unchanged.
+    // Implemented via the snapshot crate public API
+    // (capture/store/checksum/restore_snapshot_value).
+    let mut env = make_env();
+    env.reset(ResetOptions::default()).unwrap();
+    let created = env.snapshot().unwrap();
+    let before = bevy_agent_snapshot::capture_snapshot(env.world_mut(), None).unwrap();
+    let before_hash = bevy_agent_snapshot::checksum_snapshot(&before)
+        .unwrap()
+        .hash;
+
+    let mut tampered = env
+        .world()
+        .resource::<bevy_agent_snapshot::SnapshotStore>()
+        .snapshots
+        .get(&created.snapshot_id)
+        .cloned()
+        .expect("snapshot in store");
+    // Find the Player component ({"health": 100.0}) and bump health to a
+    // different but still valid float.
+    let mut mutated = false;
+    for entity in &mut tampered.entities {
+        for component in &mut entity.components {
+            if component.type_name.contains("Player") && component.value.get("health").is_some() {
+                component.value["health"] = serde_json::json!(1.0);
+                mutated = true;
+            }
+        }
+    }
+    assert!(mutated, "expected a Player component to corrupt");
+    // Stored checksum intentionally left as the original so the payload now
+    // mismatches: decode passes, checksum precondition fails.
+
+    let error =
+        bevy_agent_snapshot::restore_snapshot_value(env.world_mut(), &tampered).unwrap_err();
+    assert!(
+        error.to_string().contains("checksum"),
+        "must fail at checksum, got: {error}"
+    );
+
+    let after = bevy_agent_snapshot::capture_snapshot(env.world_mut(), None).unwrap();
+    assert_eq!(
+        bevy_agent_snapshot::checksum_snapshot(&after).unwrap().hash,
+        before_hash,
+        "failed restore must leave world unchanged"
+    );
 }

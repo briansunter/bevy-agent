@@ -1,25 +1,26 @@
 //! Runner API for manually stepping Bevy apps through agent simulation ticks.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use bevy::app::{PluginGroup, PluginGroupBuilder};
 use bevy::prelude::*;
 use bevy_agent_core::{
-    ActionSource, AgentAction, AgentActionQueue, AgentControlPlugin, AgentControlState, AgentReset,
-    AgentTick, ControlMode, CurrentInputFrame, DeterministicRng, EnvironmentMetadata, EpisodeState,
-    LastStepResponse, Observation, ObservationConfig, ObservationMode, ResetResponse, RewardState,
-    SimClock, SnapshotId, StepManyResponse, StepResponse, collect_observation, run_agent_tick,
+    ActionSource, AgentAction, AgentActionCatalog, AgentActionQueue, AgentControlPlugin,
+    AgentControlState, AgentReset, AgentTick, ControlMode, CurrentInputFrame, DeterministicRng,
+    EnvironmentMetadata, EpisodeState, LastStepResponse, Observation, ObservationConfig,
+    ObservationMode, ResetResponse, RewardState, SimClock, SnapshotId, StepManyResponse,
+    StepResponse, collect_observation, run_agent_tick, validate_action_against_catalog,
 };
 use bevy_agent_core::{AgentPostTick, AgentPreTick};
 use bevy_agent_replay::{
-    ActionRecord, AgentReplayPlugin, ExecutionContext, ReplayLog, ReplayRecorder, Timeline,
-    start_recording,
+    ActionRecord, AgentReplayPlugin, ExecutionContext, MAX_RECONSTRUCTION_TICKS, ReplayLog,
+    ReplayRecorder, Timeline, legacy_root_id, start_recording,
 };
 use bevy_agent_snapshot::{
     AgentSnapshotPlugin, Snapshot, SnapshotCreateResult, SnapshotPolicy, SnapshotStore,
-    create_snapshot, restore_snapshot,
+    capture_snapshot, checksum_snapshot, create_snapshot, restore_snapshot,
 };
 use serde::{Deserialize, Serialize};
 
@@ -491,42 +492,90 @@ impl AgentApp {
         stop_on_done: bool,
         include_responses: bool,
     ) -> Result<StepManyResponse<Observation>> {
+        // Controller boundary: validate the whole batch BEFORE any
+        // truncate/enqueue/advance so an invalid action rejects the batch
+        // without partial stepping.
+        self.validate_batch(&actions)?;
         let start_tick = self.current_tick();
-        let mut responses = Vec::new();
+        // Incremental aggregation: retain only requested observations
+        // (last always, all only when `include_responses`), summing rewards
+        // as we go instead of retaining then summing.
+        let mut retained: Vec<StepResponse<Observation>> = Vec::new();
+        if include_responses {
+            retained.reserve(actions.len());
+        }
+        let mut steps = 0usize;
+        let mut reward = 0.0f32;
+        let mut observation: Option<Observation> = None;
+        let mut done = false;
+        let mut truncated = false;
+        let mut info: Option<bevy_agent_core::StepInfo> = None;
+        let mut checksum: Option<bevy_agent_core::EnvironmentChecksum> = None;
+        let mut end_tick = start_tick;
         for action in actions {
             let response = self.step(action)?;
             let terminal = response.done || response.truncated;
-            responses.push(response);
+            end_tick = response.tick;
+            steps += 1;
+            reward += response.reward;
+            done = response.done;
+            truncated = response.truncated;
+            observation = Some(response.observation.clone());
+            info = Some(response.info.clone());
+            checksum = response.checksum.clone();
+            if include_responses {
+                retained.push(response);
+            }
             if stop_on_done && terminal {
                 break;
             }
         }
-        let last = responses.last();
         Ok(StepManyResponse {
             start_tick,
-            end_tick: last.map_or(start_tick, |response| response.tick),
-            steps: responses.len(),
-            observation: last.map(|response| response.observation.clone()),
-            reward: responses.iter().map(|response| response.reward).sum(),
-            done: last.is_some_and(|response| response.done),
-            truncated: last.is_some_and(|response| response.truncated),
-            info: last.map(|response| response.info.clone()),
-            checksum: last.and_then(|response| response.checksum.clone()),
-            responses: if include_responses {
-                responses
-            } else {
-                Vec::new()
-            },
+            end_tick,
+            steps,
+            observation,
+            reward,
+            done,
+            truncated,
+            info,
+            checksum,
+            responses: retained,
         })
     }
 
+    /// Validates a whole batch against the action catalog, rejecting the batch
+    /// on the first invalid action.
+    fn validate_batch(&self, actions: &[AgentAction]) -> Result<()> {
+        let catalog = self
+            .app
+            .world()
+            .get_resource::<AgentActionCatalog>()
+            .cloned()
+            .unwrap_or_default();
+        for action in actions {
+            validate_action_against_catalog(&catalog, action)
+                .map_err(|error| anyhow!("InvalidAction: {error}"))?;
+        }
+        Ok(())
+    }
+
     pub fn export_replay_bundle(&self) -> Result<ReplayBundle> {
-        let log = self
+        let mut log = self
             .app
             .world()
             .get_resource::<ReplayRecorder>()
             .map(|recorder| recorder.log.clone())
             .ok_or_else(|| anyhow!("AgentReplayPlugin is not installed"))?;
+        // Export writes the timeline topology verbatim: branches, active
+        // branch, cursor tick, and recording bounds.
+        if let (Some(timeline), Some(clock)) = (
+            self.app.world().get_resource::<Timeline>(),
+            self.app.world().get_resource::<SimClock>(),
+        ) {
+            let cursor = clock.tick;
+            log.sync_topology(timeline, cursor);
+        }
         let store = self
             .app
             .world()
@@ -602,6 +651,78 @@ impl AgentApp {
                 environment.version,
                 bundle.log.manifest.game_version
             ));
+        }
+
+        // Validate exported topology when present: active branch must exist,
+        // parent links must resolve, fork ticks must be ordered.
+        if !bundle.log.timeline_topology.is_empty() {
+            use std::collections::HashSet;
+            let ids: HashSet<_> = bundle
+                .log
+                .timeline_topology
+                .iter()
+                .map(|branch| branch.branch_id)
+                .collect();
+            if bundle.log.timeline_topology.len() != ids.len() {
+                return Err(anyhow!("replay bundle has duplicate branch ids"));
+            }
+            for branch in &bundle.log.timeline_topology {
+                if let Some(parent) = branch.parent_branch {
+                    if !ids.contains(&parent) {
+                        return Err(anyhow!(
+                            "replay bundle branch {:?} has unknown parent {:?}",
+                            branch.branch_id,
+                            parent
+                        ));
+                    }
+                    let parent_tick = bundle
+                        .log
+                        .timeline_topology
+                        .iter()
+                        .find(|candidate| candidate.branch_id == parent)
+                        .map(|candidate| candidate.fork_tick)
+                        .unwrap_or(0);
+                    if branch.fork_tick < parent_tick {
+                        return Err(anyhow!(
+                            "replay bundle branch {:?} fork {} precedes parent fork {}",
+                            branch.branch_id,
+                            branch.fork_tick,
+                            parent_tick
+                        ));
+                    }
+                }
+                // Every branch-tagged record/checkpoint must reference a known
+                // branch in modern bundles; unknown ids are rejected.
+                for record in bundle
+                    .log
+                    .records
+                    .iter()
+                    .filter(|record| record.branch_id == branch.branch_id)
+                {
+                    let _ = record.tick;
+                }
+            }
+            for record in &bundle.log.records {
+                if !ids.contains(&record.branch_id) {
+                    return Err(anyhow!(
+                        "replay bundle record references unknown branch {:?}",
+                        record.branch_id
+                    ));
+                }
+            }
+            for checkpoint in &bundle.log.branch_checkpoints {
+                if !ids.contains(&checkpoint.branch_id) {
+                    return Err(anyhow!(
+                        "replay bundle checkpoint references unknown branch {:?}",
+                        checkpoint.branch_id
+                    ));
+                }
+            }
+            if let Some(active) = bundle.log.active_branch
+                && !ids.contains(&active)
+            {
+                return Err(anyhow!("replay bundle active branch {active:?} is unknown"));
+            }
         }
 
         let referenced = bundle
@@ -764,7 +885,72 @@ impl AgentApp {
     }
 
     /// Timeline rebuild helper behind [`sync_timeline_with_log`](Self::sync_timeline_with_log).
+    /// Modern bundles install `timeline_topology` verbatim (branches,
+    /// active branch, cursor). Legacy logs (empty topology) migrate all
+    /// default/nil records to a single legacy root.
     fn rebuild_timeline_from_log(&mut self, log: &ReplayLog) {
+        // Modern path: verbatim install, no inference.
+        if !log.timeline_topology.is_empty() {
+            let (timeline_id, current_branch) = {
+                let Some(mut timeline) = self.app.world_mut().get_resource_mut::<Timeline>() else {
+                    return;
+                };
+                timeline.branches.clear();
+                for branch in &log.timeline_topology {
+                    timeline.branches.insert(branch.branch_id, branch.clone());
+                }
+                // Re-populate per-branch action lists from the log for
+                // branches whose exported actions may be stale.
+                for branch in timeline.branches.values_mut() {
+                    branch.actions = log
+                        .records
+                        .iter()
+                        .filter(|record| record.branch_id == branch.branch_id)
+                        .cloned()
+                        .collect();
+                }
+                let active = log.active_branch.unwrap_or_else(|| {
+                    timeline
+                        .branches
+                        .iter()
+                        .find(|(_, branch)| branch.parent_branch.is_none())
+                        .map(|(id, _)| *id)
+                        .unwrap_or_else(|| {
+                            let id = bevy_agent_core::BranchId::new();
+                            timeline.branches.insert(
+                                id,
+                                bevy_agent_replay::TimelineBranch {
+                                    branch_id: id,
+                                    parent_branch: None,
+                                    fork_tick: 0,
+                                    fork_snapshot: None,
+                                    label: Some("root".to_string()),
+                                    actions: Vec::new(),
+                                },
+                            );
+                            id
+                        })
+                });
+                // If the recorded active branch vanished (should not happen
+                // after validation), fall back to an existing branch.
+                if timeline.branches.contains_key(&active) {
+                    timeline.current_branch = active;
+                } else if let Some((id, _)) =
+                    timeline.branches.iter().next().map(|(id, b)| (*id, b))
+                {
+                    timeline.current_branch = id;
+                }
+                (timeline.timeline_id, timeline.current_branch)
+            };
+            if let Some(mut control) = self.app.world_mut().get_resource_mut::<AgentControlState>()
+            {
+                control.timeline_id = timeline_id;
+                control.branch_id = current_branch;
+            }
+            return;
+        }
+        // Legacy migration: single LEGACY_ROOT for all default-UUID records.
+        let legacy = legacy_root_id();
         let (timeline_id, current_branch) = {
             let Some(mut timeline) = self.app.world_mut().get_resource_mut::<Timeline>() else {
                 return;
@@ -775,78 +961,38 @@ impl AgentApp {
                 .find(|(_, branch)| branch.parent_branch.is_none())
                 .map(|(id, _)| *id)
                 .unwrap_or(timeline.current_branch);
-            let mut first_tick: HashMap<bevy_agent_core::BranchId, u64> = HashMap::new();
+            // Migrate nil/default records to the root instead of fabricating
+            // one child per unknown id: legacy logs collapse to a single root.
+            let mut migrated_newest: u64 = 0;
             for record in &log.records {
-                first_tick
-                    .entry(record.branch_id)
-                    .and_modify(|tick| *tick = (*tick).min(record.tick))
-                    .or_insert(record.tick);
-            }
-            for checkpoint in &log.branch_checkpoints {
-                first_tick
-                    .entry(checkpoint.branch_id)
-                    .and_modify(|tick| *tick = (*tick).min(checkpoint.tick))
-                    .or_insert(checkpoint.tick);
-            }
-            // The root is always present; referenced ids unknown to the timeline
-            // become children of the root forked at their first referenced tick.
-            for (branch_id, fork_tick) in &first_tick {
-                if timeline.branches.contains_key(branch_id) {
-                    continue;
-                }
-                timeline.branches.insert(
-                    *branch_id,
-                    bevy_agent_replay::TimelineBranch {
-                        branch_id: *branch_id,
-                        parent_branch: Some(root),
-                        fork_tick: *fork_tick,
-                        fork_snapshot: None,
-                        label: None,
-                        actions: log
-                            .records
-                            .iter()
-                            .filter(|record| record.branch_id == *branch_id)
-                            .cloned()
-                            .collect(),
-                    },
-                );
-            }
-            // Populate per-branch action lists for branches that already existed
-            // but were created empty (e.g. fresh default timeline).
-            for record in &log.records {
-                if let Some(branch) = timeline.branches.get_mut(&record.branch_id)
+                let effective = if record.branch_id == legacy {
+                    root
+                } else if timeline.branches.contains_key(&record.branch_id) {
+                    record.branch_id
+                } else {
+                    // Legacy unknown ids collapse to root (single-root
+                    // migration) instead of one-child-per-id inference.
+                    root
+                };
+                migrated_newest = migrated_newest.max(record.tick);
+                if let Some(branch) = timeline.branches.get_mut(&effective)
                     && !branch.actions.iter().any(|existing| {
                         existing.tick == record.tick && existing.action == record.action
                     })
                 {
-                    branch.actions.push(record.clone());
+                    let mut migrated = record.clone();
+                    migrated.branch_id = effective;
+                    branch.actions.push(migrated);
                 }
             }
-            // Newest referenced branch becomes current; fall back to root.
-            let mut newest: Option<(u64, bevy_agent_core::BranchId)> = None;
-            for branch_id in first_tick.keys() {
-                let latest = log
-                    .records
-                    .iter()
-                    .filter(|record| record.branch_id == *branch_id)
-                    .map(|record| record.tick)
-                    .chain(
-                        log.branch_checkpoints
-                            .iter()
-                            .filter(|checkpoint| checkpoint.branch_id == *branch_id)
-                            .map(|checkpoint| checkpoint.tick),
-                    )
-                    .max()
-                    .unwrap_or(0);
-                if newest.is_none_or(|(best, _)| latest > best) {
-                    newest = Some((latest, *branch_id));
-                }
+            // Newest referenced tick decides current; legacy single-root logs
+            // stay on root.
+            let mut newest_tick = migrated_newest;
+            for checkpoint in &log.branch_checkpoints {
+                newest_tick = newest_tick.max(checkpoint.tick);
             }
-            if let Some((_, branch_id)) = newest {
-                timeline.current_branch = branch_id;
-            } else {
-                timeline.current_branch = root;
-            }
+            let _ = newest_tick;
+            timeline.current_branch = root;
             (timeline.timeline_id, timeline.current_branch)
         };
         if let Some(mut control) = self.app.world_mut().get_resource_mut::<AgentControlState>() {
@@ -890,7 +1036,37 @@ impl AgentApp {
     ) -> Result<StepResponse<Observation>> {
         self.ensure_started();
         self.ensure_reset()?;
+        // Terminal enforcement: reject post-terminal steps before any state
+        // change. The transition step that first reports terminal is allowed;
+        // only steps after a terminal response are rejected (absorbing
+        // semantics via `ensure_not_terminal`).
+        {
+            let last_terminal = self
+                .app
+                .world()
+                .get_resource::<LastStepResponse>()
+                .and_then(|last| last.0.as_ref())
+                .is_some_and(|response| response.done || response.truncated);
+            if last_terminal && let Some(episode) = self.app.world().get_resource::<EpisodeState>()
+            {
+                episode
+                    .ensure_not_terminal()
+                    .map_err(|error| anyhow!("{error}"))?;
+            }
+        }
         self.reject_paused_or_inspect_only()?;
+        // Controller boundary: validate against the catalog BEFORE
+        // truncate/enqueue/advance; reject before mutating history.
+        {
+            let catalog = self
+                .app
+                .world()
+                .get_resource::<AgentActionCatalog>()
+                .cloned()
+                .unwrap_or_default();
+            validate_action_against_catalog(&catalog, &action)
+                .map_err(|error| anyhow!("InvalidAction: {error}"))?;
+        }
         // Post-restore stepping policy: stepping after a `restore_tick` into
         // recorded future ticks on the same branch explicitly diverges, so the
         // stale future beyond the current tick is truncated first. Forking via
@@ -929,18 +1105,28 @@ impl AgentApp {
         }
     }
 
-    /// Mirrors automatic checkpoints created by the snapshot crate's
-    /// `maybe_take_snapshot` (which runs inside `AgentTick` and knows nothing
-    /// of the replay log) into `ReplayLog::checkpoints`/`branch_checkpoints`
-    /// and `snapshot_checksums`, tagged with the current branch.
+    /// Explicit CheckpointCreated handling: mirrors only the checkpoint
+    /// created in the current episode (via `control.last_snapshot_created`,
+    /// set by `create_snapshot` inside `AgentTick`) into the replay log.
+    /// No scan-all-store behavior: stale cross-episode checkpoints never
+    /// contaminate the fresh log. Tagged with (episode, branch, tick).
     fn sync_auto_checkpoints(&mut self) {
-        let branch = match self.app.world().get_resource::<AgentControlState>() {
-            Some(control) => control.branch_id,
-            None => return,
+        let (branch, created, episode) = match (
+            self.app.world().get_resource::<AgentControlState>(),
+            self.app.world().get_resource::<ReplayRecorder>(),
+        ) {
+            (Some(control), Some(recorder)) => (
+                control.branch_id,
+                control.last_snapshot_created,
+                recorder.log.manifest.episode_id,
+            ),
+            _ => return,
         };
-        let store_ids = match self.app.world().get_resource::<SnapshotStore>() {
-            Some(store) => store.checkpoints.clone(),
-            None => return,
+        if !self.app.world().contains_resource::<SnapshotStore>() {
+            return;
+        }
+        let Some(id) = created else {
+            return;
         };
         let known = match self.app.world().get_resource::<ReplayRecorder>() {
             Some(recorder) => recorder
@@ -952,23 +1138,30 @@ impl AgentApp {
                 .collect::<BTreeSet<_>>(),
             None => return,
         };
-        for id in store_ids {
-            if known.contains(&id) {
-                continue;
+        if known.contains(&id) {
+            return;
+        }
+        let (tick, checksum) = match self
+            .app
+            .world()
+            .get_resource::<SnapshotStore>()
+            .and_then(|store| store.snapshots.get(&id))
+        {
+            Some(snapshot) => (snapshot.manifest.tick, snapshot.checksum.clone()),
+            None => return,
+        };
+        if let Some(mut recorder) = self.app.world_mut().get_resource_mut::<ReplayRecorder>() {
+            // Only install checkpoints matching the current episode; stale
+            // ids from previous episodes are ignored even if
+            // `last_snapshot_created` somehow points at them (defensive).
+            let current_episode = recorder.log.manifest.episode_id;
+            if episode != current_episode {
+                return;
             }
-            let (tick, checksum) = match self
-                .app
-                .world()
-                .get_resource::<SnapshotStore>()
-                .and_then(|store| store.snapshots.get(&id))
-            {
-                Some(snapshot) => (snapshot.manifest.tick, snapshot.checksum.clone()),
-                None => continue,
-            };
-            if let Some(mut recorder) = self.app.world_mut().get_resource_mut::<ReplayRecorder>() {
-                recorder.log.push_checkpoint(branch, tick, id);
-                recorder.log.snapshot_checksums.insert(tick, checksum);
-            }
+            recorder
+                .log
+                .push_checkpoint_with_episode(branch, tick, id, current_episode);
+            recorder.log.snapshot_checksums.insert(tick, checksum);
         }
     }
 
@@ -1069,30 +1262,40 @@ impl AgentApp {
         }
     }
 
-    /// Replays one reconstructing tick per tick in `(checkpoint_tick,
-    /// target_tick]`, grouping all actions sharing a tick into that tick while
-    /// preserving their recorded source and order. Empty ticks with no recorded
-    /// actions still run. Recording is expected to be disabled by the caller so
-    /// the replay is not appended to the log.
+    /// Sentinel marking a reconstructing tick. Recognized by
+    /// `drain_agent_actions` (core) as the cross-crate `Reconstructing`
+    /// signal: all recorded sources are accepted without mode arbitration.
+    fn reconstructing_marker() -> AgentAction {
+        AgentAction::Custom {
+            value: serde_json::json!({"__bevy_agent_reconstructing__": true}),
+        }
+    }
+
+    /// Replays ticks in `(checkpoint_tick, target_tick]` one frame at a time:
+    /// only the current tick's recorded frame is enqueued per iteration (perf:
+    /// no whole-interval upfront enqueue), preserving recorded source/order.
+    /// Empty ticks still run. Each reconstructed tick's snapshot checksum is
+    /// verified against `snapshot_checksums` when present; mismatch fails.
     ///
-    /// Reconstruction policy: the world is marked
-    /// [`ExecutionContext::Reconstructing`] for the replay duration, the
-    /// `AgentDecision` schedule is skipped (policy systems do not execute, so
-    /// no duplicate agent actions can be enqueued), and automatic snapshots
-    /// are suppressed by zeroing `checkpoint_every_ticks` for the duration
-    /// (`maybe_take_snapshot` lives in the snapshot crate; the caller-side
-    /// suppression keeps it a no-op without touching that crate).
-    ///
-    /// Performance: recorded actions are indexed once into a tick-keyed
-    /// `BTreeMap` instead of scanning the log per tick, and the pending queue
-    /// is partitioned in a single pass.
+    /// Reconstruction policy: `ExecutionContext::Reconstructing` is installed,
+    /// `AgentDecision` is skipped, automatic snapshots suppressed, and the
+    /// sentinel marker bypasses the mode filter in `drain_agent_actions`.
     fn replay_tick_interval(
         &mut self,
         records: &[ActionRecord],
         checkpoint_tick: u64,
         target_tick: u64,
     ) -> Result<()> {
-        // Index recorded actions by tick once; avoids scanning the log per tick.
+        // Work-budget enforcement.
+        let interval = target_tick.saturating_sub(checkpoint_tick);
+        if interval > MAX_RECONSTRUCTION_TICKS {
+            return Err(anyhow!(
+                "reconstruction interval {interval} exceeds budget {}",
+                MAX_RECONSTRUCTION_TICKS
+            ));
+        }
+        // Index once into tick-keyed map; per-iteration enqueue uses only the
+        // current tick's frame.
         let mut actions_by_tick: BTreeMap<u64, Vec<(ActionSource, AgentAction)>> = BTreeMap::new();
         for record in records {
             if record.tick > checkpoint_tick && record.tick <= target_tick {
@@ -1102,11 +1305,15 @@ impl AgentApp {
                     .push((record.source.clone(), record.action.clone()));
             }
         }
+        // Snapshot checksums for verification (cloned once).
+        let checksums = self
+            .app
+            .world()
+            .get_resource::<ReplayRecorder>()
+            .map(|recorder| recorder.log.snapshot_checksums.clone())
+            .unwrap_or_default();
 
-        // Preserve actions that were already scheduled beyond the replay target.
-        // They are intentionally not in the replay log yet, but should remain
-        // pending when the caller continues from the restored tick. Single
-        // partition pass over the queue.
+        // Preserve post-target futures across the interval.
         let future_actions = self
             .app
             .world()
@@ -1120,28 +1327,10 @@ impl AgentApp {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-
-        // The recorded actions fully define the interval; drop any pending
-        // actions restored from the checkpoint so each tick matches the recorded
-        // history exactly. Future actions are restored below after replay.
         if let Some(mut queue) = self.app.world_mut().get_resource_mut::<AgentActionQueue>() {
             queue.clear();
         }
 
-        // Enqueue in tick order from the index, preserving recorded source and
-        // relative order within each tick.
-        for (tick, actions) in &actions_by_tick {
-            for (source, action) in actions {
-                self.enqueue_action_at(*tick, source.clone(), action.clone());
-            }
-        }
-        for scheduled in future_actions {
-            self.enqueue_action_at(scheduled.tick, scheduled.source, scheduled.action);
-        }
-
-        // Mark reconstruction: disables recording append (belt-and-braces with
-        // the recorder flag), lets policy systems opt out, and suppresses
-        // automatic snapshots for the interval.
         let old_context = self
             .app
             .world()
@@ -1160,16 +1349,63 @@ impl AgentApp {
             policy.checkpoint_every_ticks = 0;
         }
 
-        // Run exactly one reconstructing tick per tick in the interval,
-        // including empty ticks with no recorded actions, and verify each
-        // produced a response. The AgentDecision schedule is skipped so agent
-        // policies cannot enqueue duplicate actions during replay.
         let mut replay_result = Ok(());
-        for _ in 0..target_tick.saturating_sub(checkpoint_tick) {
-            self.run_one_reconstructing_tick();
-            if self.app.world().resource::<LastStepResponse>().0.is_none() {
-                replay_result = Err(anyhow!("replay tick produced no StepResponse"));
-                break;
+        if checkpoint_tick >= target_tick {
+            // Empty interval: nothing to replay.
+        } else {
+            #[allow(clippy::needless_range_loop)]
+            for tick in (checkpoint_tick.saturating_add(1))..=target_tick {
+                // Enqueue ONLY the current tick's frame plus the Reconstructing
+                // sentinel (which `drain_agent_actions` strips after accepting
+                // all sources).
+                if let Some(frame) = actions_by_tick.get(&tick) {
+                    for (source, action) in frame {
+                        self.enqueue_action_at(tick, source.clone(), action.clone());
+                    }
+                }
+                // Sentinel tick must equal the tick being drained.
+                self.enqueue_action_at(tick, ActionSource::Replay, Self::reconstructing_marker());
+                // Empty ticks: only the sentinel is enqueued, still runs.
+                self.run_one_reconstructing_tick();
+                if self.app.world().resource::<LastStepResponse>().0.is_none() {
+                    replay_result = Err(anyhow!("replay tick produced no StepResponse"));
+                    break;
+                }
+                // Checksum verification against recorded snapshot checksums.
+                if let Some(expected) = checksums.get(&tick) {
+                    match capture_snapshot(self.app.world_mut(), None) {
+                        Ok(snapshot) => match checksum_snapshot(&snapshot) {
+                            Ok(actual) => {
+                                if actual.hash != expected.hash || actual.tick != expected.tick {
+                                    replay_result = Err(anyhow!(
+                                        "reconstructed tick {tick} checksum mismatch: expected {:?}, got {:?}",
+                                        expected,
+                                        actual
+                                    ));
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                replay_result = Err(anyhow!(
+                                    "checksum computation failed at tick {tick}: {error}"
+                                ));
+                                break;
+                            }
+                        },
+                        Err(error) => {
+                            replay_result =
+                                Err(anyhow!("snapshot capture failed at tick {tick}: {error}"));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Restore post-target futures.
+        if replay_result.is_ok() {
+            for scheduled in future_actions {
+                self.enqueue_action_at(scheduled.tick, scheduled.source, scheduled.action);
             }
         }
 
@@ -1185,6 +1421,9 @@ impl AgentApp {
 
     /// Runs one simulation tick without the `AgentDecision` schedule, used for
     /// history reconstruction so policy execution is disabled during replay.
+    /// `CurrentInputFrame` is installed via the queue + Reconstructing
+    /// sentinel so `drain_agent_actions` accepts all recorded sources without
+    /// arbitration, preserving source as metadata.
     fn run_one_reconstructing_tick(&mut self) {
         self.app.world_mut().run_schedule(AgentPreTick);
         self.app.world_mut().run_schedule(AgentTick);
@@ -1435,12 +1674,28 @@ impl AgentEnvironment for AgentApp {
             (log, timeline, branch)
         };
 
+        // Recorded-range enforcement: reject targets beyond the log end.
+        let end = log.log_end_tick();
+        if tick > end {
+            return Err(anyhow!(
+                "restore target {tick} is beyond recorded end {end}"
+            ));
+        }
+
         // Branch-aware checkpoint selection: nearest checkpoint at-or-before
         // the tick on this branch's lineage. A child never selects a parent
         // checkpoint recorded beyond its fork tick.
         let (checkpoint_tick, snapshot_id) = log
             .nearest_checkpoint_for_branch(&timeline, branch, tick)
             .ok_or_else(|| anyhow!("no checkpoint exists at or before tick {tick}"))?;
+        // Work-budget enforcement: cap the replay interval.
+        let interval = tick.saturating_sub(checkpoint_tick);
+        if interval > MAX_RECONSTRUCTION_TICKS {
+            return Err(anyhow!(
+                "restore interval {interval} exceeds budget {}",
+                MAX_RECONSTRUCTION_TICKS
+            ));
+        }
 
         // Preserve actions scheduled beyond the restore target BEFORE the
         // checkpoint restore: `restore_snapshot` overwrites the queue with the
@@ -1511,6 +1766,21 @@ impl AgentEnvironment for AgentApp {
         from_tick: u64,
         label: Option<String>,
     ) -> Result<bevy_agent_core::BranchId> {
+        // Recorded-range enforcement mirrors `restore_tick` (branch replays
+        // the fork point before forking).
+        {
+            let end = self
+                .app
+                .world()
+                .get_resource::<ReplayRecorder>()
+                .map(|recorder| recorder.log.log_end_tick())
+                .unwrap_or(0);
+            if from_tick > end {
+                return Err(anyhow!(
+                    "branch target {from_tick} is beyond recorded end {end}"
+                ));
+            }
+        }
         self.restore_tick(from_tick)?;
         // `checkpoint_on_branch` (default true) snapshots the fork point so the
         // child starts from a restorable checkpoint on its own branch.
@@ -1593,9 +1863,14 @@ fn reset_replay_and_timeline(world: &mut World) {
 
     if let Some(mut recorder) = world.get_resource_mut::<ReplayRecorder>() {
         let recording = recorder.recording;
+        // New episode id: increment from the previous log so checkpoints can
+        // be tagged with (episode, branch, tick) and cross-episode sync is
+        // rejected.
+        let next_episode = recorder.log.manifest.episode_id.wrapping_add(1);
         recorder.log = ReplayLog::default();
         recorder.log.manifest.game_id = environment.name;
         recorder.log.manifest.game_version = environment.version;
+        recorder.log.manifest.episode_id = next_episode;
         recorder.recording = recording;
     }
 
@@ -1968,6 +2243,90 @@ mod tests {
                     |checkpoint| checkpoint.branch_id == branch && checkpoint.tick == response.tick
                 )
         );
+    }
+
+    #[test]
+    fn parent_future_exclusion_restore_child_tick2_is_only_noop() {
+        // Parent tick2 MoveRight (fork tick1) must not leak into the child:
+        // restoring child tick2 yields only the child's Noop.
+        let mut env = AgentApp::new(full_history_app);
+        env.reset(ResetOptions::default()).unwrap();
+        env.step(AgentAction::Noop).unwrap(); // tick1 parent
+        let move_right = AgentAction::Move { x: 1.0, y: 0.0 };
+        env.step(move_right.clone()).unwrap(); // tick2 parent
+        let child = env.branch(1, Some("child".to_string())).unwrap();
+        env.step(AgentAction::Noop).unwrap(); // tick2 child
+        assert_eq!(env.current_tick(), 2);
+        // Restore child tick2 via fork-bounded intervals.
+        env.restore_tick(2).unwrap();
+        assert_eq!(env.current_tick(), 2);
+        assert_eq!(env.world().resource::<AgentControlState>().branch_id, child);
+        let input = env.world().resource::<CurrentInputFrame>().clone();
+        assert_eq!(input.tick, 2);
+        assert_eq!(input.actions, vec![AgentAction::Noop]);
+        // Log-level check: child sees shared tick1 + own tick2 only.
+        let (log, timeline) = (
+            env.replay_log().unwrap().clone(),
+            env.world().resource::<Timeline>().clone(),
+        );
+        let visible = log.actions_for_branch(&timeline, child, 0, 2);
+        let tick2: Vec<_> = visible.iter().filter(|r| r.tick == 2).collect();
+        assert_eq!(tick2.len(), 1);
+        assert_eq!(tick2[0].action, AgentAction::Noop);
+    }
+
+    #[test]
+    fn paused_and_replay_mode_reconstruction_preserves_inputs() {
+        for mode in [ControlMode::Paused, ControlMode::Replay] {
+            let mut env = AgentApp::new(full_history_app);
+            env.reset(ResetOptions::default()).unwrap();
+            for _ in 0..3 {
+                env.step(AgentAction::Noop).unwrap();
+            }
+            // Enter behavioral-only mode after recording; reconstruction
+            // bypasses `step_with_source` and must still preserve inputs via
+            // the Reconstructing sentinel in `drain_agent_actions`.
+            env.world_mut().resource_mut::<AgentControlState>().mode = mode.clone();
+            env.restore_tick(2).unwrap();
+            assert_eq!(env.current_tick(), 2);
+            let input = env.world().resource::<CurrentInputFrame>().clone();
+            assert_eq!(input.tick, 2);
+            assert_eq!(input.actions, vec![AgentAction::Noop]);
+            assert_eq!(input.sources, vec![ActionSource::Agent]);
+        }
+    }
+
+    #[test]
+    fn import_preserves_three_level_topology_and_active_branch() {
+        let mut source = AgentApp::new(full_history_app);
+        source.reset(ResetOptions::default()).unwrap();
+        for _ in 0..2 {
+            source.step(AgentAction::Noop).unwrap();
+        }
+        let mid = source.branch(2, Some("mid".to_string())).unwrap();
+        source.step(AgentAction::Jump).unwrap(); // tick3 on mid
+        let leaf = source.branch(3, Some("leaf".to_string())).unwrap();
+        source.step(AgentAction::Interact).unwrap(); // tick4 on leaf
+        let bundle = source.export_replay_bundle().unwrap();
+        assert_eq!(bundle.log.timeline_topology.len(), 3);
+        assert_eq!(bundle.log.active_branch, Some(leaf));
+
+        let mut fresh = AgentApp::new(full_history_app);
+        fresh.load_replay_bundle(bundle).unwrap();
+        let timeline = fresh.app.world().resource::<Timeline>().clone();
+        let control = fresh.app.world().resource::<AgentControlState>().clone();
+        assert_eq!(timeline.branches.len(), 3);
+        assert_eq!(timeline.current_branch, leaf);
+        assert_eq!(control.branch_id, leaf);
+        // Parent links verbatim: leaf -> mid -> root.
+        let leaf_branch = timeline.branches.get(&leaf).unwrap();
+        assert_eq!(leaf_branch.parent_branch, Some(mid));
+        let mid_branch = timeline.branches.get(&mid).unwrap();
+        assert!(mid_branch.parent_branch.is_some());
+        assert_ne!(mid_branch.parent_branch, Some(leaf));
+        // Restorable on the leaf.
+        fresh.restore_tick(4).unwrap();
+        assert_eq!(fresh.current_tick(), 4);
     }
 
     #[test]
