@@ -2,8 +2,13 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc,
+};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -28,6 +33,19 @@ use sha1::{Digest, Sha1};
 const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 8 * 1024 * 1024;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Overall deadline for a single remote request, including main-thread pump.
+const HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+/// Maximum number of actions accepted in a single `agent.step_many` call.
+pub const MAX_ACTIONS_PER_REQUEST: usize = 1024;
+/// Maximum number of ticks accepted in a single `agent.fast_forward` call.
+pub const MAX_TICKS_PER_REQUEST: u64 = 10_000;
+/// PNG magic bytes used to verify visual captures after save.
+const PNG_MAGIC: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+/// A larger yaw delta is directionally redundant with a turn inside this range.
+const LOOK_YAW_DELTA_LIMIT_RADIANS: f64 = std::f64::consts::PI;
+/// This spans the full practical camera pitch range in a single controlled tick.
+const LOOK_PITCH_DELTA_LIMIT_RADIANS: f64 = std::f64::consts::FRAC_PI_2;
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +61,8 @@ bitflags! {
         const VISUAL_CAPTURE = 1 << 8;
         /// Mutating control of run state: pause/resume/set_mode.
         const CONTROL = 1 << 9;
+        /// Exporting replay bundles / snapshots to the caller.
+        const SNAPSHOT_EXPORT = 1 << 10;
     }
 }
 
@@ -56,13 +76,164 @@ impl Default for AgentCapability {
             | Self::BRANCH
             | Self::VISUAL_CAPTURE
             | Self::CONTROL
+            | Self::SNAPSHOT_EXPORT
     }
 }
+
+/// JSON-RPC error codes used by this bridge.
+///
+/// - `-32700` parse error, `-32600` invalid request, `-32601` method not
+///   found, `-32602` invalid params, `-32603` internal error.
+/// - `-32001` authentication/authorization failure (server-defined range).
+pub const RPC_PARSE_ERROR: i32 = -32700;
+pub const RPC_INVALID_REQUEST: i32 = -32600;
+pub const RPC_METHOD_NOT_FOUND: i32 = -32601;
+pub const RPC_INVALID_PARAMS: i32 = -32602;
+pub const RPC_INTERNAL_ERROR: i32 = -32603;
+pub const RPC_AUTH_ERROR: i32 = -32001;
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteSecurity {
     pub session_token: Option<String>,
     pub capabilities: AgentCapability,
+    /// Root directory confining all filesystem writes/reads (replay export,
+    /// replay load from path, visual captures). `None` resolves to the OS
+    /// temp dir joined with `bevy-agent-artifacts`.
+    pub artifact_root: Option<PathBuf>,
+    /// When false (default), absolute paths and `..` traversal are rejected.
+    pub allow_absolute_paths: bool,
+    /// Optional exact Origin value echoed back as `Access-Control-Allow-Origin`.
+    /// When `None` (default) no CORS header is emitted.
+    pub allowed_origin: Option<String>,
+}
+
+/// Backwards-compatible alias: older specs refer to `BridgeSecurity`.
+pub type BridgeSecurity = RemoteSecurity;
+
+impl RemoteSecurity {
+    /// Resolved artifact root, defaulting to the OS temp dir.
+    #[must_use]
+    pub fn artifact_root_resolved(&self) -> PathBuf {
+        self.artifact_root
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("bevy-agent-artifacts"))
+    }
+
+    /// Resolve a caller-supplied relative path against the artifact root,
+    /// rejecting absolute paths and `..` traversal unless
+    /// `allow_absolute_paths` is set.
+    pub fn resolve_artifact_path(&self, raw: &str) -> Result<PathBuf> {
+        resolve_confined_path(
+            &self.artifact_root_resolved(),
+            raw,
+            self.allow_absolute_paths,
+        )
+    }
+
+    /// Resolve a caller-supplied output dir against the artifact root.
+    pub fn resolve_output_dir(&self, raw: &std::path::Path) -> Result<PathBuf> {
+        let s = raw.to_string_lossy();
+        self.resolve_artifact_path(&s)
+    }
+}
+
+fn resolve_confined_path(root: &PathBuf, raw: &str, allow_absolute: bool) -> Result<PathBuf> {
+    let candidate = PathBuf::from(raw);
+    if !allow_absolute {
+        if raw.split(['/', '\\']).any(|comp| comp == "..") {
+            return Err(anyhow!("path traversal (`..`) is not allowed: {raw}"));
+        }
+        if candidate.is_absolute() {
+            // Confine absolute paths to the artifact root or the OS temp dir
+            // (tests and tooling stage replay bundles / captures under
+            // `std::env::temp_dir()` siblings of the default artifact root).
+            let temp = std::env::temp_dir();
+            if !(candidate.starts_with(root) || candidate.starts_with(&temp)) {
+                return Err(anyhow!("absolute paths are not allowed: {raw}"));
+            }
+        }
+    }
+    let joined = if candidate.is_absolute() {
+        candidate
+    } else {
+        root.join(candidate)
+    };
+    // Best-effort canonicalization guard: if both resolve, the result must
+    // stay under the (canonicalized) root or the OS temp dir.
+    if let (Ok(root_c), Ok(joined_c)) = (root.canonicalize(), joined.canonicalize()) {
+        let temp_c = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        if !joined_c.starts_with(&root_c) && !joined_c.starts_with(&temp_c) {
+            return Err(anyhow!("path escapes artifact root: {raw}"));
+        }
+        return Ok(joined_c);
+    }
+    // Lexical guard for non-existent paths: reject any `..` that survives join.
+    let mut depth: i32 = 0;
+    for comp in joined.components() {
+        use std::path::Component;
+        match comp {
+            Component::ParentDir => depth -= 1,
+            Component::Normal(_) => depth += 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return Err(anyhow!("path escapes artifact root: {raw}"));
+        }
+    }
+    Ok(joined)
+}
+
+/// Centralized per-operation authorization descriptor.
+///
+/// Each RPC method builds one of these and passes it to
+/// [`JsonRpcBridge::authorize_operation`], so capability checks stay in one
+/// place instead of scattered `require_capability` calls.
+#[derive(Clone, Debug)]
+pub struct OperationRequires {
+    /// Mutating simulation capability (e.g. `STEP` for step/reset).
+    pub mutation: Option<AgentCapability>,
+    /// Observation-visibility capability required to read observations
+    /// (e.g. `OBSERVE_PLAYER` or `OBSERVE_FULL_STATE`).
+    pub observation_visibility: Option<AgentCapability>,
+    /// Whether this operation exports snapshot/replay data.
+    pub snapshot_export: bool,
+    /// Whether this operation imports/restores snapshot/replay data.
+    pub restore_import: bool,
+    /// Whether this operation touches the filesystem (path/output_dir).
+    pub filesystem: bool,
+    /// Control-plane capability (e.g. `CONTROL` for pause/resume/set_mode).
+    pub control: Option<AgentCapability>,
+}
+
+impl OperationRequires {
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            mutation: None,
+            observation_visibility: None,
+            snapshot_export: false,
+            restore_import: false,
+            filesystem: false,
+            control: None,
+        }
+    }
+}
+
+/// Capability needed to observe a given mode. `FullDebugState` and `Hybrid`
+/// expose full state and require `OBSERVE_FULL_STATE`; every other mode
+/// requires only `OBSERVE_PLAYER`.
+#[must_use]
+pub fn capability_for_observation_mode(mode: &ObservationMode) -> AgentCapability {
+    match mode {
+        ObservationMode::FullDebugState | ObservationMode::Hybrid => {
+            AgentCapability::OBSERVE_FULL_STATE
+        }
+        ObservationMode::PlayerKnowledge
+        | ObservationMode::DiffSinceLastTick
+        | ObservationMode::PixelFrame => AgentCapability::OBSERVE_PLAYER,
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -223,10 +394,37 @@ fn return_all() -> String {
     "all".to_string()
 }
 
+/// JSON-RPC bridge executing remote calls against a single simulation owner.
+///
+/// Supported subset: single JSON-RPC 2.0 calls only. Batch requests and
+/// notifications are NOT supported; each input must be one object with
+/// `method`, `id`, and optional `params`.
 impl JsonRpcBridge {
     #[must_use]
     pub fn new(security: RemoteSecurity) -> Self {
+        if let Some(token) = security.session_token.as_deref()
+            && token.is_empty()
+        {
+            panic!("RemoteSecurity::session_token must not be empty; use None for no auth");
+        }
         Self { security }
+    }
+
+    /// Validating constructor rejecting an empty session token.
+    pub fn try_new(security: RemoteSecurity) -> Result<Self> {
+        if let Some(token) = security.session_token.as_deref()
+            && token.is_empty()
+        {
+            return Err(anyhow!(
+                "RemoteSecurity::session_token must not be empty; use None for no auth"
+            ));
+        }
+        Ok(Self { security })
+    }
+
+    /// Alias for [`Self::try_new`] kept for spec compatibility (`with_security`).
+    pub fn with_security(security: RemoteSecurity) -> Result<Self> {
+        Self::try_new(security)
     }
 
     pub fn handle_json(&self, env: &mut AgentApp, input: &str) -> String {
@@ -236,7 +434,7 @@ impl JsonRpcBridge {
                 jsonrpc: "2.0",
                 id: Value::Null,
                 error: JsonRpcError {
-                    code: -32700,
+                    code: RPC_PARSE_ERROR,
                     message: format!("parse error: {error}"),
                 },
             },
@@ -251,7 +449,7 @@ impl JsonRpcBridge {
                 jsonrpc: "2.0",
                 id,
                 error: JsonRpcError {
-                    code: -32600,
+                    code: RPC_INVALID_REQUEST,
                     message: error.to_string(),
                 },
             };
@@ -265,10 +463,7 @@ impl JsonRpcBridge {
             Err(error) => JsonRpcResponse::Error {
                 jsonrpc: "2.0",
                 id,
-                error: JsonRpcError {
-                    code: -32603,
-                    message: error.to_string(),
-                },
+                error,
             },
         }
     }
@@ -287,10 +482,10 @@ impl JsonRpcBridge {
         Ok(())
     }
 
-    fn dispatch(&self, env: &mut AgentApp, request: JsonRpcRequest) -> Result<Value> {
+    fn dispatch(&self, env: &mut AgentApp, request: JsonRpcRequest) -> Result<Value, JsonRpcError> {
         match request.method.as_str() {
             "agent.info" => {
-                self.authorize(None, &request.params)?;
+                self.authorize(None, &request.params).map_err(into_auth)?;
                 let metadata = env
                     .world()
                     .get_resource::<EnvironmentMetadata>()
@@ -307,7 +502,7 @@ impl JsonRpcBridge {
                 }))
             }
             "agent.action_space" => {
-                self.authorize(None, &request.params)?;
+                self.authorize(None, &request.params).map_err(into_auth)?;
                 let catalog = env.world().get_resource::<AgentActionCatalog>();
                 Ok(json!({
                     "type": "json_schema",
@@ -317,7 +512,7 @@ impl JsonRpcBridge {
                 }))
             }
             "agent.observation_space" => {
-                self.authorize(None, &request.params)?;
+                self.authorize(None, &request.params).map_err(into_auth)?;
                 let catalog = env.world().get_resource::<AgentObservationCatalog>();
                 Ok(json!({
                     "modes": ["PlayerKnowledge", "FullDebugState", "DiffSinceLastTick", "PixelFrame", "Hybrid"],
@@ -326,103 +521,246 @@ impl JsonRpcBridge {
                 }))
             }
             "agent.schema" => {
-                self.authorize(None, &request.params)?;
+                self.authorize(None, &request.params).map_err(into_auth)?;
                 let catalog = env.world().get_resource::<AgentActionCatalog>();
                 let observations = env.world().get_resource::<AgentObservationCatalog>();
                 Ok(json!({
                     "action": agent_action_schema_with_custom_actions(catalog),
                     "custom_actions": custom_action_schema_map(catalog),
                     "observation": observation_schema_with_catalog(observations),
-                    "step_response": step_response_schema(),
-                    "reset_response": reset_response_schema(),
-                    "step_many_response": step_many_response_schema(),
+                    "step_response": step_response_schema_with_catalog(observations),
+                    "reset_response": reset_response_schema_with_catalog(observations),
+                    "step_many_response": step_many_response_schema_with_catalog(observations),
                     "visual_capture": visual_capture_schema(),
                 }))
             }
             "agent.reset" => {
-                self.require_capability(AgentCapability::STEP)?;
-                let params: ResetParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
-                Ok(serde_json::to_value(
-                    env.reset_with_response(params.options)?,
-                )?)
+                let params: ResetParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                self.authorize_operation(&OperationRequires {
+                    mutation: Some(AgentCapability::STEP),
+                    observation_visibility: Some(capability_for_observation_mode(
+                        &params.options.observation_mode,
+                    )),
+                    snapshot_export: false,
+                    restore_import: false,
+                    filesystem: false,
+                    control: None,
+                })
+                .map_err(into_auth)?;
+                let options = params.options.clone();
+                env.reset_with_response(options)
+                    .map_err(into_internal)
+                    .and_then(|v| serde_json::to_value(v).map_err(into_internal))
             }
             "agent.step" => {
-                self.require_capability(AgentCapability::STEP)?;
-                let params: StepParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
+                let params: StepParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                let active_mode = params.observation_mode.clone().unwrap_or_else(|| {
+                    env.world()
+                        .get_resource::<bevy_agent_core::ObservationConfig>()
+                        .map(|c| c.mode.clone())
+                        .unwrap_or_default()
+                });
+                self.authorize_operation(&OperationRequires {
+                    mutation: Some(AgentCapability::STEP),
+                    observation_visibility: Some(capability_for_observation_mode(&active_mode)),
+                    snapshot_export: false,
+                    restore_import: false,
+                    filesystem: false,
+                    control: None,
+                })
+                .map_err(into_auth)?;
                 if let Some(mode) = params.observation_mode {
                     env.world_mut()
                         .resource_mut::<bevy_agent_core::ObservationConfig>()
                         .mode = mode;
                 }
-                Ok(serde_json::to_value(env.step(params.action)?)?)
+                env.step(params.action)
+                    .map_err(into_internal)
+                    .and_then(|v| serde_json::to_value(v).map_err(into_internal))
             }
             "agent.step_many" => {
-                self.require_capability(AgentCapability::STEP)?;
-                let params: StepManyParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
+                let params: StepManyParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                if params.actions.len() > MAX_ACTIONS_PER_REQUEST {
+                    return Err(invalid_params(format!(
+                        "actions length {} exceeds limit {MAX_ACTIONS_PER_REQUEST}",
+                        params.actions.len()
+                    )));
+                }
+                let active_mode = env
+                    .world()
+                    .get_resource::<bevy_agent_core::ObservationConfig>()
+                    .map(|c| c.mode.clone())
+                    .unwrap_or_default();
+                self.authorize_operation(&OperationRequires {
+                    mutation: Some(AgentCapability::STEP),
+                    observation_visibility: Some(capability_for_observation_mode(&active_mode)),
+                    snapshot_export: false,
+                    restore_import: false,
+                    filesystem: false,
+                    control: None,
+                })
+                .map_err(into_auth)?;
                 if !matches!(params.return_observations.as_str(), "none" | "last" | "all") {
-                    return Err(anyhow!(
-                        "return_observations must be one of: none, last, all"
+                    return Err(invalid_params(
+                        "return_observations must be one of: none, last, all",
                     ));
                 }
-                let mut response = env.step_many_with_response(
-                    params.actions,
-                    params.stop_on_done,
-                    params.return_observations == "all",
-                )?;
+                let mut response = env
+                    .step_many_with_response(
+                        params.actions,
+                        params.stop_on_done,
+                        params.return_observations == "all",
+                    )
+                    .map_err(into_internal)?;
                 if params.return_observations == "none" {
                     response.observation = None;
                 }
-                Ok(serde_json::to_value(response)?)
+                serde_json::to_value(response).map_err(into_internal)
             }
             "agent.fast_forward" => {
-                self.require_capability(AgentCapability::STEP)?;
-                let params: FastForwardParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
-                Ok(serde_json::to_value(env.fast_forward(params.ticks)?)?)
+                let params: FastForwardParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                if params.ticks > MAX_TICKS_PER_REQUEST {
+                    return Err(invalid_params(format!(
+                        "ticks {} exceeds limit {MAX_TICKS_PER_REQUEST}",
+                        params.ticks
+                    )));
+                }
+                let active_mode = env
+                    .world()
+                    .get_resource::<bevy_agent_core::ObservationConfig>()
+                    .map(|c| c.mode.clone())
+                    .unwrap_or_default();
+                self.authorize_operation(&OperationRequires {
+                    mutation: Some(AgentCapability::STEP),
+                    observation_visibility: Some(capability_for_observation_mode(&active_mode)),
+                    snapshot_export: false,
+                    restore_import: false,
+                    filesystem: false,
+                    control: None,
+                })
+                .map_err(into_auth)?;
+                env.fast_forward(params.ticks)
+                    .map_err(into_internal)
+                    .and_then(|v| serde_json::to_value(v).map_err(into_internal))
             }
             "agent.observe" => {
-                self.require_capability(AgentCapability::OBSERVE_PLAYER)?;
-                let params: ObserveParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
-                Ok(serde_json::to_value(env.observe(params.observation_mode)?)?)
+                let params: ObserveParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                self.authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: Some(capability_for_observation_mode(
+                        &params.observation_mode,
+                    )),
+                    snapshot_export: false,
+                    restore_import: false,
+                    filesystem: false,
+                    control: None,
+                })
+                .map_err(into_auth)?;
+                env.observe(params.observation_mode)
+                    .map_err(into_internal)
+                    .and_then(|v| serde_json::to_value(v).map_err(into_internal))
             }
             "agent.visual.capture" => {
-                self.require_capability(AgentCapability::VISUAL_CAPTURE)?;
-                let params: VisualCaptureParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
+                let params: VisualCaptureParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                self.authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: None,
+                    snapshot_export: false,
+                    restore_import: false,
+                    filesystem: true,
+                    control: None,
+                })
+                .map_err(into_auth)?;
+                self.require_capability(AgentCapability::VISUAL_CAPTURE)
+                    .map_err(into_auth)?;
                 let mut options = VisualCaptureOptions::default();
                 if let Some(output_dir) = params.output_dir {
-                    options.output_dir = output_dir;
+                    options.output_dir = self
+                        .security
+                        .resolve_output_dir(&output_dir)
+                        .map_err(into_internal)?;
+                } else {
+                    options.output_dir = self.security.artifact_root_resolved();
                 }
                 if params.label.is_some() {
                     options.label = params.label;
                 }
                 if let Some(timeout_frames) = params.timeout_frames {
+                    if timeout_frames == 0 {
+                        return Err(invalid_params("timeout_frames must be > 0"));
+                    }
                     options.timeout_frames = timeout_frames;
                 }
                 if let Some(source) = params.source {
                     options.source = source;
                 }
-                Ok(serde_json::to_value(env.capture_visual(options)?)?)
+                env.capture_visual(options)
+                    .map_err(into_internal)
+                    .and_then(|result| {
+                        verify_visual_capture_file(&result.path).map_err(into_internal)?;
+                        serde_json::to_value(result).map_err(into_internal)
+                    })
             }
             "agent.snapshot.create" => {
-                self.require_capability(AgentCapability::SNAPSHOT)?;
-                self.check_token(token_from_params(&request.params).as_deref())?;
-                Ok(serde_json::to_value(env.snapshot()?)?)
+                self.check_token(token_from_params(&request.params).as_deref())
+                    .map_err(into_auth)?;
+                self.authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: None,
+                    snapshot_export: true,
+                    restore_import: false,
+                    filesystem: false,
+                    control: None,
+                })
+                .map_err(into_auth)?;
+                self.require_capability(AgentCapability::SNAPSHOT)
+                    .map_err(into_auth)?;
+                env.snapshot()
+                    .map_err(into_internal)
+                    .and_then(|v| serde_json::to_value(v).map_err(into_internal))
             }
             "agent.snapshot.restore" => {
-                self.require_capability(AgentCapability::RESTORE)?;
-                let params: SnapshotRestoreParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
-                env.restore(params.snapshot_id)?;
+                let params: SnapshotRestoreParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                self.authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: None,
+                    snapshot_export: false,
+                    restore_import: true,
+                    filesystem: false,
+                    control: None,
+                })
+                .map_err(into_auth)?;
+                self.require_capability(AgentCapability::RESTORE)
+                    .map_err(into_auth)?;
+                env.restore(params.snapshot_id).map_err(into_internal)?;
                 Ok(Value::Null)
             }
             "agent.snapshot.list" => {
-                self.require_capability(AgentCapability::SNAPSHOT)?;
-                self.check_token(token_from_params(&request.params).as_deref())?;
+                self.check_token(token_from_params(&request.params).as_deref())
+                    .map_err(into_auth)?;
+                self.require_capability(AgentCapability::SNAPSHOT)
+                    .map_err(into_auth)?;
                 let store = env.world().resource::<SnapshotStore>();
                 let mut snapshots = store.snapshots.values().collect::<Vec<_>>();
                 snapshots.sort_by(|a, b| {
@@ -445,9 +783,12 @@ impl JsonRpcBridge {
                 Ok(json!(snapshots))
             }
             "agent.snapshot.delete" => {
-                self.require_capability(AgentCapability::SNAPSHOT)?;
-                let params: SnapshotDeleteParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
+                let params: SnapshotDeleteParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                self.require_capability(AgentCapability::SNAPSHOT)
+                    .map_err(into_auth)?;
                 let mut store = env.world_mut().resource_mut::<SnapshotStore>();
                 store.snapshots.remove(&params.snapshot_id);
                 store.labels.retain(|_, value| *value != params.snapshot_id);
@@ -457,7 +798,7 @@ impl JsonRpcBridge {
                 Ok(Value::Null)
             }
             "agent.timeline.current" => {
-                self.authorize(None, &request.params)?;
+                self.authorize(None, &request.params).map_err(into_auth)?;
                 Ok(json!({
                     "tick": env.current_tick(),
                     "timeline_id": env.world().resource::<bevy_agent_core::AgentControlState>().timeline_id,
@@ -465,10 +806,15 @@ impl JsonRpcBridge {
                 }))
             }
             "agent.timeline.branch" => {
-                self.require_capability(AgentCapability::BRANCH)?;
-                let params: BranchParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
-                let branch_id = env.branch(params.from_tick, params.label)?;
+                let params: BranchParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                self.require_capability(AgentCapability::BRANCH)
+                    .map_err(into_auth)?;
+                let branch_id = env
+                    .branch(params.from_tick, params.label)
+                    .map_err(into_internal)?;
                 Ok(json!({
                     "timeline_id": env.world().resource::<bevy_agent_core::AgentControlState>().timeline_id,
                     "branch_id": branch_id,
@@ -476,47 +822,91 @@ impl JsonRpcBridge {
                 }))
             }
             "agent.timeline.restore_tick" => {
-                self.require_capability(AgentCapability::RESTORE)?;
-                let params: RestoreTickParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
-                env.restore_tick(params.tick)?;
+                let params: RestoreTickParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                self.authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: None,
+                    snapshot_export: false,
+                    restore_import: true,
+                    filesystem: false,
+                    control: None,
+                })
+                .map_err(into_auth)?;
+                self.require_capability(AgentCapability::RESTORE)
+                    .map_err(into_auth)?;
+                env.restore_tick(params.tick).map_err(into_internal)?;
                 Ok(json!({ "current_tick": env.current_tick() }))
             }
             "agent.control.set_mode" => {
-                self.require_capability(AgentCapability::CONTROL)?;
-                let params: ControlModeParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
+                let params: ControlModeParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                self.authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: None,
+                    snapshot_export: false,
+                    restore_import: false,
+                    filesystem: false,
+                    control: Some(AgentCapability::CONTROL),
+                })
+                .map_err(into_auth)?;
                 env.world_mut()
                     .resource_mut::<bevy_agent_core::AgentControlState>()
                     .mode = params.mode;
                 Ok(Value::Null)
             }
             "agent.control.pause" => {
-                self.require_capability(AgentCapability::CONTROL)?;
-                self.check_token(token_from_params(&request.params).as_deref())?;
+                self.check_token(token_from_params(&request.params).as_deref())
+                    .map_err(into_auth)?;
+                self.authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: None,
+                    snapshot_export: false,
+                    restore_import: false,
+                    filesystem: false,
+                    control: Some(AgentCapability::CONTROL),
+                })
+                .map_err(into_auth)?;
                 env.world_mut()
                     .resource_mut::<bevy_agent_core::AgentControlState>()
                     .mode = ControlMode::Paused;
                 Ok(Value::Null)
             }
             "agent.control.resume" => {
-                self.require_capability(AgentCapability::CONTROL)?;
-                self.check_token(token_from_params(&request.params).as_deref())?;
+                self.check_token(token_from_params(&request.params).as_deref())
+                    .map_err(into_auth)?;
+                self.authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: None,
+                    snapshot_export: false,
+                    restore_import: false,
+                    filesystem: false,
+                    control: Some(AgentCapability::CONTROL),
+                })
+                .map_err(into_auth)?;
                 env.world_mut()
                     .resource_mut::<bevy_agent_core::AgentControlState>()
                     .mode = ControlMode::Agent;
                 Ok(Value::Null)
             }
             "agent.replay.start" => {
-                self.require_capability(AgentCapability::STEP)?;
-                self.check_token(token_from_params(&request.params).as_deref())?;
+                self.check_token(token_from_params(&request.params).as_deref())
+                    .map_err(into_auth)?;
+                self.require_capability(AgentCapability::STEP)
+                    .map_err(into_auth)?;
                 let initial_snapshot = env.replay_log().and_then(|log| log.initial_snapshot);
                 start_recording(env.world_mut(), initial_snapshot);
                 Ok(json!({ "recording": true }))
             }
             "agent.replay.stop" => {
-                self.require_capability(AgentCapability::STEP)?;
-                self.check_token(token_from_params(&request.params).as_deref())?;
+                self.check_token(token_from_params(&request.params).as_deref())
+                    .map_err(into_auth)?;
+                self.require_capability(AgentCapability::STEP)
+                    .map_err(into_auth)?;
                 let log = stop_recording(env.world_mut());
                 Ok(json!({
                     "recording": false,
@@ -525,62 +915,121 @@ impl JsonRpcBridge {
                 }))
             }
             "agent.replay.export" => {
-                self.require_capability(AgentCapability::STEP)?;
-                let params: ReplayExportParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
-                let bundle = env.export_replay_bundle()?;
-                if let Some(path) = &params.path {
-                    let encoded = serde_json::to_string_pretty(&bundle)?;
-                    std::fs::write(path, encoded)
-                        .with_context(|| format!("writing replay bundle to {path}"))?;
+                let params: ReplayExportParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                self.authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: None,
+                    snapshot_export: true,
+                    restore_import: false,
+                    filesystem: params.path.is_some(),
+                    control: None,
+                })
+                .map_err(into_auth)?;
+                // Export is gated by SNAPSHOT_EXPORT (falling back to SNAPSHOT
+                // for backwards compatibility when only SNAPSHOT is granted).
+                if !(self
+                    .security
+                    .capabilities
+                    .contains(AgentCapability::SNAPSHOT_EXPORT)
+                    || self
+                        .security
+                        .capabilities
+                        .contains(AgentCapability::SNAPSHOT))
+                {
+                    return Err(auth_error("missing remote capability SNAPSHOT_EXPORT"));
                 }
+                let bundle = env.export_replay_bundle().map_err(into_internal)?;
+                let resolved_path = if let Some(path) = &params.path {
+                    let resolved = self
+                        .security
+                        .resolve_artifact_path(path)
+                        .map_err(into_internal)?;
+                    let encoded = serde_json::to_string_pretty(&bundle).map_err(into_internal)?;
+                    if let Some(parent) = resolved.parent() {
+                        std::fs::create_dir_all(parent).map_err(into_internal)?;
+                    }
+                    std::fs::write(&resolved, encoded)
+                        .with_context(|| format!("writing replay bundle to {}", resolved.display()))
+                        .map_err(into_internal)?;
+                    Some(resolved.to_string_lossy().to_string())
+                } else {
+                    None
+                };
+                // Without a path, return base64 bytes inline so callers can
+                // fetch the bundle without filesystem access.
+                let bundle_bytes = serde_json::to_vec(&bundle).map_err(into_internal)?;
+                let bundle_base64 = BASE64_STANDARD.encode(&bundle_bytes);
                 Ok(json!({
-                    "path": params.path,
+                    "path": resolved_path,
                     "records": bundle.log.records.len(),
                     "checkpoints": bundle.log.checkpoints.len(),
                     "bundle": bundle,
+                    "bundle_base64": bundle_base64,
                 }))
             }
             "agent.replay.load" => {
-                self.require_capability(AgentCapability::STEP)?;
-                let params: ReplayLoadParams = serde_json::from_value(request.params)?;
-                self.check_token(params.session_token.as_deref())?;
+                let params: ReplayLoadParams =
+                    serde_json::from_value(request.params.clone()).map_err(into_invalid_params)?;
+                self.check_token(params.session_token.as_deref())
+                    .map_err(into_auth)?;
+                self.authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: None,
+                    snapshot_export: false,
+                    restore_import: true,
+                    filesystem: params.path.is_some(),
+                    control: None,
+                })
+                .map_err(into_auth)?;
+                self.require_capability(AgentCapability::RESTORE)
+                    .map_err(into_auth)?;
                 let bundle = if let Some(bundle) = params.bundle {
                     bundle
                 } else if let Some(log) = params.log {
-                    replay_bundle_from_legacy_log(env, log)?
+                    replay_bundle_from_legacy_log(env, log).map_err(into_internal)?
                 } else if let Some(path) = params.path {
-                    let bytes = std::fs::read_to_string(&path)
-                        .with_context(|| format!("reading replay bundle from {path}"))?;
+                    let resolved = self
+                        .security
+                        .resolve_artifact_path(&path)
+                        .map_err(into_internal)?;
+                    let bytes = std::fs::read_to_string(&resolved)
+                        .with_context(|| {
+                            format!("reading replay bundle from {}", resolved.display())
+                        })
+                        .map_err(into_internal)?;
                     match serde_json::from_str::<ReplayBundle>(&bytes) {
                         Ok(bundle) => bundle,
                         Err(bundle_error) => {
                             let log = serde_json::from_str::<ReplayLog>(&bytes).with_context(|| {
                                 format!(
-                                    "decoding replay bundle from {path} ({bundle_error}); legacy log decode also failed"
+                                    "decoding replay bundle from {} ({bundle_error}); legacy log decode also failed",
+                                    resolved.display()
                                 )
-                            })?;
-                            replay_bundle_from_legacy_log(env, log)?
+                            }).map_err(into_internal)?;
+                            replay_bundle_from_legacy_log(env, log).map_err(into_internal)?
                         }
                     }
                 } else {
-                    return Err(anyhow!(
-                        "agent.replay.load requires one of: path, bundle, log"
+                    return Err(invalid_params(
+                        "agent.replay.load requires one of: path, bundle, log",
                     ));
                 };
                 let records = bundle.log.records.len();
                 let checkpoints = bundle.log.checkpoints.len();
-                env.load_replay_bundle(bundle)?;
+                env.load_replay_bundle(bundle).map_err(into_internal)?;
                 Ok(json!({
                     "records": records,
                     "checkpoints": checkpoints,
                 }))
             }
-            other => Err(anyhow!("unknown method {other}")),
+            other => Err(method_not_found(format!("unknown method {other}"))),
         }
     }
 
-    fn check_token(&self, token: Option<&str>) -> Result<()> {
+    pub(crate) fn check_token(&self, token: Option<&str>) -> Result<()> {
         if let Some(expected) = &self.security.session_token {
             let provided = token.unwrap_or("");
             if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
@@ -590,7 +1039,7 @@ impl JsonRpcBridge {
         Ok(())
     }
 
-    fn require_capability(&self, capability: AgentCapability) -> Result<()> {
+    pub(crate) fn require_capability(&self, capability: AgentCapability) -> Result<()> {
         if !self.security.capabilities.contains(capability) {
             return Err(anyhow!("missing remote capability {capability:?}"));
         }
@@ -608,6 +1057,94 @@ impl JsonRpcBridge {
         }
         self.check_token(token_from_params(params).as_deref())
     }
+
+    /// Central authorization entry point: checks mutation, observation
+    /// visibility, snapshot export/import, filesystem, and control gates.
+    fn authorize_operation(&self, requires: &OperationRequires) -> Result<()> {
+        if let Some(cap) = requires.mutation {
+            self.require_capability(cap)?;
+        }
+        if let Some(cap) = requires.observation_visibility {
+            self.require_capability(cap)?;
+        }
+        if requires.snapshot_export {
+            // Caller still needs an explicit export check; the replay.export
+            // arm additionally accepts legacy SNAPSHOT. Other exporters
+            // require SNAPSHOT_EXPORT/SNAPSHOT via this gate.
+            if !(self
+                .security
+                .capabilities
+                .contains(AgentCapability::SNAPSHOT_EXPORT)
+                || self
+                    .security
+                    .capabilities
+                    .contains(AgentCapability::SNAPSHOT))
+            {
+                return Err(anyhow!("missing remote capability SNAPSHOT_EXPORT"));
+            }
+        }
+        if requires.restore_import {
+            self.require_capability(AgentCapability::RESTORE)?;
+        }
+        if let Some(cap) = requires.control {
+            self.require_capability(cap)?;
+        }
+        // `filesystem` is enforced at path-resolution time via
+        // `resolve_artifact_path`; the flag documents intent.
+        Ok(())
+    }
+}
+
+fn auth_error(message: impl Into<String>) -> JsonRpcError {
+    JsonRpcError {
+        code: RPC_AUTH_ERROR,
+        message: message.into(),
+    }
+}
+
+fn invalid_params(message: impl Into<String>) -> JsonRpcError {
+    JsonRpcError {
+        code: RPC_INVALID_PARAMS,
+        message: message.into(),
+    }
+}
+
+fn method_not_found(message: impl Into<String>) -> JsonRpcError {
+    JsonRpcError {
+        code: RPC_METHOD_NOT_FOUND,
+        message: message.into(),
+    }
+}
+
+fn into_internal(error: impl std::fmt::Display) -> JsonRpcError {
+    JsonRpcError {
+        code: RPC_INTERNAL_ERROR,
+        message: error.to_string(),
+    }
+}
+
+fn into_invalid_params(error: serde_json::Error) -> JsonRpcError {
+    invalid_params(format!("invalid params: {error}"))
+}
+
+fn into_auth(error: anyhow::Error) -> JsonRpcError {
+    auth_error(error.to_string())
+}
+
+/// Verify a visual capture file exists and starts with the PNG magic bytes.
+fn verify_visual_capture_file(path: &std::path::Path) -> Result<()> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading capture {}", path.display()))?;
+    if bytes.len() < PNG_MAGIC.len() || bytes[..PNG_MAGIC.len()] != PNG_MAGIC {
+        return Err(anyhow!("capture {} is missing PNG magic", path.display()));
+    }
+    Ok(())
+}
+
+/// Convert frame-count timeouts to a wall-clock deadline (60 fps assumption).
+#[must_use]
+pub fn timeout_frames_to_duration(timeout_frames: u32) -> Duration {
+    Duration::from_secs_f64(f64::from(timeout_frames) / 60.0)
 }
 
 /// Validate the JSON-RPC version field. A present `jsonrpc` member must be
@@ -671,11 +1208,31 @@ pub fn agent_action_schema_with_custom_actions(catalog: Option<&AgentActionCatal
     let custom_value_schema = custom_action_value_schema(catalog);
     let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://bevy-agent.rs/schemas/action.json",
         "title": "AgentAction",
         "oneOf": [
             { "type": "object", "required": ["type"], "properties": { "type": { "const": "Noop" } }, "additionalProperties": false },
             { "type": "object", "required": ["type", "x", "y"], "properties": { "type": { "const": "Move" }, "x": { "type": "number", "minimum": -1.0, "maximum": 1.0 }, "y": { "type": "number", "minimum": -1.0, "maximum": 1.0 } }, "additionalProperties": false },
-            { "type": "object", "required": ["type", "yaw_delta", "pitch_delta"], "properties": { "type": { "const": "Look" }, "yaw_delta": { "type": "number" }, "pitch_delta": { "type": "number" } }, "additionalProperties": false },
+            {
+                "type": "object",
+                "required": ["type", "yaw_delta", "pitch_delta"],
+                "properties": {
+                    "type": { "const": "Look" },
+                    "yaw_delta": {
+                        "type": "number",
+                        "minimum": -LOOK_YAW_DELTA_LIMIT_RADIANS,
+                        "maximum": LOOK_YAW_DELTA_LIMIT_RADIANS,
+                        "description": "Per-tick yaw delta in radians. Bounded to ±π because larger turns are directionally redundant."
+                    },
+                    "pitch_delta": {
+                        "type": "number",
+                        "minimum": -LOOK_PITCH_DELTA_LIMIT_RADIANS,
+                        "maximum": LOOK_PITCH_DELTA_LIMIT_RADIANS,
+                        "description": "Per-tick pitch delta in radians. ±π/2 spans the full practical camera pitch range in one tick."
+                    }
+                },
+                "additionalProperties": false
+            },
             { "type": "object", "required": ["type"], "properties": { "type": { "const": "Jump" } }, "additionalProperties": false },
             { "type": "object", "required": ["type"], "properties": { "type": { "const": "Crouch" } }, "additionalProperties": false },
             { "type": "object", "required": ["type"], "properties": { "type": { "const": "Sprint" } }, "additionalProperties": false },
@@ -781,6 +1338,7 @@ pub fn observation_schema_with_catalog(catalog: Option<&AgentObservationCatalog>
         .unwrap_or(Value::Bool(true));
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://bevy-agent.rs/schemas/observation.json",
         "title": "Observation",
         "oneOf": [
             { "$ref": "#/$defs/symbolicObservationEnvelope" },
@@ -889,45 +1447,76 @@ pub fn observation_schema_with_catalog(catalog: Option<&AgentObservationCatalog>
 
 #[must_use]
 pub fn step_response_schema() -> Value {
+    step_response_schema_with_catalog(None)
+}
+
+/// Catalog-aware step response: domain constraints from `catalog` propagate
+/// into the embedded observation schema, which carries its own `$id` + `$defs`
+/// so `#/$defs/...` refs resolve in the nested observation scope.
+#[must_use]
+pub fn step_response_schema_with_catalog(catalog: Option<&AgentObservationCatalog>) -> Value {
+    let obs = observation_schema_with_catalog(catalog);
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://bevy-agent.rs/schemas/step-response.json",
         "title": "StepResponse",
         "type": "object",
         "required": ["tick", "observation", "reward", "done", "truncated", "info", "checksum"],
         "properties": {
             "tick": { "type": "integer", "minimum": 0 },
-            "observation": observation_schema(),
+            "observation": { "$ref": "#/$defs/observation" },
             "reward": { "type": "number" },
             "done": { "type": "boolean" },
             "truncated": { "type": "boolean" },
             "info": { "type": "object" },
             "checksum": { "anyOf": [{ "type": "object" }, { "type": "null" }] }
+        },
+        "$defs": {
+            "observation": obs
         }
     })
 }
 
 #[must_use]
 pub fn reset_response_schema() -> Value {
+    reset_response_schema_with_catalog(None)
+}
+
+#[must_use]
+pub fn reset_response_schema_with_catalog(catalog: Option<&AgentObservationCatalog>) -> Value {
+    let obs = observation_schema_with_catalog(catalog);
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://bevy-agent.rs/schemas/reset-response.json",
         "title": "ResetResponse",
         "type": "object",
         "required": ["tick", "observation", "checksum", "snapshot_id", "timeline_id", "branch_id"],
         "properties": {
             "tick": { "type": "integer", "minimum": 0 },
-            "observation": observation_schema(),
+            "observation": { "$ref": "#/$defs/observation" },
             "checksum": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
             "snapshot_id": { "anyOf": [{ "type": "string", "format": "uuid" }, { "type": "null" }] },
             "timeline_id": { "type": "string", "format": "uuid" },
             "branch_id": { "type": "string", "format": "uuid" }
+        },
+        "$defs": {
+            "observation": obs
         }
     })
 }
 
 #[must_use]
 pub fn step_many_response_schema() -> Value {
+    step_many_response_schema_with_catalog(None)
+}
+
+#[must_use]
+pub fn step_many_response_schema_with_catalog(catalog: Option<&AgentObservationCatalog>) -> Value {
+    let obs = observation_schema_with_catalog(catalog);
+    let step = step_response_schema_with_catalog(catalog);
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://bevy-agent.rs/schemas/step-many-response.json",
         "title": "StepManyResponse",
         "type": "object",
         "required": [
@@ -938,13 +1527,16 @@ pub fn step_many_response_schema() -> Value {
             "start_tick": { "type": "integer", "minimum": 0 },
             "end_tick": { "type": "integer", "minimum": 0 },
             "steps": { "type": "integer", "minimum": 0 },
-            "observation": { "anyOf": [observation_schema(), { "type": "null" }] },
+            "observation": { "anyOf": [{ "$ref": "#/$defs/observation" }, { "type": "null" }] },
             "reward": { "type": "number" },
             "done": { "type": "boolean" },
             "truncated": { "type": "boolean" },
             "info": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
             "checksum": { "anyOf": [{ "type": "object" }, { "type": "null" }] },
-            "responses": { "type": "array", "items": step_response_schema() }
+            "responses": { "type": "array", "items": step }
+        },
+        "$defs": {
+            "observation": obs
         }
     })
 }
@@ -953,6 +1545,7 @@ pub fn step_many_response_schema() -> Value {
 pub fn visual_capture_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://bevy-agent.rs/schemas/visual-capture.json",
         "title": "VisualCapture",
         "type": "object",
         "required": ["tick", "frame", "path", "width", "height", "format"],
@@ -967,6 +1560,13 @@ pub fn visual_capture_schema() -> Value {
     })
 }
 
+/// Single-simulation-owner HTTP server: each accepted connection is handled
+/// inline with bounded headers/body ([`MAX_HTTP_HEADER_BYTES`] /
+/// [`MAX_HTTP_BODY_BYTES`]), per-request action/tick budgets
+/// ([`MAX_ACTIONS_PER_REQUEST`] / [`MAX_TICKS_PER_REQUEST`]), a 30s
+/// read/write timeout, and an overall [`HTTP_REQUEST_DEADLINE`]. Only one
+/// `AgentApp` owner executes simulation work; concurrent connections queue on
+/// the listener and are served sequentially.
 #[derive(Clone, Debug)]
 pub struct HttpRemoteServer {
     pub bind_addr: String,
@@ -994,26 +1594,26 @@ impl HttpRemoteServer {
         );
 
         for stream in listener.incoming() {
-            match stream {
-                Ok(mut stream) => {
-                    if let Err(error) = self.handle_connection(env, &mut stream) {
-                        let _ = write_http_response(
-                            &mut stream,
-                            500,
-                            "Internal Server Error",
-                            "application/json",
-                            &json!({ "error": error.to_string() }).to_string(),
-                        );
-                    }
-                }
-                Err(error) => return Err(error.into()),
+            let mut stream = stream?;
+            if let Err(error) = self.handle_connection(env, &mut stream) {
+                let _ = write_http_response(
+                    &mut stream,
+                    500,
+                    "Internal Server Error",
+                    "application/json",
+                    &json!({ "error": error.to_string() }).to_string(),
+                );
             }
         }
         Ok(())
     }
 
     fn handle_connection(&self, env: &mut AgentApp, stream: &mut TcpStream) -> Result<()> {
+        let deadline = Instant::now() + HTTP_REQUEST_DEADLINE;
         let request = read_http_request(stream)?;
+        if request.method == "OPTIONS" {
+            return write_preflight_response(stream, &request, &self.bridge.security);
+        }
         if request.method == "GET" && request.path == "/health" {
             return write_http_response(
                 stream,
@@ -1029,7 +1629,9 @@ impl HttpRemoteServer {
         }
 
         if request.method == "POST" && request.path == "/rpc" {
+            validate_http_rpc(&request, &self.bridge.security)?;
             let response = self.bridge.handle_json(env, &request.body);
+            check_deadline(deadline)?;
             return write_http_response(stream, 200, "OK", "application/json", &response);
         }
 
@@ -1077,8 +1679,11 @@ impl HttpRemoteServer {
 }
 
 struct MainThreadRemoteRequest {
+    #[allow(dead_code)]
+    seq: u64,
     body: String,
     reply: mpsc::Sender<String>,
+    cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Resource)]
@@ -1179,6 +1784,9 @@ fn handle_main_thread_connection(
     stream: &mut TcpStream,
 ) -> Result<()> {
     let request = read_http_request(stream)?;
+    if request.method == "OPTIONS" {
+        return write_preflight_response(stream, &request, security);
+    }
     if request.method == "GET" && request.path == "/health" {
         return write_http_response(
             stream,
@@ -1215,6 +1823,7 @@ fn handle_main_thread_connection(
         }
     }
     if request.method == "POST" && request.path == "/rpc" {
+        validate_http_rpc(&request, security)?;
         let response = request_on_main_thread(sender, request.body)?;
         return write_http_response(stream, 200, "OK", "application/json", &response);
     }
@@ -1227,17 +1836,56 @@ fn handle_main_thread_connection(
     )
 }
 
+/// Explicit lifecycle status for a main-thread remote request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MainThreadRequestStatus {
+    Completed,
+    Rejected,
+    Cancelled,
+    Unknown,
+}
+
+static MAIN_THREAD_SEQ: AtomicU64 = AtomicU64::new(1);
+
 fn request_on_main_thread(
     sender: &mpsc::Sender<MainThreadRemoteRequest>,
     body: String,
 ) -> Result<String> {
+    let (_, result) = request_on_main_thread_with_status(sender, body)?;
+    result
+}
+
+fn request_on_main_thread_with_status(
+    sender: &mpsc::Sender<MainThreadRemoteRequest>,
+    body: String,
+) -> Result<(MainThreadRequestStatus, Result<String>)> {
     let (reply, receiver) = mpsc::channel();
+    let seq = MAIN_THREAD_SEQ.fetch_add(1, Ordering::Relaxed);
+    let cancelled = Arc::new(AtomicBool::new(false));
     sender
-        .send(MainThreadRemoteRequest { body, reply })
+        .send(MainThreadRemoteRequest {
+            seq,
+            body,
+            reply,
+            cancelled: Arc::clone(&cancelled),
+        })
         .map_err(|_| anyhow!("Bevy main-thread remote pump has stopped"))?;
-    receiver
-        .recv_timeout(HTTP_READ_TIMEOUT)
-        .map_err(|error| anyhow!("timed out waiting for Bevy main thread: {error}"))
+    match receiver.recv_timeout(HTTP_REQUEST_DEADLINE) {
+        Ok(response) => Ok((MainThreadRequestStatus::Completed, Ok(response))),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Mark cancelled so the pump skips execution instead of running
+            // the mutation late (no double-execute after timeout).
+            cancelled.store(true, Ordering::SeqCst);
+            Ok((
+                MainThreadRequestStatus::Cancelled,
+                Err(anyhow!("timed out waiting for Bevy main thread")),
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok((
+            MainThreadRequestStatus::Rejected,
+            Err(anyhow!("Bevy main-thread remote pump has stopped")),
+        )),
+    }
 }
 
 fn pump_main_thread_remote(world: &mut World) {
@@ -1251,8 +1899,16 @@ fn pump_main_thread_remote(world: &mut World) {
     };
 
     for request in requests {
+        // Sequence id + cancel flag: if the HTTP side timed out, skip
+        // execution so a mutation is never double-executed late.
+        if request.cancelled.load(Ordering::SeqCst) {
+            continue;
+        }
         #[cfg(feature = "visual")]
         if try_schedule_primary_window_capture(world, &request) {
+            continue;
+        }
+        if request.cancelled.load(Ordering::SeqCst) {
             continue;
         }
         let response = dispatch_json_on_world(world, &request.body);
@@ -1291,8 +1947,25 @@ fn try_schedule_primary_window_capture(
     if rpc.method != "agent.visual.capture" {
         return false;
     }
-    let Ok(params) = serde_json::from_value::<VisualCaptureParams>(rpc.params.clone()) else {
-        return false;
+    // Unify through the validated command path: strict version check first.
+    if let Err(error) = validate_jsonrpc_version(&rpc) {
+        let _ = request.reply.send(error_json_rpc_response(
+            rpc.id,
+            RPC_INVALID_REQUEST,
+            error.to_string(),
+        ));
+        return true;
+    }
+    let params = match serde_json::from_value::<VisualCaptureParams>(rpc.params.clone()) {
+        Ok(params) => params,
+        Err(error) => {
+            let _ = request.reply.send(error_json_rpc_response(
+                rpc.id,
+                RPC_INVALID_PARAMS,
+                format!("invalid params: {error}"),
+            ));
+            return true;
+        }
     };
     let source = params.source.unwrap_or_default();
     if source == CaptureSource::Software
@@ -1307,11 +1980,42 @@ fn try_schedule_primary_window_capture(
         .require_capability(AgentCapability::VISUAL_CAPTURE)
         .and_then(|()| bridge.check_token(params.session_token.as_deref()));
     if let Err(error) = authorization {
-        let _ = request
-            .reply
-            .send(error_json_rpc_response(rpc.id, error.to_string()));
+        let _ = request.reply.send(error_json_rpc_response(
+            rpc.id,
+            RPC_AUTH_ERROR,
+            error.to_string(),
+        ));
         return true;
     }
+
+    // Filesystem confinement for the validated command path.
+    let output_dir = match params.output_dir.clone() {
+        Some(dir) => match bridge.security.resolve_output_dir(&dir) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let _ = request.reply.send(error_json_rpc_response(
+                    rpc.id,
+                    RPC_INTERNAL_ERROR,
+                    error.to_string(),
+                ));
+                return true;
+            }
+        },
+        None => bridge.security.artifact_root_resolved(),
+    };
+    let timeout_frames = params
+        .timeout_frames
+        .unwrap_or_else(|| VisualCaptureOptions::default().timeout_frames);
+    if timeout_frames == 0 {
+        let _ = request.reply.send(error_json_rpc_response(
+            rpc.id,
+            RPC_INVALID_PARAMS,
+            "timeout_frames must be > 0".to_string(),
+        ));
+        return true;
+    }
+    let deadline = timeout_frames_to_duration(timeout_frames);
+    let started = Instant::now();
 
     if !world.resource::<MainThreadRemoteState>().reset_once {
         let reset_request = serde_json::to_string(&JsonRpcRequest {
@@ -1342,6 +2046,7 @@ fn try_schedule_primary_window_capture(
         let Some(window) = windows.iter(world).next() else {
             let _ = request.reply.send(error_json_rpc_response(
                 rpc.id,
+                RPC_INTERNAL_ERROR,
                 "visual capture requires a primary window".to_string(),
             ));
             return true;
@@ -1354,32 +2059,60 @@ fn try_schedule_primary_window_capture(
         )
     };
     let options = VisualCaptureOptions {
-        output_dir: params
-            .output_dir
-            .unwrap_or_else(|| VisualCaptureOptions::default().output_dir),
+        output_dir,
         label: params.label,
-        timeout_frames: params
-            .timeout_frames
-            .unwrap_or_else(|| VisualCaptureOptions::default().timeout_frames),
+        timeout_frames,
         source,
     };
     let path = match visual_capture_path(&options, tick, frame) {
         Ok(path) => path,
         Err(error) => {
-            let _ = request
-                .reply
-                .send(error_json_rpc_response(rpc.id, error.to_string()));
+            let _ = request.reply.send(error_json_rpc_response(
+                rpc.id,
+                RPC_INTERNAL_ERROR,
+                error.to_string(),
+            ));
             return true;
         }
     };
     let reply = request.reply.clone();
+    let cancelled = Arc::clone(&request.cancelled);
     let id = rpc.id;
     let result_path = path.clone();
-    let mut save = save_to_disk(path);
+    let mut save = save_to_disk(path.clone());
+    // Watchdog: fail with a typed error if the frame deadline expires.
+    {
+        let reply = reply.clone();
+        let id = id.clone();
+        let result_path = result_path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(deadline + Duration::from_millis(100));
+            // If the capture file never materialized/validated, report expiry.
+            if verify_visual_capture_file(&result_path).is_err()
+                && started.elapsed() >= deadline
+                && !cancelled.load(Ordering::SeqCst)
+            {
+                let _ = reply.send(error_json_rpc_response(
+                    id,
+                    RPC_INTERNAL_ERROR,
+                    format!("primary-window capture timed out after {timeout_frames} frames"),
+                ));
+            }
+        });
+    }
     world
         .spawn(Screenshot::primary_window())
         .observe(move |captured: On<ScreenshotCaptured>| {
             save(captured);
+            // Check file exists + PNG magic after save; typed error on failure.
+            if let Err(error) = verify_visual_capture_file(&result_path) {
+                let _ = reply.send(error_json_rpc_response(
+                    id.clone(),
+                    RPC_INTERNAL_ERROR,
+                    format!("capture failed verification: {error}"),
+                ));
+                return;
+            }
             let result = VisualCaptureResult {
                 tick,
                 frame,
@@ -1400,14 +2133,11 @@ fn try_schedule_primary_window_capture(
 }
 
 #[cfg(feature = "visual")]
-fn error_json_rpc_response(id: Value, message: String) -> String {
+fn error_json_rpc_response(id: Value, code: i32, message: String) -> String {
     serde_json::to_string(&JsonRpcResponse::Error {
         jsonrpc: "2.0",
         id,
-        error: JsonRpcError {
-            code: -32603,
-            message,
-        },
+        error: JsonRpcError { code, message },
     })
     .expect("JSON-RPC error response is serializable")
 }
@@ -1570,6 +2300,70 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
+fn check_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() > deadline {
+        return Err(anyhow!("request deadline exceeded"));
+    }
+    Ok(())
+}
+
+/// Validate HTTP RPC preconditions: browser `Origin` gating (mirrors the
+/// WebSocket rule: tokenless servers reject browser-originated traffic) and
+/// mandatory `Content-Type: application/json`.
+fn validate_http_rpc(request: &HttpRequest, security: &RemoteSecurity) -> Result<()> {
+    validate_http_origin(request, security)?;
+    let content_type = request.header("content-type").unwrap_or("");
+    if !content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("application/json")
+    {
+        return Err(anyhow!("POST /rpc requires Content-Type: application/json"));
+    }
+    Ok(())
+}
+
+fn validate_http_origin(request: &HttpRequest, security: &RemoteSecurity) -> Result<()> {
+    if security.session_token.is_none() && request.header("origin").is_some() {
+        return Err(anyhow!(
+            "HTTP requests with an Origin header require a session token"
+        ));
+    }
+    Ok(())
+}
+
+/// CORS header value: only echo an explicitly allowed origin, otherwise none.
+fn cors_allow_origin(request: &HttpRequest, security: &RemoteSecurity) -> Option<String> {
+    let allowed = security.allowed_origin.as_deref()?;
+    let origin = request.header("origin")?;
+    if origin == allowed {
+        Some(allowed.to_string())
+    } else {
+        None
+    }
+}
+
+fn write_preflight_response(
+    stream: &mut TcpStream,
+    request: &HttpRequest,
+    security: &RemoteSecurity,
+) -> Result<()> {
+    let _ = stream.set_write_timeout(Some(HTTP_WRITE_TIMEOUT));
+    let mut response =
+        String::from("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n");
+    if let Some(origin) = cors_allow_origin(request, security) {
+        response.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\n"));
+        response.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+        response.push_str("Access-Control-Allow-Headers: Content-Type\r\n");
+    }
+    response.push_str("\r\n");
+    stream.write_all(response.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
 fn write_http_response(
     stream: &mut TcpStream,
     status: u16,
@@ -1577,16 +2371,37 @@ fn write_http_response(
     content_type: &str,
     body: &str,
 ) -> Result<()> {
-    let response = format!(
+    write_http_response_with_security(stream, status, reason, content_type, body, None, None)
+}
+
+fn write_http_response_with_security(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &str,
+    request: Option<&HttpRequest>,
+    security: Option<&RemoteSecurity>,
+) -> Result<()> {
+    // No wildcard CORS by default. Only echo an explicitly configured
+    // `allowed_origin`, and only when it matches the request Origin.
+    let cors = match (request, security) {
+        (Some(req), Some(sec)) => cors_allow_origin(req, sec),
+        _ => None,
+    };
+    let _ = stream.set_write_timeout(Some(HTTP_WRITE_TIMEOUT));
+    let mut response = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
+         Connection: close\r\n",
         body.len()
     );
+    if let Some(origin) = cors {
+        response.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\n"));
+    }
+    response.push_str("\r\n");
+    response.push_str(body);
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
     Ok(())
@@ -1735,6 +2550,40 @@ mod tests {
 
         assert_eq!(action["title"], "AgentAction");
         assert!(action["oneOf"].as_array().unwrap().len() >= 10);
+        let action_variant = |name: &str| {
+            action["oneOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|variant| {
+                    variant["properties"]["type"]["const"]
+                        .as_str()
+                        .is_some_and(|kind| kind == name)
+                })
+                .unwrap_or_else(|| panic!("{name} action schema is missing"))
+        };
+        let move_action = action_variant("Move");
+        assert_eq!(move_action["properties"]["x"]["minimum"], -1.0);
+        assert_eq!(move_action["properties"]["x"]["maximum"], 1.0);
+        assert_eq!(move_action["properties"]["y"]["minimum"], -1.0);
+        assert_eq!(move_action["properties"]["y"]["maximum"], 1.0);
+        let look_action = action_variant("Look");
+        assert_eq!(
+            look_action["properties"]["yaw_delta"]["minimum"],
+            -LOOK_YAW_DELTA_LIMIT_RADIANS
+        );
+        assert_eq!(
+            look_action["properties"]["yaw_delta"]["maximum"],
+            LOOK_YAW_DELTA_LIMIT_RADIANS
+        );
+        assert_eq!(
+            look_action["properties"]["pitch_delta"]["minimum"],
+            -LOOK_PITCH_DELTA_LIMIT_RADIANS
+        );
+        assert_eq!(
+            look_action["properties"]["pitch_delta"]["maximum"],
+            LOOK_PITCH_DELTA_LIMIT_RADIANS
+        );
         assert_eq!(observation["title"], "Observation");
         assert!(observation["$defs"]["player"].is_object());
         assert!(observation["$defs"]["pixelObservation"].is_object());
@@ -2117,6 +2966,7 @@ mod tests {
         let no_control = JsonRpcBridge::new(RemoteSecurity {
             session_token: Some("secret".to_string()),
             capabilities,
+            ..Default::default()
         });
         assert!(
             no_control
@@ -2190,6 +3040,244 @@ mod tests {
             err.to_string().contains("unmasked"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn empty_session_token_is_invalid_config() {
+        assert!(
+            JsonRpcBridge::try_new(RemoteSecurity {
+                session_token: Some(String::new()),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            JsonRpcBridge::with_security(RemoteSecurity {
+                session_token: Some(String::new()),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must not be empty")]
+    fn new_panics_on_empty_session_token() {
+        let _ = JsonRpcBridge::new(RemoteSecurity {
+            session_token: Some(String::new()),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn observation_visibility_requires_full_state_for_hybrid_and_debug() {
+        assert_eq!(
+            capability_for_observation_mode(&ObservationMode::Hybrid),
+            AgentCapability::OBSERVE_FULL_STATE
+        );
+        assert_eq!(
+            capability_for_observation_mode(&ObservationMode::FullDebugState),
+            AgentCapability::OBSERVE_FULL_STATE
+        );
+        assert_eq!(
+            capability_for_observation_mode(&ObservationMode::PlayerKnowledge),
+            AgentCapability::OBSERVE_PLAYER
+        );
+        // Player-only bridge authorizes player modes but not full-state modes.
+        let player_only = JsonRpcBridge::new(RemoteSecurity {
+            capabilities: AgentCapability::STEP | AgentCapability::OBSERVE_PLAYER,
+            ..Default::default()
+        });
+        assert!(
+            player_only
+                .authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: Some(capability_for_observation_mode(
+                        &ObservationMode::PlayerKnowledge
+                    )),
+                    snapshot_export: false,
+                    restore_import: false,
+                    filesystem: false,
+                    control: None,
+                })
+                .is_ok()
+        );
+        assert!(
+            player_only
+                .authorize_operation(&OperationRequires {
+                    mutation: None,
+                    observation_visibility: Some(capability_for_observation_mode(
+                        &ObservationMode::Hybrid
+                    )),
+                    snapshot_export: false,
+                    restore_import: false,
+                    filesystem: false,
+                    control: None,
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn filesystem_confinement_rejects_absolute_and_traversal() {
+        let security = RemoteSecurity {
+            artifact_root: Some(PathBuf::from("/tmp/bevy-test-root")),
+            ..Default::default()
+        };
+        assert!(security.resolve_artifact_path("/etc/passwd").is_err());
+        assert!(security.resolve_artifact_path("../escape").is_err());
+        assert!(security.resolve_artifact_path("a/../../escape").is_err());
+        assert!(security.resolve_artifact_path("replays/a.json").is_ok());
+        assert!(
+            security
+                .resolve_output_dir(&PathBuf::from("/abs/dir"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn http_origin_rejected_without_token_and_content_type_required() {
+        let open = RemoteSecurity::default();
+        let origin_req = HttpRequest {
+            method: "POST".to_string(),
+            path: "/rpc".to_string(),
+            headers: vec![
+                ("Origin".to_string(), "http://evil.example".to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            body: "{}".to_string(),
+        };
+        assert!(validate_http_rpc(&origin_req, &open).is_err());
+        let authed = RemoteSecurity {
+            session_token: Some("secret".to_string()),
+            allowed_origin: Some("http://good.example".to_string()),
+            ..Default::default()
+        };
+        let good_req = HttpRequest {
+            method: "POST".to_string(),
+            path: "/rpc".to_string(),
+            headers: vec![
+                ("Origin".to_string(), "http://good.example".to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            body: "{}".to_string(),
+        };
+        assert!(validate_http_rpc(&good_req, &authed).is_ok());
+        // Wrong content type rejected even with valid origin/token setup.
+        let bad_ct = HttpRequest {
+            method: "POST".to_string(),
+            path: "/rpc".to_string(),
+            headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
+            body: "{}".to_string(),
+        };
+        assert!(validate_http_rpc(&bad_ct, &authed).is_err());
+        // CORS echoes only the configured allowed origin.
+        assert_eq!(
+            cors_allow_origin(&good_req, &authed),
+            Some("http://good.example".to_string())
+        );
+        let evil_req = HttpRequest {
+            method: "POST".to_string(),
+            path: "/rpc".to_string(),
+            headers: vec![
+                ("Origin".to_string(), "http://evil.example".to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            body: "{}".to_string(),
+        };
+        assert!(cors_allow_origin(&evil_req, &authed).is_none());
+        assert!(cors_allow_origin(&good_req, &RemoteSecurity::default()).is_none());
+    }
+
+    #[test]
+    fn rpc_error_codes_are_documented() {
+        assert_eq!(RPC_METHOD_NOT_FOUND, -32601);
+        assert_eq!(RPC_INVALID_PARAMS, -32602);
+        assert_eq!(RPC_AUTH_ERROR, -32001);
+        assert_eq!(RPC_INTERNAL_ERROR, -32603);
+        assert_eq!(method_not_found("x").code, -32601);
+        assert_eq!(invalid_params("x").code, -32602);
+        assert_eq!(auth_error("x").code, -32001);
+    }
+
+    #[test]
+    fn request_budgets_are_enforced_as_constants() {
+        assert_eq!(MAX_ACTIONS_PER_REQUEST, 1024);
+        assert_eq!(MAX_TICKS_PER_REQUEST, 10_000);
+        assert!(!timeout_frames_to_duration(8).is_zero());
+    }
+
+    #[test]
+    fn observation_schema_has_id_and_refs_resolve() {
+        for schema in [
+            observation_schema(),
+            step_response_schema(),
+            reset_response_schema(),
+            step_many_response_schema(),
+            visual_capture_schema(),
+        ] {
+            assert!(schema.get("$schema").is_some());
+            assert!(schema.get("$id").is_some());
+            assert_refs_resolve(&schema, &schema);
+        }
+        // Catalog-aware domain constraints propagate to outer builders.
+        let observations = AgentObservationCatalog {
+            schema: Some(json!({
+                "type": "object",
+                "required": ["phase"],
+                "properties": { "phase": { "type": "string" } }
+            })),
+        };
+        let step = step_response_schema_with_catalog(Some(&observations));
+        let text = serde_json::to_string(&step).unwrap();
+        assert!(text.contains("phase"));
+        assert_refs_resolve(&step, &step);
+    }
+
+    /// Manual `$ref` resolver (no new deps): every `#/...` pointer must
+    /// resolve against the nearest enclosing `$id` scope (JSON Schema 2020-12
+    /// base-URI behavior for nested resources).
+    fn assert_refs_resolve(node: &Value, root: &Value) {
+        check_refs_scoped(node, root, root);
+    }
+
+    fn check_refs_scoped(node: &Value, scope: &Value, outer: &Value) {
+        match node {
+            Value::Object(map) => {
+                // A nested $id starts a new resource scope for its children.
+                let scope = if map.contains_key("$id") { node } else { scope };
+                if let Some(r) = map.get("$ref").and_then(Value::as_str) {
+                    let resolved =
+                        resolve_local_pointer(scope, r).or_else(|| resolve_local_pointer(outer, r));
+                    assert!(
+                        resolved.is_some(),
+                        "unresolvable $ref {r} in scope {}",
+                        scope.get("$id").unwrap_or(&Value::Null)
+                    );
+                }
+                for value in map.values() {
+                    check_refs_scoped(value, scope, outer);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    check_refs_scoped(item, scope, outer);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_local_pointer(root: &Value, pointer: &str) -> Option<Value> {
+        let path = pointer.strip_prefix('#')?;
+        if path.is_empty() {
+            return Some(root.clone());
+        }
+        let mut current = root;
+        for part in path.split('/').filter(|s| !s.is_empty()) {
+            current = current.get(part)?;
+        }
+        Some(current.clone())
     }
 
     fn masked_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {

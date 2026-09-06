@@ -11,17 +11,19 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    let url =
-        take_option(&mut args, "--url").unwrap_or_else(|| "http://127.0.0.1:4000/rpc".to_string());
-    let token = take_option(&mut args, "--token").or_else(|| std::env::var("AGENT_TOKEN").ok());
+    let url = take_value_option(&mut args, "--url")?
+        .unwrap_or_else(|| "http://127.0.0.1:4000/rpc".to_string());
+    let token =
+        take_value_option(&mut args, "--token")?.or_else(|| std::env::var("AGENT_TOKEN").ok());
 
     if args.is_empty() {
         print_usage();
-        return Ok(());
+        std::process::exit(2);
     }
 
     let command = args.remove(0);
     let (method, mut params) = build_request(&command, &mut args)?;
+    ensure_no_leftover_args(&args)?;
     if let Some(token) = token {
         params["session_token"] = Value::String(token);
     }
@@ -34,7 +36,65 @@ fn main() -> Result<()> {
     });
     let response = post_json_rpc(&url, &request)?;
     println!("{}", serde_json::to_string_pretty(&response)?);
+    if is_jsonrpc_error(&response) {
+        eprintln!("json-rpc error: {}", response["error"]);
+        std::process::exit(2);
+    }
     Ok(())
+}
+
+fn ensure_no_leftover_args(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("unknown argument(s): {}", args.join(" ")))
+    }
+}
+
+fn is_jsonrpc_error(response: &Value) -> bool {
+    response.get("error").is_some_and(|error| !error.is_null())
+}
+
+fn parse_observation_mode(value: &str) -> Result<String> {
+    const VALID: &[&str] = &[
+        "PlayerKnowledge",
+        "FullDebugState",
+        "DiffSinceLastTick",
+        "PixelFrame",
+        "Hybrid",
+    ];
+    if VALID.contains(&value) {
+        Ok(value.to_string())
+    } else {
+        Err(anyhow!(
+            "invalid --mode {value:?}; expected one of {}",
+            VALID.join("|")
+        ))
+    }
+}
+
+fn parse_return_mode(value: &str) -> Result<String> {
+    const VALID: &[&str] = &["last", "all", "none"];
+    if VALID.contains(&value) {
+        Ok(value.to_string())
+    } else {
+        Err(anyhow!(
+            "invalid --return {value:?}; expected one of {}",
+            VALID.join("|")
+        ))
+    }
+}
+
+fn parse_capture_source(value: &str) -> Result<String> {
+    const VALID: &[&str] = &["auto", "software", "primary_window"];
+    if VALID.contains(&value) {
+        Ok(value.to_string())
+    } else {
+        Err(anyhow!(
+            "invalid --source {value:?}; expected one of {}",
+            VALID.join("|")
+        ))
+    }
 }
 
 fn build_request(command: &str, args: &mut Vec<String>) -> Result<(&'static str, Value)> {
@@ -50,8 +110,10 @@ fn build_request(command: &str, args: &mut Vec<String>) -> Result<(&'static str,
                 .map(|value| value.parse::<u64>())
                 .transpose()?
                 .unwrap_or(0);
-            let observation_mode =
-                take_option(args, "--mode").unwrap_or_else(|| "Hybrid".to_string());
+            let observation_mode = match take_value_option(args, "--mode")? {
+                Some(mode) => parse_observation_mode(&mode)?,
+                None => "Hybrid".to_string(),
+            };
             Ok((
                 "agent.reset",
                 json!({
@@ -64,77 +126,105 @@ fn build_request(command: &str, args: &mut Vec<String>) -> Result<(&'static str,
             ))
         }
         "step" => {
-            let action = args
-                .first()
-                .ok_or_else(|| anyhow!("step requires an action JSON argument"))?;
+            if args.is_empty() {
+                return Err(anyhow!("step requires an action JSON argument"));
+            }
+            let action = args.remove(0);
+            let observation_mode = match take_value_option(args, "--mode")? {
+                Some(mode) => parse_observation_mode(&mode)?,
+                None => "Hybrid".to_string(),
+            };
             Ok((
                 "agent.step",
                 json!({
-                    "action": serde_json::from_str::<Value>(action)?,
-                    "observation_mode": take_option(args, "--mode").unwrap_or_else(|| "Hybrid".to_string()),
+                    "action": serde_json::from_str::<Value>(&action)?,
+                    "observation_mode": observation_mode,
                 }),
             ))
         }
         "step-many" => {
-            let actions = args
-                .first()
-                .ok_or_else(|| anyhow!("step-many requires an action array JSON argument"))?;
+            if args.is_empty() {
+                return Err(anyhow!("step-many requires an action array JSON argument"));
+            }
+            let actions = args.remove(0);
+            let return_observations = match take_value_option(args, "--return")? {
+                Some(value) => parse_return_mode(&value)?,
+                None => "last".to_string(),
+            };
             Ok((
                 "agent.step_many",
                 json!({
-                    "actions": serde_json::from_str::<Value>(actions)?,
+                    "actions": serde_json::from_str::<Value>(&actions)?,
                     "stop_on_done": !has_flag(args, "--no-stop-on-done"),
-                    "return_observations": take_option(args, "--return").unwrap_or_else(|| "last".to_string()),
+                    "return_observations": return_observations,
                 }),
             ))
         }
-        "observe" => Ok((
-            "agent.observe",
-            json!({
-                "observation_mode": take_option(args, "--mode").unwrap_or_else(|| "Hybrid".to_string()),
-            }),
-        )),
-        "capture" => Ok((
-            "agent.visual.capture",
-            json!({
-                "output_dir": take_option(args, "--out-dir").unwrap_or_else(|| "screenshots".to_string()),
-                "label": take_option(args, "--label"),
-                "timeout_frames": take_option(args, "--timeout-frames")
-                    .map(|value| value.parse::<u32>())
-                    .transpose()?
-                    .unwrap_or(8),
-            }),
-        )),
+        "observe" => {
+            let observation_mode = match take_value_option(args, "--mode")? {
+                Some(mode) => parse_observation_mode(&mode)?,
+                None => "Hybrid".to_string(),
+            };
+            Ok((
+                "agent.observe",
+                json!({
+                    "observation_mode": observation_mode,
+                }),
+            ))
+        }
+        "capture" => {
+            let output_dir =
+                take_value_option(args, "--out-dir")?.unwrap_or_else(|| "screenshots".to_string());
+            let label = take_value_option(args, "--label")?;
+            let timeout_frames = take_value_option(args, "--timeout-frames")?
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(8);
+            let source = match take_value_option(args, "--source")? {
+                Some(value) => parse_capture_source(&value)?,
+                None => "auto".to_string(),
+            };
+            Ok((
+                "agent.visual.capture",
+                json!({
+                    "output_dir": output_dir,
+                    "label": label,
+                    "timeout_frames": timeout_frames,
+                    "source": source,
+                }),
+            ))
+        }
         "fast-forward" => {
-            let ticks = args
-                .first()
-                .ok_or_else(|| anyhow!("fast-forward requires a tick count"))?
-                .parse::<u64>()?;
+            if args.is_empty() {
+                return Err(anyhow!("fast-forward requires a tick count"));
+            }
+            let ticks = args.remove(0).parse::<u64>()?;
             Ok(("agent.fast_forward", json!({ "ticks": ticks })))
         }
         "snapshot" => Ok(("agent.snapshot.create", json!({}))),
         "snapshots" => Ok(("agent.snapshot.list", json!({}))),
         "restore" => {
-            let snapshot_id = args
-                .first()
-                .ok_or_else(|| anyhow!("restore requires a snapshot id"))?;
+            if args.is_empty() {
+                return Err(anyhow!("restore requires a snapshot id"));
+            }
+            let snapshot_id = args.remove(0);
             Ok((
                 "agent.snapshot.restore",
                 json!({ "snapshot_id": snapshot_id }),
             ))
         }
         "restore-tick" => {
-            let tick = args
-                .first()
-                .ok_or_else(|| anyhow!("restore-tick requires a tick"))?
-                .parse::<u64>()?;
+            if args.is_empty() {
+                return Err(anyhow!("restore-tick requires a tick"));
+            }
+            let tick = args.remove(0).parse::<u64>()?;
             Ok(("agent.timeline.restore_tick", json!({ "tick": tick })))
         }
         "branch" => {
-            let from_tick = take_option(args, "--from-tick")
+            let from_tick = take_value_option(args, "--from-tick")?
                 .ok_or_else(|| anyhow!("branch requires --from-tick <tick>"))?
                 .parse::<u64>()?;
-            let label = take_option(args, "--label");
+            let label = take_value_option(args, "--label")?;
             Ok((
                 "agent.timeline.branch",
                 json!({ "from_tick": from_tick, "label": label }),
@@ -142,14 +232,19 @@ fn build_request(command: &str, args: &mut Vec<String>) -> Result<(&'static str,
         }
         "replay-start" => Ok(("agent.replay.start", json!({}))),
         "replay-stop" => Ok(("agent.replay.stop", json!({}))),
-        "replay-export" => Ok((
-            "agent.replay.export",
-            json!({ "path": args.first().cloned() }),
-        )),
+        "replay-export" => {
+            let path = if args.first().is_some_and(|arg| !arg.starts_with("--")) {
+                Some(args.remove(0))
+            } else {
+                None
+            };
+            Ok(("agent.replay.export", json!({ "path": path })))
+        }
         "replay-load" => {
-            let path = args
-                .first()
-                .ok_or_else(|| anyhow!("replay-load requires a path"))?;
+            if args.is_empty() {
+                return Err(anyhow!("replay-load requires a path"));
+            }
+            let path = args.remove(0);
             Ok(("agent.replay.load", json!({ "path": path })))
         }
         _ => Err(anyhow!("unknown command {command}")),
@@ -257,6 +352,7 @@ fn parse_host_port(host_port: &str) -> Result<(String, u16)> {
     }
 }
 
+#[allow(dead_code)]
 fn take_option(args: &mut Vec<String>, name: &str) -> Option<String> {
     let index = args.iter().position(|arg| arg == name)?;
     args.remove(index);
@@ -300,7 +396,7 @@ fn print_usage() {
            step '<action-json>' [--mode Hybrid]\n\
            step-many '<actions-json-array>' [--return last|all|none]\n\
            observe [--mode Hybrid]\n\
-           capture [--out-dir screenshots] [--label name] [--timeout-frames N]\n\
+           capture [--out-dir screenshots] [--label name] [--timeout-frames N] [--source auto|software|primary_window]\n\
            fast-forward <ticks>\n\
            snapshot | snapshots | restore <snapshot-id> | restore-tick <tick>\n\
            branch --from-tick <tick> [--label name]\n\
@@ -594,5 +690,72 @@ mod tests {
         handle.join().unwrap();
 
         assert_eq!(value["error"]["code"], -32603);
+        assert!(is_jsonrpc_error(&value));
+        assert!(!is_jsonrpc_error(
+            &json!({"jsonrpc":"2.0","id":1,"result":{}})
+        ));
+        assert!(!is_jsonrpc_error(
+            &json!({"jsonrpc":"2.0","id":1,"error":null,"result":{}})
+        ));
+    }
+
+    #[test]
+    fn leftover_args_are_rejected() {
+        let args = vec!["--bogus".to_string()];
+        let error = ensure_no_leftover_args(&args).unwrap_err();
+        assert!(error.to_string().contains("unknown argument"));
+
+        // Positional commands must consume their inputs; leftovers error.
+        let mut step = vec![r#"{"type":"Noop"}"#.to_string(), "--extra".to_string()];
+        build_request("step", &mut step).unwrap();
+        let error = ensure_no_leftover_args(&step).unwrap_err();
+        assert!(error.to_string().contains("--extra"));
+    }
+
+    #[test]
+    fn invalid_mode_and_return_values_are_rejected() {
+        let mut args = vec![
+            r#"{"type":"Noop"}"#.to_string(),
+            "--mode".to_string(),
+            "Nope".to_string(),
+        ];
+        assert!(build_request("step", &mut args).is_err());
+
+        let mut args = vec![
+            r#"[]"#.to_string(),
+            "--return".to_string(),
+            "everything".to_string(),
+        ];
+        assert!(build_request("step-many", &mut args).is_err());
+
+        let mut args = vec!["--source".to_string(), "bogus".to_string()];
+        assert!(build_request("capture", &mut args).is_err());
+    }
+
+    #[test]
+    fn missing_option_values_error_strictly() {
+        for option in ["--out-dir", "--label", "--timeout-frames", "--source"] {
+            let mut args = vec![option.to_string()];
+            assert!(
+                build_request("capture", &mut args).is_err(),
+                "{option} should require a value"
+            );
+        }
+        let mut args = vec![r#"{"type":"Noop"}"#.to_string(), "--mode".to_string()];
+        assert!(build_request("step", &mut args).is_err());
+        let mut args = vec!["--from-tick".to_string()];
+        assert!(build_request("branch", &mut args).is_err());
+    }
+
+    #[test]
+    fn capture_includes_source_param() {
+        let mut args = vec!["--source".to_string(), "software".to_string()];
+        let (_, params) = build_request("capture", &mut args).unwrap();
+        assert_eq!(params["source"], "software");
+        assert!(ensure_no_leftover_args(&args).is_ok());
+
+        let mut defaults: Vec<String> = Vec::new();
+        let (_, params) = build_request("capture", &mut defaults).unwrap();
+        assert_eq!(params["source"], "auto");
     }
 }

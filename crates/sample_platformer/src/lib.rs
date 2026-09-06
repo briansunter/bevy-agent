@@ -5,10 +5,11 @@ use std::hash::Hash;
 use anyhow::Result;
 use bevy::prelude::*;
 use bevy_agent_core::{
-    AgentAction, AgentActionKind, AgentControlAppExt, AgentControlState, AgentReset, AgentResetSet,
-    AgentSet, CurrentInputFrame, EntityObservation, EpisodeState, ObjectiveObservation,
-    Observation, ObservationMode, PlayerObservation, RewardState, SimClock, SnapshotEntity,
-    StableEntityId, StableHasher, StableIdAllocator, StateChecksum, SymbolicObservation,
+    AgentAction, AgentActionCatalog, AgentActionKind, AgentControlAppExt, AgentControlState,
+    AgentReset, AgentResetSet, AgentSet, CurrentInputFrame, EntityObservation, EpisodeState,
+    ObjectiveObservation, Observation, ObservationMode, PlayerObservation, RewardState, SimClock,
+    SnapshotEntity, StableEntityId, StableHasher, StableIdAllocator, StateChecksum,
+    SymbolicObservation, validate_action_against_catalog, validate_clock_tick,
 };
 use bevy_agent_runner::{
     AgentControlPlugins, VisualCaptureAppExt, VisualCaptureOptions, VisualCaptureResult,
@@ -28,6 +29,24 @@ pub const PLAYER_SPEED: f32 = 6.0;
 pub const JUMP_SPEED: f32 = 9.5;
 pub const GRAVITY: f32 = -24.0;
 pub const MAX_FALL_SPEED: f32 = -18.0;
+/// Horizontal push added per `Dodge` on top of the summed `Move` base.
+/// Standalone `Dodge` therefore dashes at this speed in the facing/last-move
+/// direction (`+X` when idle); `Move + Dodge` on the same tick composes by
+/// summation instead of overwriting.
+pub const DODGE_DASH_SPEED: f32 = 6.0;
+/// Clamp for the composed horizontal velocity so stacked dodges stay sane.
+pub const MAX_HORIZONTAL_SPEED: f32 = 15.0;
+
+/// Last nonzero horizontal move direction, used as the facing for a
+/// standalone `Dodge` dash. Defaults to `+X` when the player has never moved.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct LastMoveDirection(pub f32);
+
+impl Default for LastMoveDirection {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
 
 #[derive(Component, Clone, Debug, Serialize, Deserialize)]
 pub struct Player {
@@ -91,13 +110,23 @@ impl Plugin for PlatformerPlugin {
         app.init_resource::<PlatformerConfig>()
             .init_resource::<GameScore>()
             .init_resource::<PlatformerState>()
+            .init_resource::<LastMoveDirection>()
             .set_snapshot_metadata("sample_platformer", env!("CARGO_PKG_VERSION"))
             .set_supported_actions([
                 AgentActionKind::Noop,
                 AgentActionKind::Move,
                 AgentActionKind::Jump,
                 AgentActionKind::Dodge,
-            ]);
+            ])
+            // Discovery advertises only the implemented observation modes:
+            // Symbolic (via PlayerKnowledge) and Hybrid (symbolic + debug).
+            // PixelFrame/DiffSinceLastTick/FullDebugState fall back to symbolic
+            // (see `platformer_observation`).
+            .set_observation_schema(serde_json::json!({
+                "modes": ["Hybrid", "PlayerKnowledge"],
+                "kind": "Symbolic",
+                "notes": "Hybrid carries symbolic + optional debug; PixelFrame/DiffSinceLastTick/FullDebugState fall back to symbolic with no pixel capture.",
+            }));
         register_snapshot_components!(
             app,
             StableEntityId,
@@ -295,34 +324,83 @@ fn spawn_goal(world: &mut World, translation: Vec3) {
     ));
 }
 
-fn reset_tick_reward(mut reward: ResMut<RewardState>) {
+fn reset_tick_reward(mut reward: ResMut<RewardState>, episode: Res<EpisodeState>) {
+    // Absorbing terminal semantics: once done/truncated, ticks must not
+    // accumulate shaping rewards (post-terminal ticks are no-ops).
+    if !episode.should_accumulate_reward() {
+        reward.current_reward = 0.0;
+        return;
+    }
     reward.current_reward = -0.001;
     reward.cumulative_reward += reward.current_reward;
 }
 
+/// Compound input semantics:
+///
+/// * Multiple `Move` actions on the same tick are summed (not overwritten:
+///   the last writer does not win) into a single horizontal base.
+/// * `Dodge` adds a horizontal dash push (`DODGE_DASH_SPEED`) on top of that
+///   base instead of scaling whatever `Move` wrote last. A standalone
+///   `Dodge` therefore dashes in the facing direction: the current tick's
+///   move direction when moving, else the last nonzero move direction
+///   (`LastMoveDirection`, default `+X` when idle).
+/// * Actions rejected by [`validate_action_against_catalog`] (unsupported
+///   kinds, non-finite or out-of-`[-1, 1]` `Move` payloads) are skipped.
+/// * When the episode is terminal (absorbing), inputs are ignored so the
+///   player freezes until a reset.
 fn apply_player_actions(
     input: Res<CurrentInputFrame>,
+    catalog: Res<AgentActionCatalog>,
+    episode: Res<EpisodeState>,
+    mut last_direction: ResMut<LastMoveDirection>,
     mut player: Query<(&mut Velocity, &OnGround), With<Player>>,
 ) {
     let Ok((mut velocity, on_ground)) = player.single_mut() else {
         return;
     };
 
-    velocity.linvel.x = 0.0;
+    if episode.is_terminal() {
+        velocity.linvel.x = 0.0;
+        return;
+    }
+
+    let mut move_base = 0.0_f32;
+    let mut dodge_count = 0_u32;
+    let mut jumped = false;
     for action in &input.actions {
+        if validate_action_against_catalog(&catalog, action).is_err() {
+            continue;
+        }
         match action {
             AgentAction::Move { x, .. } => {
-                velocity.linvel.x = x.clamp(-1.0, 1.0) * PLAYER_SPEED;
+                let clamped = x.clamp(-1.0, 1.0);
+                move_base += clamped * PLAYER_SPEED;
+                if clamped != 0.0 {
+                    last_direction.0 = clamped.signum();
+                }
             }
-            AgentAction::Jump if on_ground.0 => {
+            AgentAction::Jump if on_ground.0 && !jumped => {
                 velocity.linvel.y = JUMP_SPEED;
+                jumped = true;
             }
             AgentAction::Dodge => {
-                velocity.linvel.x *= 1.75;
+                dodge_count += 1;
             }
             _ => {}
         }
     }
+
+    // Sum, don't overwrite: dodge push composes with the move base.
+    let mut horizontal = move_base;
+    if dodge_count > 0 {
+        let facing = if move_base != 0.0 {
+            move_base.signum()
+        } else {
+            last_direction.0
+        };
+        horizontal += facing * DODGE_DASH_SPEED * dodge_count as f32;
+    }
+    velocity.linvel.x = horizontal.clamp(-MAX_HORIZONTAL_SPEED, MAX_HORIZONTAL_SPEED);
 }
 
 #[allow(clippy::type_complexity)]
@@ -331,6 +409,14 @@ fn physics_step(
     mut player: Query<(&mut Transform, &mut Velocity, &Collider, &mut OnGround), With<Player>>,
     platforms: Query<(&Transform, &Collider), (With<Platform>, Without<Player>)>,
 ) {
+    // Validate imported clock values (snapshot/timeline restores): a corrupt
+    // tick/dt would poison integration, so freeze instead of exploding.
+    if validate_clock_tick(clock.tick).is_err()
+        || !clock.dt_seconds.is_finite()
+        || clock.dt_seconds <= 0.0
+    {
+        return;
+    }
     let Ok((mut transform, mut velocity, collider, mut on_ground)) = player.single_mut() else {
         return;
     };
@@ -365,7 +451,12 @@ fn collect_coins(
     mut score: ResMut<GameScore>,
     mut state: ResMut<PlatformerState>,
     mut reward: ResMut<RewardState>,
+    episode: Res<EpisodeState>,
 ) {
+    // No reward accumulation post-terminal (absorbing episodes).
+    if !episode.should_accumulate_reward() {
+        return;
+    }
     let Ok((player_transform, player_collider)) = player.single() else {
         return;
     };
@@ -386,6 +477,12 @@ fn collect_coins(
     }
 }
 
+/// Terminal semantics are absorbing: once `done`/`truncated` is set the
+/// episode stays terminal until a reset. Post-terminal ticks are no-ops —
+/// inputs are ignored (`apply_player_actions`), tick/coin rewards stop
+/// accumulating (`reset_tick_reward`, `collect_coins`), and stepping past
+/// terminal without a reset must be rejected at the controller boundary
+/// (`EpisodeState::ensure_not_terminal`).
 #[allow(clippy::too_many_arguments)]
 fn check_terminal_state(
     clock: Res<SimClock>,
@@ -579,6 +676,14 @@ fn world_to_pixel(
     (x, y)
 }
 
+/// Observation modes: only Symbolic and Hybrid are implemented. `Hybrid`
+/// returns symbolic plus a debug payload; `PlayerKnowledge` maps to plain
+/// `Symbolic`. `PixelFrame`, `DiffSinceLastTick`, and `FullDebugState` have
+/// no dedicated extractor here and fall back to `Symbolic` (documented in the
+/// discovery schema set in [`PlatformerPlugin`]); pixel capture stays `None`
+/// unless a visual renderer is installed. Callers that need strictness should
+/// use `ObservationMode::validate_supported()` to surface
+/// `UnsupportedObservationMode` instead of taking this fallback.
 fn platformer_observation(world: &mut World, mode: ObservationMode) -> Observation {
     let tick = world.resource::<SimClock>().tick;
     let score_value = world.resource::<GameScore>().value;
@@ -802,5 +907,96 @@ mod tests {
         app.world_mut().get_mut::<OnGround>(player).unwrap().0 = true;
         let grounded = platformer_checksum(app.world_mut()).hash;
         assert_ne!(grounded, damaged);
+    }
+
+    fn reset_app() -> App {
+        let mut app = build_headless_app();
+        app.finish();
+        app.cleanup();
+        app.world_mut().run_schedule(AgentReset);
+        app
+    }
+
+    fn player_velocity(app: &mut App) -> Vec2 {
+        app.world_mut()
+            .query_filtered::<&Velocity, With<Player>>()
+            .single(app.world())
+            .map(|velocity| velocity.linvel)
+            .unwrap()
+    }
+
+    fn step_with(app: &mut App, actions: Vec<AgentAction>) {
+        use bevy_agent_core::{ActionSource, AgentActionQueue, run_agent_tick};
+        let next_tick = app.world().resource::<SimClock>().tick + 1;
+        for action in actions {
+            app.world_mut().resource_mut::<AgentActionQueue>().schedule(
+                next_tick,
+                ActionSource::Agent,
+                action,
+            );
+        }
+        run_agent_tick(app.world_mut());
+    }
+
+    #[test]
+    fn standalone_dodge_dashes_in_default_plus_x() {
+        let mut app = reset_app();
+        step_with(&mut app, vec![AgentAction::Dodge]);
+        assert_eq!(player_velocity(&mut app).x, DODGE_DASH_SPEED);
+    }
+
+    #[test]
+    fn move_and_dodge_on_same_tick_sum() {
+        let mut app = reset_app();
+        step_with(
+            &mut app,
+            vec![AgentAction::Move { x: 1.0, y: 0.0 }, AgentAction::Dodge],
+        );
+        assert_eq!(player_velocity(&mut app).x, PLAYER_SPEED + DODGE_DASH_SPEED);
+    }
+
+    #[test]
+    fn multiple_moves_sum_instead_of_overwriting() {
+        let mut app = reset_app();
+        step_with(
+            &mut app,
+            vec![
+                AgentAction::Move { x: 0.5, y: 0.0 },
+                AgentAction::Move { x: 0.5, y: 0.0 },
+            ],
+        );
+        assert!((player_velocity(&mut app).x - PLAYER_SPEED).abs() < 1e-5);
+    }
+
+    #[test]
+    fn invalid_move_payload_is_rejected() {
+        let mut app = reset_app();
+        step_with(&mut app, vec![AgentAction::Move { x: 5.0, y: 0.0 }]);
+        assert_eq!(player_velocity(&mut app).x, 0.0);
+    }
+
+    #[test]
+    fn terminal_episode_freezes_player_and_stops_rewards() {
+        let mut app = reset_app();
+        app.world_mut().resource_mut::<EpisodeState>().done = true;
+        app.world_mut().resource_mut::<EpisodeState>().reason = Some("goal_reached".to_string());
+        let cumulative = app.world().resource::<RewardState>().cumulative_reward;
+        step_with(
+            &mut app,
+            vec![AgentAction::Move { x: 1.0, y: 0.0 }, AgentAction::Dodge],
+        );
+        assert_eq!(player_velocity(&mut app).x, 0.0);
+        let reward = app.world().resource::<RewardState>().clone();
+        assert_eq!(reward.current_reward, 0.0);
+        assert_eq!(reward.cumulative_reward, cumulative);
+    }
+
+    #[test]
+    fn unimplemented_observation_modes_fall_back_to_symbolic() {
+        let mut app = reset_app();
+        let symbolic = platformer_observation(app.world_mut(), ObservationMode::PixelFrame);
+        assert!(matches!(symbolic, Observation::Symbolic(_)));
+        let hybrid = platformer_observation(app.world_mut(), ObservationMode::Hybrid);
+        assert!(matches!(hybrid, Observation::Hybrid { .. }));
     }
 }

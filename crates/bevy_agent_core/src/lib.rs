@@ -21,6 +21,12 @@ pub enum AgentControlError {
     MissingStepResponse,
     #[error("requested resource is not installed: {0}")]
     MissingResource(&'static str),
+    #[error("invalid action: {0}")]
+    InvalidAction(String),
+    #[error("unsupported observation mode: {0}")]
+    UnsupportedObservationMode(String),
+    #[error("episode is terminal ({reason}); reset before stepping")]
+    TerminalStepRejected { reason: String },
     #[error("agent control error: {0}")]
     Message(String),
 }
@@ -155,19 +161,76 @@ pub struct SimClock {
 }
 
 impl SimClock {
+    /// Creates a clock running at `tick_hz` ticks per second.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `tick_hz` is zero, because the fixed timestep
+    /// `1.0 / tick_hz` would be infinite.
     #[must_use]
     pub fn new(tick_hz: u32) -> Self {
-        Self {
+        Self::try_new(tick_hz).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible constructor used when the tick rate comes from untrusted
+    /// input (configs, snapshots, network params).
+    pub fn try_new(tick_hz: u32) -> ControlResult<Self> {
+        if tick_hz == 0 {
+            return Err(AgentControlError::Message(
+                "SimClock tick rate must be > 0 Hz".to_string(),
+            ));
+        }
+        Ok(Self {
             tick: 0,
             dt_seconds: 1.0 / tick_hz as f32,
             elapsed_seconds: 0.0,
+        })
+    }
+
+    /// Validates an imported/deserialized clock (snapshot restore, replay).
+    /// Rejects zero/NaN/infinite timesteps and absurd tick values that would
+    /// poison physics (`dt * velocity`) or terminal checks.
+    pub fn validate(&self) -> ControlResult<()> {
+        if !self.dt_seconds.is_finite() || self.dt_seconds <= 0.0 {
+            return Err(AgentControlError::Message(format!(
+                "invalid SimClock dt_seconds {}: must be finite and > 0",
+                self.dt_seconds
+            )));
         }
+        if !self.elapsed_seconds.is_finite() || self.elapsed_seconds < 0.0 {
+            return Err(AgentControlError::Message(format!(
+                "invalid SimClock elapsed_seconds {}: must be finite and >= 0",
+                self.elapsed_seconds
+            )));
+        }
+        validate_clock_tick(self.tick)?;
+        Ok(())
+    }
+
+    /// Sets the tick after validating it (snapshot/timeline restores).
+    pub fn set_tick_checked(&mut self, tick: u64) -> ControlResult<()> {
+        validate_clock_tick(tick)?;
+        self.tick = tick;
+        Ok(())
     }
 
     pub fn advance_one_tick(&mut self) {
         self.tick += 1;
         self.elapsed_seconds += self.dt_seconds as f64;
     }
+}
+
+/// Upper bound guard for imported tick values. Real episodes are thousands
+/// of ticks; anything above u32::MAX almost certainly indicates corrupt or
+/// adversarial snapshot/replay data.
+pub fn validate_clock_tick(tick: u64) -> ControlResult<()> {
+    const MAX_REASONABLE_TICK: u64 = u32::MAX as u64;
+    if tick > MAX_REASONABLE_TICK {
+        return Err(AgentControlError::Message(format!(
+            "invalid SimClock tick {tick}: exceeds maximum {MAX_REASONABLE_TICK}"
+        )));
+    }
+    Ok(())
 }
 
 impl Default for SimClock {
@@ -299,6 +362,56 @@ impl AgentActionCatalog {
             .as_ref()
             .is_none_or(|supported| supported.contains(&action))
     }
+
+    /// Validates an action against the catalog at the controller boundary.
+    /// Rejects unsupported kinds and out-of-bounds/invalid payloads with
+    /// [`AgentControlError::InvalidAction`].
+    pub fn validate_action(&self, action: &AgentAction) -> ControlResult<()> {
+        validate_action_against_catalog(self, action)
+    }
+}
+
+/// Controller-boundary validation shared by in-process (`AgentApp::step`)
+/// and remote (JSON-RPC) stepping paths.
+///
+/// * Unsupported [`AgentActionKind`]s (per [`AgentActionCatalog`]) are
+///   rejected.
+/// * Bounded payloads are rejected when non-finite or out of range:
+///   `Move.x/y` must be finite in `[-1, 1]`, `Look` deltas must be finite.
+pub fn validate_action_against_catalog(
+    catalog: &AgentActionCatalog,
+    action: &AgentAction,
+) -> ControlResult<()> {
+    let kind = action.kind();
+    if !catalog.supports(kind) {
+        return Err(AgentControlError::InvalidAction(format!(
+            "unsupported action kind {kind:?}"
+        )));
+    }
+    match action {
+        AgentAction::Move { x, y } => {
+            if !x.is_finite() || !y.is_finite() {
+                return Err(AgentControlError::InvalidAction(format!(
+                    "Move{{x: {x}, y: {y}}} must be finite"
+                )));
+            }
+            if x.abs() > 1.0 || y.abs() > 1.0 {
+                return Err(AgentControlError::InvalidAction(format!(
+                    "Move{{x: {x}, y: {y}}} out of bounds: expected [-1, 1]"
+                )));
+            }
+        }
+        AgentAction::Look {
+            yaw_delta,
+            pitch_delta,
+        } if !yaw_delta.is_finite() || !pitch_delta.is_finite() => {
+            return Err(AgentControlError::InvalidAction(format!(
+                "Look{{yaw_delta: {yaw_delta}, pitch_delta: {pitch_delta}}} must be finite"
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Resource, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -387,6 +500,45 @@ pub enum ObservationMode {
     PixelFrame,
     #[default]
     Hybrid,
+}
+
+impl ObservationMode {
+    /// Modes with a first-class extractor in the sample games.
+    ///
+    /// `Symbolic` observations are produced from `PlayerKnowledge` requests
+    /// and `Hybrid` adds an optional debug payload on top of the same
+    /// symbolic base. Discovery (`agent.observation_space`) should advertise
+    /// only these; `PixelFrame`/`DiffSinceLastTick`/`FullDebugState` fall back
+    /// to symbolic (`Hybrid` keeps its debug block) unless a game installs a
+    /// dedicated renderer/delta encoder.
+    #[must_use]
+    pub const fn implemented_modes() -> &'static str {
+        "Symbolic, Hybrid (Hybrid carries symbolic + optional debug; no pixel capture by default)"
+    }
+
+    /// Returns `true` for modes with a dedicated extractor. Everything else
+    /// uses the symbolic fallback documented in
+    /// [`ObservationMode::implemented_modes`].
+    #[must_use]
+    pub const fn is_implemented(&self) -> bool {
+        match self {
+            Self::PlayerKnowledge | Self::Hybrid => true,
+            Self::FullDebugState | Self::DiffSinceLastTick | Self::PixelFrame => false,
+        }
+    }
+
+    /// Validates a requested mode. Implemented modes pass through;
+    /// unimplemented modes return [`AgentControlError::UnsupportedObservationMode`]
+    /// so callers can either surface the error or fall back to symbolic.
+    pub fn validate_supported(&self) -> ControlResult<()> {
+        if self.is_implemented() {
+            Ok(())
+        } else {
+            Err(AgentControlError::UnsupportedObservationMode(format!(
+                "{self:?} has no dedicated extractor; use Hybrid or PlayerKnowledge (symbolic fallback)"
+            )))
+        }
+    }
 }
 
 #[derive(Resource, Clone, Debug, Default, Serialize, Deserialize)]
@@ -587,6 +739,65 @@ pub enum ControlMode {
     InspectOnly,
 }
 
+impl ControlMode {
+    /// Source/mode enforcement matrix for input resolution (`drain`).
+    ///
+    /// | mode        | Agent | Human | Replay | Script | Network | Test |
+    /// |-------------|-------|-------|--------|--------|---------|------|
+    /// | Agent       | yes   | no    | no     | yes    | no      | yes  |
+    /// | Human       | no    | yes   | no     | no     | no      | yes  |
+    /// | Hybrid      | yes   | yes   | no     | yes    | yes     | yes  |
+    /// | Replay      | no    | no    | yes    | no     | no      | no   |
+    /// | Paused      | no    | no    | no     | no     | no      | no   |
+    /// | InspectOnly | no    | no    | no     | no     | no      | no   |
+    ///
+    /// `Paused`/`InspectOnly` never accept steps (the runner rejects them
+    /// before enqueueing). `Script`/`Test` are trusted automation sources.
+    #[must_use]
+    pub const fn accepts_source(&self, source: &ActionSource) -> bool {
+        match self {
+            Self::Agent => matches!(
+                source,
+                ActionSource::Agent | ActionSource::Script | ActionSource::Test
+            ),
+            Self::Human => matches!(source, ActionSource::Human | ActionSource::Test),
+            Self::Hybrid => !matches!(source, ActionSource::Replay),
+            Self::Replay => matches!(source, ActionSource::Replay),
+            Self::Paused | Self::InspectOnly => false,
+        }
+    }
+
+    /// Returns `true` when external stepping is allowed at all.
+    #[must_use]
+    pub const fn allows_stepping(&self) -> bool {
+        !matches!(self, Self::Paused | Self::InspectOnly)
+    }
+
+    /// Filters a drained input frame to the sources this mode accepts.
+    /// Returns the rejected count so callers can log/metrics it.
+    #[must_use]
+    pub fn filter_sources(
+        &self,
+        actions: &mut Vec<AgentAction>,
+        sources: &mut Vec<ActionSource>,
+    ) -> usize {
+        let mut rejected = 0;
+        let mut kept_actions = Vec::with_capacity(actions.len());
+        let mut kept_sources = Vec::with_capacity(sources.len());
+        for (action, source) in actions.drain(..).zip(sources.drain(..)) {
+            if self.accepts_source(&source) {
+                kept_actions.push(action);
+                kept_sources.push(source);
+            } else {
+                rejected += 1;
+            }
+        }
+        *actions = kept_actions;
+        *sources = kept_sources;
+        rejected
+    }
+}
+
 #[derive(Resource, Clone, Debug, Serialize, Deserialize)]
 pub struct AgentControlState {
     pub mode: ControlMode,
@@ -621,6 +832,35 @@ pub struct EpisodeState {
     pub done: bool,
     pub truncated: bool,
     pub reason: Option<String>,
+}
+
+impl EpisodeState {
+    /// Terminal episodes use absorbing semantics: once `done` or `truncated`
+    /// is set, the simulation must not advance gameplay or accumulate reward
+    /// until a reset. Stepping past terminal without a reset is rejected with
+    /// [`AgentControlError::TerminalStepRejected`].
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        self.done || self.truncated
+    }
+
+    /// Returns an error when a step is attempted past terminal state.
+    pub fn ensure_not_terminal(&self) -> ControlResult<()> {
+        if self.is_terminal() {
+            Err(AgentControlError::TerminalStepRejected {
+                reason: self.reason.clone().unwrap_or_else(|| "unknown".to_string()),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns `false` once terminal so games can stop reward accumulation
+    /// post-terminal (no-op ticks must not farm shaping rewards).
+    #[must_use]
+    pub const fn should_accumulate_reward(&self) -> bool {
+        !self.is_terminal()
+    }
 }
 
 type ObservationExtractorFn = dyn Fn(&mut World, ObservationMode) -> Observation + Send + Sync;
@@ -776,6 +1016,14 @@ pub enum AgentPluginMode {
     Remote,
 }
 
+/// Marker recording which [`AgentControlPlugin`] preset built the app.
+///
+/// `Deterministic` disables visual capture and pins a fixed RNG seed;
+/// `VisualDebug` enables the visual-capture path (renderers still installed
+/// by the game/runner); `Remote` matches deterministic without visuals.
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresetVisualCapture(pub bool);
+
 #[derive(Clone, Debug)]
 pub struct AgentControlPlugin {
     pub mode: AgentPluginMode,
@@ -809,7 +1057,13 @@ impl AgentControlPlugin {
 }
 
 impl Plugin for AgentControlPlugin {
+    /// Builds the core schedules/resources, inspecting [`AgentPluginMode`]:
+    /// `Deterministic` pins `DeterministicRng::seeded(0)` and disables visual
+    /// capture; `VisualDebug` keeps the fixed RNG but enables the
+    /// visual-capture path; `Remote` matches deterministic. Presets are
+    /// otherwise equivalent (same schedules, tick rate, and resources).
     fn build(&self, app: &mut App) {
+        let visual_enabled = matches!(self.mode, AgentPluginMode::VisualDebug);
         app.init_schedule(AgentReset)
             .init_schedule(AgentDecision)
             .init_schedule(AgentPreTick)
@@ -817,7 +1071,8 @@ impl Plugin for AgentControlPlugin {
             .init_schedule(AgentPostTick)
             .insert_resource(SimClock::new(self.tick_hz))
             .init_resource::<StableIdAllocator>()
-            .init_resource::<DeterministicRng>()
+            .insert_resource(DeterministicRng::seeded(0))
+            .insert_resource(PresetVisualCapture(visual_enabled))
             .init_resource::<AgentControlState>()
             .init_resource::<AgentActionQueue>()
             .init_resource::<CurrentInputFrame>()
@@ -918,11 +1173,16 @@ pub fn drain_agent_actions(
     input.actions.clear();
     input.sources.clear();
 
+    let mode = control.mode.clone();
     let mut remaining = VecDeque::new();
     while let Some(next) = queue.pending.pop_front() {
         if next.tick == clock.tick {
-            input.sources.push(next.source);
-            input.actions.push(next.action);
+            // Enforce the source/mode matrix at input resolution: actions
+            // from rejected sources are dropped (not applied, not counted).
+            if mode.accepts_source(&next.source) {
+                input.sources.push(next.source);
+                input.actions.push(next.action);
+            }
         } else if next.tick > clock.tick {
             remaining.push_back(next);
         }
@@ -933,8 +1193,19 @@ pub fn drain_agent_actions(
 }
 
 pub fn collect_observation(world: &mut World) {
-    let clock = world.resource::<SimClock>().clone();
     let mode = world.resource::<ObservationConfig>().mode.clone();
+    collect_observation_with_mode(world, mode);
+}
+
+/// Request-local observation collection: renders with the explicitly passed
+/// `mode` instead of mutating the global [`ObservationConfig`].
+///
+/// Remote/step paths should prefer this so a per-request
+/// `observation_mode` does not leak into subsequent ticks. At minimum,
+/// callers that must go through the global resource should snapshot
+/// `ObservationConfig.mode` before an implicit reset and reapply it after.
+pub fn collect_observation_with_mode(world: &mut World, mode: ObservationMode) {
+    let clock = world.resource::<SimClock>().clone();
     let observation = if world.contains_resource::<AgentObservationExtractor>() {
         world.resource_scope(|world, extractor: Mut<AgentObservationExtractor>| {
             extractor.extract(world, mode)
@@ -979,6 +1250,12 @@ pub fn collect_observation(world: &mut World) {
 
 pub fn end_tick() {}
 
+/// Version for the canonical checksum serialization.
+///
+/// Bump this when the set of hashed fields or their encoding changes so
+/// mismatched producers/consumers fail loudly instead of colliding silently.
+pub const CHECKSUM_VERSION: u32 = 1;
+
 pub fn default_checksum(world: &World) -> StateChecksum {
     let clock = world.resource::<SimClock>();
     let reward = world.resource::<RewardState>();
@@ -986,16 +1263,70 @@ pub fn default_checksum(world: &World) -> StateChecksum {
     let input = world.resource::<CurrentInputFrame>();
 
     let mut hasher = StableHasher::new();
-    clock.tick.hash(&mut hasher);
-    clock.dt_seconds.to_bits().hash(&mut hasher);
-    clock.elapsed_seconds.to_bits().hash(&mut hasher);
-    reward.current_reward.to_bits().hash(&mut hasher);
-    reward.cumulative_reward.to_bits().hash(&mut hasher);
-    episode.done.hash(&mut hasher);
-    episode.truncated.hash(&mut hasher);
-    episode.reason.hash(&mut hasher);
-    input.tick.hash(&mut hasher);
-    input.actions.len().hash(&mut hasher);
+    hasher.write_u32(CHECKSUM_VERSION);
+    hasher.write_u64(clock.tick);
+    hasher.write_u32(clock.dt_seconds.to_bits());
+    hasher.write_u64(clock.elapsed_seconds.to_bits());
+    hasher.write_u32(reward.current_reward.to_bits());
+    hasher.write_u32(reward.cumulative_reward.to_bits());
+    hasher.write_bool_value(episode.done);
+    hasher.write_bool_value(episode.truncated);
+    // `None` vs `Some("")` must hash differently; length-prefix via write_string.
+    match &episode.reason {
+        Some(reason) => {
+            hasher.write_bool_value(true);
+            hasher.write_string(reason);
+        }
+        None => hasher.write_bool_value(false),
+    }
+
+    // Current input frame: tick + full action/source contents (not just len).
+    hasher.write_u64(input.tick);
+    hasher.write_u64(input.actions.len() as u64);
+    for action in &input.actions {
+        match serde_json::to_value(action) {
+            Ok(value) => hasher.write_json(&value),
+            Err(_) => hasher.write_string("unserializable-action"),
+        }
+    }
+    hasher.write_u64(input.sources.len() as u64);
+    for source in &input.sources {
+        match serde_json::to_value(source) {
+            Ok(value) => hasher.write_json(&value),
+            Err(_) => hasher.write_string("unserializable-source"),
+        }
+    }
+
+    // Queued (not yet drained) inputs: tick + source + action contents.
+    if let Some(queue) = world.get_resource::<AgentActionQueue>() {
+        hasher.write_u64(queue.pending.len() as u64);
+        for scheduled in &queue.pending {
+            hasher.write_u64(scheduled.tick);
+            match serde_json::to_value(&scheduled.source) {
+                Ok(value) => hasher.write_json(&value),
+                Err(_) => hasher.write_string("unserializable-source"),
+            }
+            match serde_json::to_value(&scheduled.action) {
+                Ok(value) => hasher.write_json(&value),
+                Err(_) => hasher.write_string("unserializable-action"),
+            }
+        }
+    } else {
+        // Explicit partial-checksum marker when the queue is unavailable.
+        hasher.write_string("partial:no-action-queue");
+    }
+
+    // RNG state, when available. Without it the checksum is partial: two
+    // worlds that differ only in future RNG draws would otherwise collide.
+    if let Some(rng) = world.get_resource::<DeterministicRng>() {
+        hasher.write_u64(rng.seed);
+        match serde_json::to_value(&rng.rng) {
+            Ok(value) => hasher.write_json(&value),
+            Err(_) => hasher.write_string("partial:unserializable-rng"),
+        }
+    } else {
+        hasher.write_string("partial:no-rng");
+    }
 
     StateChecksum {
         tick: clock.tick,
@@ -1062,6 +1393,55 @@ impl Hasher for StableHasher {
             self.state ^= u64::from(*byte);
             self.state = self.state.wrapping_mul(Self::PRIME);
         }
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.write(&[i]);
+    }
+
+    fn write_u16(&mut self, i: u16) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_u128(&mut self, i: u128) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        // Fixed-width LE regardless of platform (usize is 32/64-bit).
+        self.write(&(i as u64).to_le_bytes());
+    }
+
+    fn write_i8(&mut self, i: i8) {
+        self.write(&[i as u8]);
+    }
+
+    fn write_i16(&mut self, i: i16) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_i32(&mut self, i: i32) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_i64(&mut self, i: i64) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_i128(&mut self, i: i128) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn write_isize(&mut self, i: isize) {
+        self.write(&(i as i64).to_le_bytes());
     }
 
     fn finish(&self) -> u64 {
@@ -1290,6 +1670,116 @@ mod tests {
     }
 
     #[test]
+    fn default_checksum_detects_mutation_of_each_authoritative_field() {
+        use rand::RngCore;
+
+        fn seeded_app() -> App {
+            let mut app = app_with_core();
+            app.world_mut().resource_mut::<SimClock>().tick = 7;
+            app.world_mut().resource_mut::<SimClock>().dt_seconds = 0.05;
+            app.world_mut().resource_mut::<SimClock>().elapsed_seconds = 0.35;
+            app.world_mut().resource_mut::<RewardState>().current_reward = 1.5;
+            app.world_mut()
+                .resource_mut::<RewardState>()
+                .cumulative_reward = 4.25;
+            app.world_mut()
+                .resource_mut::<CurrentInputFrame>()
+                .actions
+                .push(AgentAction::Jump);
+            app.world_mut()
+                .resource_mut::<CurrentInputFrame>()
+                .sources
+                .push(ActionSource::Agent);
+            app.world_mut().resource_mut::<AgentActionQueue>().schedule(
+                9,
+                ActionSource::Script,
+                AgentAction::Interact,
+            );
+            app
+        }
+
+        let base = default_checksum(seeded_app().world());
+
+        let mut mutated = seeded_app();
+        mutated.world_mut().resource_mut::<SimClock>().tick = 8;
+        assert_ne!(
+            default_checksum(mutated.world()),
+            base,
+            "tick mutation undetected"
+        );
+
+        let mut mutated = seeded_app();
+        mutated
+            .world_mut()
+            .resource_mut::<RewardState>()
+            .current_reward = 99.0;
+        assert_ne!(
+            default_checksum(mutated.world()),
+            base,
+            "reward mutation undetected"
+        );
+
+        let mut mutated = seeded_app();
+        mutated.world_mut().resource_mut::<EpisodeState>().done = true;
+        assert_ne!(
+            default_checksum(mutated.world()),
+            base,
+            "episode.done mutation undetected"
+        );
+
+        let mut mutated = seeded_app();
+        mutated
+            .world_mut()
+            .resource_mut::<CurrentInputFrame>()
+            .actions
+            .push(AgentAction::Crouch);
+        assert_ne!(
+            default_checksum(mutated.world()),
+            base,
+            "input action mutation undetected"
+        );
+
+        let mut mutated = seeded_app();
+        mutated
+            .world_mut()
+            .resource_mut::<AgentActionQueue>()
+            .schedule(10, ActionSource::Agent, AgentAction::Dodge);
+        assert_ne!(
+            default_checksum(mutated.world()),
+            base,
+            "queued input mutation undetected"
+        );
+
+        let mut mutated = seeded_app();
+        mutated
+            .world_mut()
+            .resource_mut::<DeterministicRng>()
+            .rng
+            .next_u32();
+        assert_ne!(
+            default_checksum(mutated.world()),
+            base,
+            "rng state mutation undetected"
+        );
+
+        // Action contents (not just queue length) must matter.
+        let mut mutated = seeded_app();
+        if let Some(first) = mutated
+            .world_mut()
+            .resource_mut::<AgentActionQueue>()
+            .pending
+            .front_mut()
+        {
+            first.action = AgentAction::Dodge;
+        }
+        assert_ne!(
+            default_checksum(mutated.world()),
+            base,
+            "queued action contents mutation undetected"
+        );
+    }
+
+    #[test]
     fn agent_decision_runs_once_before_each_simulation_tick() {
         #[derive(Resource, Default)]
         struct PolicyCalls(u64);
@@ -1320,6 +1810,138 @@ mod tests {
                 .resource::<AgentControlState>()
                 .last_action_count,
             1
+        );
+    }
+
+    #[test]
+    fn sim_clock_rejects_zero_tick_rate() {
+        assert!(SimClock::try_new(0).is_err());
+        assert!(SimClock::try_new(60).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "tick rate must be > 0")]
+    fn sim_clock_new_panics_on_zero() {
+        let _ = SimClock::new(0);
+    }
+
+    #[test]
+    fn sim_clock_validates_imported_values() {
+        let valid = SimClock::new(60);
+        assert!(valid.validate().is_ok());
+
+        let mut bad_dt = valid.clone();
+        bad_dt.dt_seconds = f32::INFINITY;
+        assert!(bad_dt.validate().is_err());
+
+        let mut bad_tick = valid.clone();
+        bad_tick.tick = u64::MAX;
+        assert!(bad_tick.validate().is_err());
+        assert!(validate_clock_tick(u64::MAX).is_err());
+        assert!(bad_tick.set_tick_checked(5).is_ok());
+        assert_eq!(bad_tick.tick, 5);
+    }
+
+    #[test]
+    fn action_validation_rejects_unsupported_and_out_of_bounds() {
+        let mut catalog = AgentActionCatalog::default();
+        catalog.set_supported_actions([AgentActionKind::Move, AgentActionKind::Jump]);
+        assert!(
+            catalog
+                .validate_action(&AgentAction::Move { x: 1.5, y: 0.0 })
+                .is_err()
+        );
+        assert!(
+            catalog
+                .validate_action(&AgentAction::Move {
+                    x: f32::NAN,
+                    y: 0.0
+                })
+                .is_err()
+        );
+        assert!(catalog.validate_action(&AgentAction::Dodge).is_err());
+        assert!(
+            catalog
+                .validate_action(&AgentAction::Move { x: 0.5, y: 0.0 })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn observation_mode_advertises_implemented_subset() {
+        assert!(ObservationMode::Hybrid.is_implemented());
+        assert!(ObservationMode::PlayerKnowledge.is_implemented());
+        assert!(!ObservationMode::PixelFrame.is_implemented());
+        assert!(!ObservationMode::DiffSinceLastTick.is_implemented());
+        assert!(ObservationMode::Hybrid.validate_supported().is_ok());
+        assert!(ObservationMode::PixelFrame.validate_supported().is_err());
+    }
+
+    #[test]
+    fn control_mode_enforces_source_matrix() {
+        assert!(ControlMode::Agent.accepts_source(&ActionSource::Agent));
+        assert!(!ControlMode::Agent.accepts_source(&ActionSource::Human));
+        assert!(ControlMode::Human.accepts_source(&ActionSource::Human));
+        assert!(!ControlMode::Human.accepts_source(&ActionSource::Agent));
+        assert!(ControlMode::Hybrid.accepts_source(&ActionSource::Human));
+        assert!(ControlMode::Hybrid.accepts_source(&ActionSource::Agent));
+        assert!(!ControlMode::Hybrid.accepts_source(&ActionSource::Replay));
+        assert!(ControlMode::Replay.accepts_source(&ActionSource::Replay));
+        assert!(!ControlMode::Paused.allows_stepping());
+        assert!(!ControlMode::InspectOnly.allows_stepping());
+    }
+
+    #[test]
+    fn terminal_state_is_absorbing() {
+        let live = EpisodeState::default();
+        assert!(!live.is_terminal());
+        assert!(live.should_accumulate_reward());
+        let done = EpisodeState {
+            done: true,
+            truncated: false,
+            reason: Some("goal_reached".to_string()),
+        };
+        assert!(done.is_terminal());
+        assert!(!done.should_accumulate_reward());
+        assert!(done.ensure_not_terminal().is_err());
+    }
+
+    #[test]
+    fn plugin_presets_differ_on_visual_capture() {
+        let mut det = App::new();
+        det.add_plugins(AgentControlPlugin::deterministic());
+        det.finish();
+        det.cleanup();
+        let mut vis = App::new();
+        vis.add_plugins(AgentControlPlugin::visual_debug());
+        vis.finish();
+        vis.cleanup();
+        assert_eq!(
+            det.world().resource::<PresetVisualCapture>(),
+            &PresetVisualCapture(false)
+        );
+        assert_eq!(
+            vis.world().resource::<PresetVisualCapture>(),
+            &PresetVisualCapture(true)
+        );
+    }
+
+    #[test]
+    fn drain_enforces_control_mode_matrix() {
+        let mut app = app_with_core();
+        app.world_mut().resource_mut::<AgentControlState>().mode = ControlMode::Human;
+        app.world_mut().resource_mut::<AgentActionQueue>().schedule(
+            1,
+            ActionSource::Agent,
+            AgentAction::Jump,
+        );
+        app.world_mut().run_schedule(AgentTick);
+        // Agent-sourced action is dropped in Human mode.
+        assert!(
+            app.world()
+                .resource::<CurrentInputFrame>()
+                .actions
+                .is_empty()
         );
     }
 }
