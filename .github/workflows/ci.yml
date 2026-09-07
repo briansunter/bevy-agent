@@ -67,7 +67,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y g++ pkg-config libx11-dev libasound2-dev libudev-dev libxkbcommon-x11-0 libwayland-dev libxkbcommon-dev
 
       - name: Visual feature compile check
-        run: cargo check -p sample_platformer --features visual --locked
+        # Screenshot runtime is covered by capture integration tests; this job
+        # ensures every feature/target compiles.
+        run: cargo check --workspace --all-targets --all-features --locked
 
   python:
     runs-on: ubuntu-latest

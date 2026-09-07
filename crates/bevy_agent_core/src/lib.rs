@@ -537,6 +537,60 @@ impl<A> AgentActionQueue<A> {
     }
 }
 
+/// Policy for reconciling queued future inputs across history navigation.
+///
+/// `ReplaceFromImport` (replay-bundle load) replaces the live queue with the
+/// imported snapshot's `action_queue` and never merges destination futures;
+/// `PreserveCurrentFuture` (interactive `restore_tick`/`branch` rewind)
+/// preserves caller-enqueued futures beyond the target via a
+/// multiplicity-preserving merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingInputPolicy {
+    ReplaceFromImport,
+    PreserveCurrentFuture,
+}
+
+/// Applies pending-input reconciliation per `policy`.
+///
+/// * `ReplaceFromImport`: `queue.pending` becomes `imported` verbatim
+///   (`before` — pre-existing destination futures — is discarded).
+/// * `PreserveCurrentFuture`: multiset-merges `before` into the live queue
+///   (an identical entry is appended only while the live queue holds fewer
+///   copies), then re-sorts by tick. `imported` is ignored.
+pub fn apply_pending_policy<A: Clone + PartialEq>(
+    queue: &mut AgentActionQueue<A>,
+    before: Vec<ScheduledAction<A>>,
+    imported: Vec<ScheduledAction<A>>,
+    policy: PendingInputPolicy,
+) {
+    match policy {
+        PendingInputPolicy::ReplaceFromImport => {
+            queue.pending = imported.into();
+        }
+        PendingInputPolicy::PreserveCurrentFuture => {
+            for (index, scheduled) in before.iter().enumerate() {
+                let needed = before[..=index]
+                    .iter()
+                    .filter(|candidate| *candidate == scheduled)
+                    .count();
+                let present = queue
+                    .pending
+                    .iter()
+                    .filter(|candidate| *candidate == scheduled)
+                    .count();
+                if present < needed {
+                    queue.pending.push_back(scheduled.clone());
+                }
+            }
+            let mut pending = std::mem::take(&mut queue.pending);
+            pending
+                .make_contiguous()
+                .sort_by_key(|scheduled| scheduled.tick);
+            queue.pending = pending;
+        }
+    }
+}
+
 #[derive(Resource, Clone, Debug, Serialize, Deserialize)]
 pub struct CurrentInputFrame<A = AgentAction> {
     pub tick: u64,

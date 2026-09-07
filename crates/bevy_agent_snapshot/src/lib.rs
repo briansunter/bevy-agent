@@ -933,9 +933,10 @@ pub fn restore_snapshot_value_with_options(
     let backup = capture_snapshot(world, None)?;
 
     // ---- Phase 2: Apply ----
+    // Rollback-failure paths install `FaultState`; early rejects above never do.
     if let Err(apply_error) = apply_restore_plan(world, &plan, remap) {
         let original = format!("{apply_error:?}");
-        match apply_snapshot_unchecked(world, &backup) {
+        match rollback_snapshot(world, &backup) {
             Ok(()) => {
                 return Err(apply_error.context("restore apply failed; rolled back"));
             }
@@ -990,7 +991,7 @@ pub fn restore_snapshot_value_with_options(
         Ok(checksum) => Ok(checksum),
         Err(error) => {
             let original = format!("{error:?}");
-            match apply_snapshot_unchecked(world, &backup) {
+            match rollback_snapshot(world, &backup) {
                 Ok(()) => Err(error.context("restore verification failed; rolled back")),
                 Err(rollback_error) => {
                     let rollback = format!("{rollback_error:?}");
@@ -1214,12 +1215,32 @@ fn apply_restore_plan(
     Ok(())
 }
 
-/// Best-effort unchecked apply used for rollback: rebuild a plan from a
-/// just-captured backup (which must validate) and apply it without
+/// Rollback helper: re-applies a just-captured backup without
 /// post-verification.
-fn apply_snapshot_unchecked(world: &mut World, backup: &Snapshot) -> Result<()> {
+///
+/// Returns `Result` so callers distinguish "rolled back cleanly" (`Ok`) from
+/// "rollback itself failed" (`Err`, world possibly half-applied and requiring
+/// [`FaultState`]). Used by the restore apply/verification failure paths;
+/// early-reject paths (prepare failures) never reach this helper and never
+/// install [`FaultState`].
+pub fn rollback_snapshot(world: &mut World, backup: &Snapshot) -> Result<()> {
     let plan = prepare_restore_plan(world, backup)?;
     apply_restore_plan(world, &plan, None)
+}
+
+/// Full offline validation of a snapshot payload (complete prepare without
+/// world mutation).
+///
+/// Runs the entire [`prepare_restore_plan`] validation -- [`SimClock::validate`],
+/// schema hash, game/version metadata, duplicate stable ids, checksum
+/// recompute, typed `serde_json::from_value` decode of every
+/// resource/component via the [`SnapshotRegistry`], and action-queue
+/// round-trip -- without touching the world and without installing
+/// [`FaultState`] on failure. The runner calls this per referenced snapshot
+/// before transactional install; early rejects return `Err` with no
+/// world mutation and no fault marker.
+pub fn validate_snapshot_full(world: &World, snapshot: &Snapshot) -> Result<()> {
+    prepare_restore_plan(world, snapshot).map(|_| ())
 }
 
 pub fn lookup_snapshot_by_label(world: &World, label: &str) -> Option<SnapshotId> {

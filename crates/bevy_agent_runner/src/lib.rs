@@ -10,9 +10,10 @@ use bevy_agent_core::{
     ActionSource, AgentAction, AgentActionCatalog, AgentActionQueue, AgentControlPlugin,
     AgentControlState, AgentReset, AgentTick, BranchId, ControlMode, CurrentInputFrame,
     DeterministicRng, EnvironmentMetadata, EpisodeState, ExecutionContext as CoreExecutionContext,
-    LastStepResponse, Observation, ObservationConfig, ObservationMode, ResetResponse, RewardState,
-    SimClock, SnapshotChecksum, SnapshotId, StepManyResponse, StepResponse, collect_observation,
-    run_agent_tick, validate_action_against_catalog,
+    LastStepResponse, Observation, ObservationConfig, ObservationMode, PendingInputPolicy,
+    ResetResponse, RewardState, SimClock, SnapshotChecksum, SnapshotId, StepManyResponse,
+    StepResponse, apply_pending_policy, collect_observation, run_agent_tick,
+    validate_action_against_catalog,
 };
 use bevy_agent_core::{AgentPostTick, AgentPreTick};
 use bevy_agent_replay::{
@@ -24,8 +25,8 @@ use bevy_agent_replay::{
 use bevy_agent_snapshot::{
     AgentSnapshotPlugin, FaultState, Snapshot, SnapshotCreateResult, SnapshotPolicy, SnapshotRole,
     SnapshotStore, capture_snapshot, checksum_snapshot, create_snapshot_with_role,
-    delete_snapshot_checked, pin_snapshot, prune_checkpoints_with_refs, restore_snapshot,
-    restore_snapshot_value, unpin_snapshot,
+    delete_snapshot_checked, enforce_retention, pin_snapshot, prune_checkpoints_with_refs,
+    restore_snapshot, restore_snapshot_value, unpin_snapshot,
 };
 use serde::{Deserialize, Serialize};
 
@@ -233,6 +234,167 @@ fn validate_import_topology_acyclic(topology: &[TimelineBranch]) -> Result<()> {
     Ok(())
 }
 
+/// Temporal validation for an imported replay bundle (checked BEFORE install).
+///
+/// For every branch-tagged and legacy checkpoint the referenced snapshot must
+/// exist and satisfy `snapshot.clock.tick == checkpoint.tick` and
+/// `snapshot.manifest.tick == checkpoint.tick`. The baseline initial snapshot
+/// tick must equal `log.initial_tick`, and every topology `fork_snapshot`
+/// tick must equal its branch `fork_tick`. Any mismatch rejects the import
+/// before world state is touched.
+fn validate_import_temporal(bundle: &ReplayBundle) -> Result<()> {
+    use std::collections::HashMap;
+    let snapshots: HashMap<SnapshotId, &Snapshot> = bundle
+        .snapshots
+        .iter()
+        .map(|snapshot| (snapshot.manifest.snapshot_id, snapshot))
+        .collect();
+    let check_at = |id: &SnapshotId, tick: u64, context: &str| -> Result<()> {
+        let snapshot = snapshots
+            .get(id)
+            .ok_or_else(|| anyhow!("replay bundle {context} references missing snapshot {id:?}"))?;
+        if snapshot.clock.tick != tick || snapshot.manifest.tick != tick {
+            return Err(anyhow!(
+                "replay bundle {context} tick mismatch at tick {tick}: snapshot {:?} has clock.tick={} manifest.tick={}",
+                snapshot.manifest.snapshot_id,
+                snapshot.clock.tick,
+                snapshot.manifest.tick,
+            ));
+        }
+        Ok(())
+    };
+    for checkpoint in &bundle.log.branch_checkpoints {
+        check_at(
+            &checkpoint.snapshot_id,
+            checkpoint.tick,
+            &format!("branch checkpoint (branch {:?})", checkpoint.branch_id),
+        )?;
+    }
+    for (tick, id) in &bundle.log.checkpoints {
+        check_at(id, *tick, "legacy checkpoint")?;
+    }
+    if let Some(initial) = bundle.log.initial_snapshot {
+        check_at(
+            &initial,
+            bundle.log.initial_tick,
+            "baseline initial snapshot",
+        )?;
+    }
+    for branch in &bundle.log.timeline_topology {
+        if let Some(fork_snapshot) = branch.fork_snapshot {
+            check_at(
+                &fork_snapshot,
+                branch.fork_tick,
+                &format!("fork snapshot (branch {:?})", branch.branch_id),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the fork parent for `branch(from_tick)` to the ancestor owning
+/// the `from_tick` interval.
+///
+/// Walks the lineage from the current branch (deepest first) and returns the
+/// deepest ancestor whose fork interval contains `from_tick`: the target
+/// itself when `from_tick >= own_fork`, otherwise an ancestor with
+/// `from_tick >= own_fork && from_tick <= child_fork` (inclusive bounds so
+/// the tick-0 baseline resolves to the root). Rejects when no ancestor
+/// contains the tick so the import validator invariant (child fork >= parent
+/// fork) always holds for the new branch.
+fn resolve_fork_parent_branch(
+    timeline: &Timeline,
+    current: BranchId,
+    from_tick: u64,
+) -> Result<BranchId> {
+    let chain = timeline.lineage(current);
+    if !chain.contains(&current) && !timeline.branches.contains_key(&current) {
+        return Err(anyhow!(
+            "branch target {from_tick} references unknown branch {current:?}"
+        ));
+    }
+    // Deepest first: `lineage` returns branch-first, root-last.
+    for candidate in &chain {
+        let Some(info) = timeline.branches.get(candidate) else {
+            continue;
+        };
+        if *candidate == current {
+            if from_tick >= info.fork_tick {
+                return Ok(*candidate);
+            }
+            continue;
+        }
+        let Some(child_fork) = branch_fork_from_ancestor(timeline, *candidate, current) else {
+            continue;
+        };
+        if from_tick >= info.fork_tick && from_tick <= child_fork {
+            return Ok(*candidate);
+        }
+    }
+    // Root fallback: tick 0 baseline belongs to the root even though the
+    // strict interval `(own_fork, child_fork]` excludes it.
+    if from_tick == 0
+        && let Some(root) = chain.last().copied()
+    {
+        return Ok(root);
+    }
+    Err(anyhow!(
+        "branch target {from_tick} is not owned by any ancestor of {current:?}"
+    ))
+}
+
+/// Marks the current tick completed in the replay log, including empty
+/// frames.
+///
+/// The `record_replay_step` system only appends records for drained inputs;
+/// ticks with no input would otherwise leave `end_tick`/`cursor_tick` stale.
+/// This is the runner-side equivalent of `ReplayLog::record_tick`: it
+/// advances the recording bounds to the current tick unconditionally.
+/// Newer replay crates may expose `modern`/`completed_ticks` fields or an
+/// explicit `record_tick` API; this helper uses only the stable
+/// `end_tick`/`cursor_tick` bounds so it compiles against both shapes
+/// (callers should prefer the native API when present and fall back here).
+fn mark_tick_completed(world: &mut World) {
+    let tick = world
+        .get_resource::<SimClock>()
+        .map(|clock| clock.tick)
+        .unwrap_or(0);
+    let branch = world
+        .get_resource::<bevy_agent_core::AgentControlState>()
+        .map(|c| c.branch_id);
+    if let Some(mut recorder) = world.get_resource_mut::<ReplayRecorder>() {
+        recorder.log.end_tick = recorder.log.end_tick.max(tick);
+        recorder.log.cursor_tick = recorder.log.cursor_tick.max(tick);
+        // Record per-branch completed tick (including empty frames).
+        let branch = branch.unwrap_or_else(|| recorder.log.active_branch.unwrap_or_default());
+        recorder
+            .log
+            .completed_ticks
+            .entry(bevy_agent_replay::branch_checksum_key(branch))
+            .or_default()
+            .insert(tick);
+    }
+}
+
+/// Ensures the log carries the modern topology shape (the runner-side
+/// equivalent of `ensure_modern` / `new_live`): populates
+/// `timeline_topology` from the live timeline and installs
+/// `active_branch`/`cursor_tick` when missing. Called on reset so a fresh
+/// episode is live by definition even before the first checkpoint.
+fn ensure_modern_log(log: &mut ReplayLog, timeline: &Timeline, cursor_tick: u64) {
+    if log.timeline_topology.is_empty() {
+        log.timeline_topology = timeline.branches.values().cloned().collect();
+        log.timeline_topology
+            .sort_by_key(|branch| (branch.fork_tick, branch.branch_id.0));
+    }
+    if log.active_branch.is_none() {
+        log.active_branch = Some(timeline.current_branch);
+    }
+    log.cursor_tick = log.cursor_tick.max(cursor_tick);
+    log.end_tick = log.end_tick.max(cursor_tick);
+    log.end_tick = log.end_tick.max(log.initial_tick);
+}
+
 /// Global end of recorded history (max over bounds, records, checkpoints,
 /// and checksums) computed directly from [`ReplayLog`] fields. Used for
 /// legacy / validation fallbacks where no per-branch bound applies.
@@ -306,6 +468,25 @@ fn recorded_range(log: &ReplayLog, timeline: &Timeline, branch: BranchId) -> (u6
         for tick in per_branch.keys() {
             end = end.max(*tick);
         }
+    }
+    // Completed ticks (including empty resolved frames) extend this branch.
+    if let Some(ticks) = log
+        .completed_ticks
+        .get(&bevy_agent_replay::branch_checksum_key(branch))
+    {
+        for tick in ticks {
+            // Only count ticks within this branch's visible lineage interval.
+            if *tick >= start && branch_record_visible(timeline, branch, *tick, branch, modern) {
+                end = end.max(*tick);
+            }
+        }
+    }
+    // Recording bounds advanced every executed tick (including empty frames)
+    // also extend the range, clamped to this branch's visibility: the global
+    // cursor/end belongs to the active branch history; other branches use
+    // their own completed ticks above.
+    if Some(branch) == log.active_branch {
+        end = end.max(log.end_tick.max(log.cursor_tick));
     }
     // Legacy maps count only when no branch-tagged data exists at all
     // (pure legacy log); otherwise they are stale aliases from other branches.
@@ -1096,13 +1277,43 @@ impl AgentApp {
             ));
         }
 
-        // Decode check BEFORE installing: every referenced snapshot payload
-        // must recompute its checksum, carry a valid clock, and reference
-        // only registered resource/component types. Failures return Err
-        // without touching world state (transactional import).
+        // Checkpoint temporal validation BEFORE installing: every
+        // branch/legacy checkpoint must reference a snapshot whose clock and
+        // manifest ticks equal the checkpoint tick; the baseline initial
+        // snapshot tick must equal `initial_tick`; fork snapshots must equal
+        // their branch `fork_tick`. Rejects before any mutation.
+        validate_import_temporal(&bundle)?;
+
+        // Typed validation for EVERY referenced snapshot (not only the cursor
+        // snapshot). `bevy_agent_snapshot` exposes no public prepare/validate
+        // entry point (`prepare_restore_plan` is private), so the fallback is
+        // a serde decode round-trip plus `clock.validate` plus checksum
+        // recompute. Failures return Err without touching world state
+        // (transactional import).
         for snapshot in &bundle.snapshots {
             if !referenced.contains(&snapshot.manifest.snapshot_id) {
                 continue;
+            }
+            // Serde decode check: typed round-trip through JSON.
+            let encoded = serde_json::to_value(snapshot).map_err(|error| {
+                anyhow!(
+                    "replay bundle snapshot {:?} failed typed encode check: {error}",
+                    snapshot.manifest.snapshot_id
+                )
+            })?;
+            let _decoded: Snapshot = serde_json::from_value(encoded).map_err(|error| {
+                anyhow!(
+                    "replay bundle snapshot {:?} failed typed decode check: {error}",
+                    snapshot.manifest.snapshot_id
+                )
+            })?;
+            if snapshot.manifest.tick != snapshot.clock.tick {
+                return Err(anyhow!(
+                    "replay bundle snapshot {:?} manifest/clock tick mismatch: manifest.tick={} clock.tick={}",
+                    snapshot.manifest.snapshot_id,
+                    snapshot.manifest.tick,
+                    snapshot.clock.tick,
+                ));
             }
             snapshot.clock.validate().map_err(|error| {
                 anyhow!(
@@ -1206,8 +1417,29 @@ impl AgentApp {
         let last_backup = self.app.world().get_resource::<LastStepResponse>().cloned();
         let reset_once_backup = self.reset_once;
 
-        // Install helper with rollback on activation failure.
-        let rollback = |agent: &mut AgentApp| {
+        // Pre-move bundle facts (`bundle.snapshots` / `bundle.log` are moved
+        // into the store/recorder during install).
+        let bundle_has_snapshots = !bundle.snapshots.is_empty();
+        let bundle_has_history = !bundle.log.records.is_empty()
+            || !bundle.log.branch_checkpoints.is_empty()
+            || !bundle.log.checkpoints.is_empty()
+            || bundle.log.initial_snapshot.is_some();
+        let bundle_cursor = bundle.log.cursor_tick;
+        // Imported pending queues by snapshot id (cloned pre-move) for the
+        // `ReplaceFromImport` policy applied after activation.
+        let imported_queues: BTreeMap<
+            SnapshotId,
+            Vec<bevy_agent_core::ScheduledAction<AgentAction>>,
+        > = bundle
+            .snapshots
+            .iter()
+            .map(|snapshot| (snapshot.manifest.snapshot_id, snapshot.action_queue.clone()))
+            .collect();
+
+        // Install helper with rollback on activation failure. Returns `Result`:
+        // a backup-restore failure is reported so the caller can install
+        // `FaultState` carrying both the original and the rollback error.
+        let rollback = |agent: &mut AgentApp| -> Result<()> {
             if let Some(store) = store_backup.clone()
                 && let Some(mut live) = agent.app.world_mut().get_resource_mut::<SnapshotStore>()
             {
@@ -1238,8 +1470,9 @@ impl AgentApp {
             }
             agent.reset_once = reset_once_backup;
             if let Some(backup) = world_backup.clone() {
-                let _ = restore_snapshot_value(agent.app.world_mut(), &backup);
+                restore_snapshot_value(agent.app.world_mut(), &backup)?;
             }
+            Ok(())
         };
 
         // ---- Install log + store + timeline ----
@@ -1309,18 +1542,34 @@ impl AgentApp {
         // faults and do NOT set `reset_once` yet: both happen only on
         // successful activation below.
         self.sync_timeline_with_log();
+        // Missing baseline: records without any snapshots have no restorable
+        // baseline. Keep the log-only install without activation
+        // (`reset_once=false`); history that needs a baseline requires an
+        // explicit reset first.
+        if !bundle_has_snapshots {
+            self.reset_once = reset_once_backup;
+            if bundle_has_history {
+                return Err(anyhow!(
+                    "replay bundle has records but no snapshots: no restorable baseline; explicit reset required before activation"
+                ));
+            }
+            return Ok(());
+        }
         // Position on the exported cursor when snapshots are present,
         // INCLUDING cursor-zero (restore the initial snapshot at tick 0).
         // Any activation failure returns Err WITHOUT clearing FaultState and
         // WITHOUT setting `reset_once=true`; the install above is rolled
         // back so stepping cannot proceed on half-activated state (leave
         // `reset_once=false` when activation is deferred/failed).
-        let cursor = self
-            .app
-            .world()
-            .get_resource::<ReplayRecorder>()
-            .map(|recorder| recorder.log.cursor_tick)
-            .unwrap_or(0);
+        let cursor = bundle_cursor;
+        // Import queue policy (`ReplaceFromImport`): destination futures must
+        // NOT merge into the imported history, so clear the live queue before
+        // the activation restore (`restore_tick` merges pre-restore futures
+        // under `PreserveCurrentFuture`; starting empty leaves nothing to
+        // merge).
+        if let Some(mut queue) = self.app.world_mut().get_resource_mut::<AgentActionQueue>() {
+            queue.clear();
+        }
         let has_snapshots = self
             .app
             .world()
@@ -1337,9 +1586,72 @@ impl AgentApp {
             let restore_result = self.restore_tick(cursor);
             if let Err(error) = restore_result {
                 self.reset_once = saved_reset_once;
-                rollback(self);
+                if let Err(rollback_error) = rollback(self) {
+                    let message = format!(
+                        "replay import activation failed ({error:?}) and rollback failed ({rollback_error:?}); world may be faulted"
+                    );
+                    self.app.world_mut().insert_resource(FaultState {
+                        message: message.clone(),
+                    });
+                    // Do NOT clear FaultState; do NOT set reset_once=true.
+                    return Err(anyhow!("{message}"));
+                }
                 // Do NOT clear FaultState; do NOT set reset_once=true.
                 return Err(error);
+            }
+            // `ReplaceFromImport`: set the live pending queue from the
+            // imported cursor snapshot's `action_queue` (or empty when the
+            // cursor checkpoint has no queued inputs).
+            let imported_pending = {
+                let (log, timeline, branch) = (
+                    self.app
+                        .world()
+                        .get_resource::<ReplayRecorder>()
+                        .map(|recorder: &ReplayRecorder| recorder.log.clone()),
+                    self.app.world().get_resource::<Timeline>().cloned(),
+                    self.app
+                        .world()
+                        .get_resource::<AgentControlState>()
+                        .map(|control| control.branch_id),
+                );
+                match (log, timeline, branch) {
+                    (Some(log), Some(timeline), Some(branch)) => log
+                        .nearest_checkpoint_for_branch(&timeline, branch, cursor)
+                        .and_then(|(_, id)| imported_queues.get(&id).cloned())
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                }
+            };
+            if let Some(mut queue) = self.app.world_mut().get_resource_mut::<AgentActionQueue>() {
+                apply_pending_policy(
+                    &mut queue,
+                    Vec::new(),
+                    imported_pending,
+                    PendingInputPolicy::ReplaceFromImport,
+                );
+            }
+            // Post-activation temporal assert: the world clock must match the
+            // imported cursor, else the install is rolled back with an error.
+            let live_tick = self
+                .app
+                .world()
+                .get_resource::<SimClock>()
+                .map(|clock| clock.tick)
+                .unwrap_or(u64::MAX);
+            if live_tick != cursor {
+                self.reset_once = saved_reset_once;
+                if let Err(rollback_error) = rollback(self) {
+                    let message = format!(
+                        "replay import cursor mismatch (world tick {live_tick} != cursor {cursor}) and rollback failed ({rollback_error:?}); world may be faulted"
+                    );
+                    self.app.world_mut().insert_resource(FaultState {
+                        message: message.clone(),
+                    });
+                    return Err(anyhow!("{message}"));
+                }
+                return Err(anyhow!(
+                    "replay import cursor mismatch: world tick {live_tick} != cursor {cursor}"
+                ));
             }
         }
         // Success: mark activated and clear any prior fault.
@@ -1636,6 +1948,11 @@ impl AgentApp {
 
     fn run_one_agent_tick(&mut self) {
         run_agent_tick(self.app.world_mut());
+        // Record every live tick — including empty frames with no input —
+        // so recording bounds never go stale (see `mark_tick_completed`).
+        // Reconstruction uses `run_one_reconstructing_tick` and never lands
+        // here, so replayed history is not re-recorded.
+        mark_tick_completed(self.app.world_mut());
     }
 
     fn last_response(&self) -> Result<StepResponse<Observation>> {
@@ -1736,6 +2053,14 @@ impl AgentApp {
     /// immediately indexed into the log and retention is enforced with live
     /// refs (the snapshot crate no longer prunes with replay visibility).
     fn sync_auto_checkpoints(&mut self) {
+        // Replay-disabled retention: even without a recorder, snapshot-only
+        // retention still applies (empty reference set).
+        if !self.app.world().contains_resource::<ReplayRecorder>() {
+            if self.app.world().contains_resource::<SnapshotStore>() {
+                enforce_retention(self.app.world_mut(), &BTreeSet::new());
+            }
+            return;
+        }
         let (branch, created, episode) = match (
             self.app.world().get_resource::<AgentControlState>(),
             self.app.world().get_resource::<ReplayRecorder>(),
@@ -2436,31 +2761,18 @@ impl AgentEnvironment for AgentApp {
         let records = log.actions_for_branch(&timeline, branch, checkpoint_tick, tick);
         let replay_result = self.replay_tick_interval(branch, &records, checkpoint_tick, tick);
 
-        // Re-apply pre-restore futures lost by the checkpoint restore.
-        // Multiset merge (multiplicity-preserving): an identical entry is
-        // skipped only when the live queue already holds that many copies;
-        // otherwise it is appended (duplicates allowed).
+        // Re-apply pre-restore futures lost by the checkpoint restore
+        // (`PreserveCurrentFuture` policy shared with `branch` interactive
+        // rewind; see `apply_pending_policy`).
         if !pending_future_before.is_empty()
             && let Some(mut queue) = self.app.world_mut().get_resource_mut::<AgentActionQueue>()
         {
-            for (index, scheduled) in pending_future_before.iter().enumerate() {
-                let needed = pending_future_before[..=index]
-                    .iter()
-                    .filter(|candidate| *candidate == scheduled)
-                    .count();
-                let present = queue
-                    .pending
-                    .iter()
-                    .filter(|candidate| *candidate == scheduled)
-                    .count();
-                if present < needed {
-                    queue.pending.push_back(scheduled.clone());
-                }
-            }
-            // Keep tick order stable for future actions.
-            let mut pending = std::mem::take(&mut queue.pending);
-            pending.make_contiguous().sort_by_key(|s| s.tick);
-            queue.pending = pending;
+            apply_pending_policy(
+                &mut queue,
+                pending_future_before,
+                Vec::new(),
+                PendingInputPolicy::PreserveCurrentFuture,
+            );
         }
 
         if let Some(mut recorder) = self.app.world_mut().get_resource_mut::<ReplayRecorder>() {
@@ -2486,9 +2798,16 @@ impl AgentEnvironment for AgentApp {
             }
             self.reset_once = reset_once_backup;
             if let Some(rollback) = rollback_error {
-                return Err(anyhow!(
-                    "restore_tick to {tick} failed ({original}) and rollback failed ({rollback}); world may be faulted"
-                ));
+                // Rollback itself failed: the world may hold a partially
+                // applied snapshot, so install `FaultState` carrying both
+                // errors and fail closed until an explicit reset.
+                let message = format!(
+                    "restore_tick to {tick} failed ({original}) and rollback failed ({rollback})"
+                );
+                self.app.world_mut().insert_resource(FaultState {
+                    message: message.clone(),
+                });
+                return Err(anyhow!("{message}; world may be faulted"));
             }
             return Err(anyhow!(
                 "restore_tick to {tick} failed; rolled back: {original}"
@@ -2535,6 +2854,26 @@ impl AgentEnvironment for AgentApp {
             }
         }
         self.restore_tick(from_tick)?;
+        // Backward-fork parent resolution: the new branch must hang off the
+        // ancestor owning the `from_tick` interval (deepest ancestor whose
+        // fork interval contains `from_tick`), not necessarily the current
+        // branch. Forking off the current branch for an older tick would
+        // produce `child fork < parent fork`, which bundle import rejects.
+        let fork_parent = {
+            let (timeline, current) = (
+                self.app
+                    .world()
+                    .get_resource::<Timeline>()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("AgentReplayPlugin is not installed"))?,
+                self.app
+                    .world()
+                    .get_resource::<AgentControlState>()
+                    .map(|control| control.branch_id)
+                    .ok_or_else(|| anyhow!("AgentReplayPlugin is not installed"))?,
+            );
+            resolve_fork_parent_branch(&timeline, current, from_tick)?
+        };
         // `checkpoint_on_branch` (default true) snapshots the fork point so the
         // child starts from a restorable checkpoint on its own branch.
         let checkpoint_on_branch = self
@@ -2560,6 +2899,9 @@ impl AgentEnvironment for AgentApp {
                 .world_mut()
                 .get_resource_mut::<Timeline>()
                 .ok_or_else(|| anyhow!("AgentReplayPlugin is not installed"))?;
+            // Reparent to the interval owner before forking:
+            // `create_branch` parents off `current_branch`.
+            timeline.current_branch = fork_parent;
             timeline.create_branch(
                 from_tick,
                 snapshot.as_ref().map(|result| result.snapshot_id),
@@ -2637,6 +2979,15 @@ fn reset_replay_and_timeline(world: &mut World) {
         recorder.log.manifest.game_version = environment.version;
         recorder.log.manifest.episode_id = next_episode;
         recorder.recording = recording;
+        // Fresh episodes start live at the modern shape (`ensure_modern` /
+        // `new_live` equivalent): install topology, active branch, and
+        // cursor/end bounds from the new root so the log is never left
+        // topology-less with stale bounds.
+        let timeline_snapshot = world.get_resource::<Timeline>().cloned();
+        if let Some(timeline) = timeline_snapshot {
+            let log = &mut world.resource_mut::<ReplayRecorder>().log;
+            ensure_modern_log(log, &timeline, 0);
+        }
     }
 
     if let Some((timeline_id, branch_id)) = new_root

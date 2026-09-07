@@ -145,6 +145,16 @@ pub enum ExecutionContext {
 pub struct ReplayLog {
     pub manifest: ReplayManifest,
     pub initial_snapshot: Option<SnapshotId>,
+    /// True for newly recorded live histories. Serde default `false` keeps
+    /// legacy bundles (which predate this flag) classified as legacy.
+    /// See [`ReplayLog::is_modern`] and [`ReplayLog::new_live`].
+    #[serde(default)]
+    pub modern: bool,
+    /// Every executed tick per branch (including empty frames with no
+    /// actions). Keyed by [`branch_checksum_key`]. Serde default empty for
+    /// back-compat; legacy migration backfills from `records`.
+    #[serde(default)]
+    pub completed_ticks: BTreeMap<String, BTreeSet<u64>>,
     pub records: Vec<ActionRecord>,
     pub checkpoints: BTreeMap<u64, SnapshotId>,
     /// Legacy per-tick checksums (no branch tag).
@@ -190,6 +200,60 @@ pub struct ReplayLog {
 }
 
 impl ReplayLog {
+    /// Constructor for new live histories. Sets [`ReplayLog::modern`] so
+    /// live recordings never fall back to legacy global checksum visibility.
+    #[must_use]
+    pub fn new_live() -> Self {
+        Self {
+            modern: true,
+            ..Default::default()
+        }
+    }
+
+    /// Canonical live history marker. Sets [`ReplayLog::modern`] and, when
+    /// `timeline_topology` is empty, populates it with a single `root`
+    /// entry so live logs always carry topology. Called on reset
+    /// ([`start_recording`]) and on first record
+    /// ([`record_replay_step`], [`ReplayLog::record_tick`],
+    /// [`ReplayLog::push_checkpoint_with_episode`],
+    /// [`ReplayLog::insert_branch_checksum`]).
+    pub fn ensure_modern(&mut self, root: BranchId) {
+        self.modern = true;
+        if self.timeline_topology.is_empty() {
+            self.timeline_topology.push(TimelineBranch {
+                branch_id: root,
+                parent_branch: None,
+                fork_tick: 0,
+                fork_snapshot: None,
+                label: Some("root".to_string()),
+                actions: Vec::new(),
+            });
+        }
+    }
+
+    /// Record that `tick` executed on `branch`, including empty frames with
+    /// no actions. Exposed for the runner so per-branch bounds
+    /// ([`ReplayLog::branch_end_tick`] / [`ReplayLog::recorded_range`])
+    /// advance even when a tick carries no actions/checkpoints/checksums.
+    pub fn record_tick(&mut self, branch: BranchId, tick: u64) {
+        self.ensure_modern(branch);
+        self.completed_ticks
+            .entry(branch_checksum_key(branch))
+            .or_default()
+            .insert(tick);
+    }
+
+    /// Backfill [`ReplayLog::completed_ticks`] from `records` for legacy
+    /// logs that predate per-tick completion tracking.
+    pub fn migrate_legacy_completed_ticks(&mut self) {
+        for record in &self.records {
+            self.completed_ticks
+                .entry(branch_checksum_key(record.branch_id))
+                .or_default()
+                .insert(record.tick);
+        }
+    }
+
     #[must_use]
     pub fn actions_between(&self, start_exclusive: u64, end_inclusive: u64) -> Vec<ActionRecord> {
         self.records
@@ -199,12 +263,21 @@ impl ReplayLog {
             .collect()
     }
 
-    /// Modern logs carry `timeline_topology`; unknown branch ids are rejected.
-    /// Legacy logs (empty topology) treat unknown ids as universally visible
-    /// for back-compat, with nil (`legacy_root_id`) migrated to a single root.
+    /// Modern logs carry `timeline_topology` (or were recorded live via
+    /// [`ReplayLog::new_live`] / [`ReplayLog::ensure_modern`]); unknown
+    /// branch ids are rejected. Legacy logs (empty topology, no live flag,
+    /// no branch-tagged checkpoints/checksums) treat unknown ids as
+    /// universally visible for back-compat, with nil (`legacy_root_id`)
+    /// migrated to a single root.
     #[must_use]
     pub fn is_modern(&self) -> bool {
-        !self.timeline_topology.is_empty()
+        self.modern
+            || !self.timeline_topology.is_empty()
+            || !self.branch_checkpoints.is_empty()
+            || self
+                .branch_checksums
+                .values()
+                .any(|per_branch| !per_branch.is_empty())
     }
 
     /// End of recorded history: max over records, checkpoints, bounds,
@@ -233,6 +306,11 @@ impl ReplayLog {
         }
         for per_branch in self.branch_checksums.values() {
             for tick in per_branch.keys() {
+                end = end.max(*tick);
+            }
+        }
+        for ticks in self.completed_ticks.values() {
+            for tick in ticks {
                 end = end.max(*tick);
             }
         }
@@ -283,6 +361,14 @@ impl ReplayLog {
                     }
                 }
             }
+            for (key, ticks) in &self.completed_ticks {
+                let tick_branch = key.parse::<Uuid>().map(BranchId).unwrap_or(branch);
+                for tick in ticks {
+                    if branch_record_visible(timeline, tick_branch, *tick, branch, modern) {
+                        end = end.max(*tick);
+                    }
+                }
+            }
         } else {
             for per_branch in self.branch_checksums.values() {
                 for tick in per_branch.keys() {
@@ -291,6 +377,11 @@ impl ReplayLog {
             }
             for tick in self.snapshot_checksums.keys() {
                 end = end.max(*tick);
+            }
+            for ticks in self.completed_ticks.values() {
+                for tick in ticks {
+                    end = end.max(*tick);
+                }
             }
         }
         // Timeline actions mirror recorded frames; include visible ones so a
@@ -360,6 +451,7 @@ impl ReplayLog {
         for (tick, checksum) in &self.snapshot_checksums {
             per_branch.entry(*tick).or_insert_with(|| checksum.clone());
         }
+        self.migrate_legacy_completed_ticks();
     }
 
     /// Branch-aware checksum insert. Writes the per-branch map and keeps the
@@ -371,6 +463,7 @@ impl ReplayLog {
         tick: u64,
         checksum: SnapshotChecksum,
     ) {
+        self.ensure_modern(branch);
         self.branch_checksums
             .entry(branch_checksum_key(branch))
             .or_default()
@@ -380,6 +473,7 @@ impl ReplayLog {
 
     /// Populate topology fields from a live timeline (called on export).
     pub fn sync_topology(&mut self, timeline: &Timeline, cursor_tick: u64) {
+        self.modern = true;
         self.timeline_topology = timeline.branches.values().cloned().collect();
         // Deterministic export order.
         self.timeline_topology
@@ -399,6 +493,12 @@ impl ReplayLog {
         for tick in self.checkpoints.keys() {
             min_tick = min_tick.min(*tick);
             max_tick = max_tick.max(*tick);
+        }
+        for ticks in self.completed_ticks.values() {
+            for tick in ticks {
+                min_tick = min_tick.min(*tick);
+                max_tick = max_tick.max(*tick);
+            }
         }
         if min_tick == u64::MAX {
             min_tick = cursor_tick;
@@ -543,6 +643,18 @@ impl ReplayLog {
         {
             self.branch_checksums.remove(&key);
         }
+        // Completed ticks: drop this branch's future (including empty
+        // frames); drop the branch key when empty.
+        if let Some(ticks) = self.completed_ticks.get_mut(&key) {
+            ticks.retain(|completed_tick| *completed_tick <= tick);
+        }
+        if self
+            .completed_ticks
+            .get(&key)
+            .is_some_and(|ticks| ticks.is_empty())
+        {
+            self.completed_ticks.remove(&key);
+        }
         // Legacy maps: always drop entries beyond `tick` that have no
         // remaining branch checkpoint at that tick (same-tick isolation
         // across branches). No empty-vector special case: legacy-only logs
@@ -589,6 +701,7 @@ impl ReplayLog {
         snapshot_id: SnapshotId,
         episode: u64,
     ) {
+        self.ensure_modern(branch);
         self.checkpoints.insert(tick, snapshot_id);
         if let Some(existing) = self
             .branch_checkpoints
@@ -633,7 +746,7 @@ impl Default for ReplayRecorder {
     fn default() -> Self {
         Self {
             recording: true,
-            log: ReplayLog::default(),
+            log: ReplayLog::new_live(),
         }
     }
 }
@@ -904,6 +1017,8 @@ pub fn record_replay_step(
         });
     }
 
+    recorder.log.ensure_modern(branch_id);
+    recorder.log.record_tick(branch_id, input.tick);
     recorder.log.records.extend(records.iter().cloned());
     if let Some(branch) = timeline.branches.get_mut(&branch_id) {
         branch.actions.extend(records);
@@ -940,7 +1055,8 @@ pub fn start_recording(world: &mut World, initial_snapshot: Option<SnapshotId>) 
     }
     let mut recorder = world.resource_mut::<ReplayRecorder>();
     recorder.recording = true;
-    recorder.log = ReplayLog::default();
+    recorder.log = ReplayLog::new_live();
+    recorder.log.ensure_modern(branch_id);
     recorder.log.manifest.game_id = metadata.name;
     recorder.log.manifest.game_version = metadata.version;
     recorder.log.initial_snapshot = initial_snapshot;

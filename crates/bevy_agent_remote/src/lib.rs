@@ -1083,6 +1083,23 @@ impl JsonRpcBridge {
                 // malformed topology must be rejected up front.
                 validate_replay_bundle_topology(&bundle)
                     .map_err(|error| invalid_params(error.to_string()))?;
+                // Self-containment pre-check: every snapshot referenced by the
+                // log must be present in the bundle payload. Rejected here
+                // with -32602 (invalid params) before delegating to the
+                // runner transactional load.
+                {
+                    let referenced = collect_replay_references(&bundle.log);
+                    let provided = bundle
+                        .snapshots
+                        .iter()
+                        .map(|snapshot| snapshot.manifest.snapshot_id)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if let Some(missing) = referenced.difference(&provided).next() {
+                        return Err(invalid_params(format!(
+                            "replay bundle is missing referenced snapshot {missing:?}"
+                        )));
+                    }
+                }
                 env.load_replay_bundle(bundle).map_err(into_internal)?;
                 Ok(json!({
                     "records": records,
