@@ -16,6 +16,7 @@ Use the guide that matches the job:
 
 ## Maintain and publish
 
+- [`architecture.md`](architecture.md) explains crate/module ownership, deterministic execution, snapshot/replay transactions, transport contracts, the architecture review, and its implementation plan.
 - [`publishing.md`](publishing.md) lists formatting, test, lint, coverage, packaging, and publish checks.
 
 For a high-level overview and the quickest sample run, start with the [root README](../README.md).

@@ -2,7 +2,7 @@ use bevy_agent_core::AgentAction;
 use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions};
 
 fn main() -> anyhow::Result<()> {
-    let mut env = AgentApp::new(sample_platformer::build_headless_app);
+    let mut env = AgentApp::new(sample_platformer::build_headless_app)?;
     let initial = env.reset(ResetOptions::default())?;
     println!("{}", serde_json::to_string_pretty(&initial)?);
 

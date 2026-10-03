@@ -1,0 +1,1 @@
+{"jsonrpc": "2.0", "id": 4, "method": "agent.step", "params": {"action": {"type": "Noop", "extra": 1}}}

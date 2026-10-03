@@ -1,0 +1,1 @@
+{"jsonrpc": "2.0", "id": 2, "method": "agent.step", "params": {"action": {"type": "Move", "x": 1, "y": 0}}}

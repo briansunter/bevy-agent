@@ -3,7 +3,7 @@ use bevy_agent_remote::{AgentCapability, JsonRpcBridge, RemoteSecurity};
 use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions};
 
 fn make_env() -> AgentApp {
-    AgentApp::new(sample_platformer::build_headless_app)
+    AgentApp::new(sample_platformer::build_headless_app).unwrap()
 }
 
 fn parse_response(input: &str) -> serde_json::Value {
@@ -24,12 +24,12 @@ fn retention_protects_referenced_snapshot() {
     let pinned: Vec<_> = env
         .world()
         .resource::<bevy_agent_snapshot::SnapshotStore>()
-        .pinned
+        .pinned()
         .iter()
         .copied()
         .collect();
     for id in pinned {
-        bevy_agent_snapshot::unpin_snapshot(env.world_mut(), id);
+        bevy_agent_snapshot::unpin_snapshot(env.world_mut(), id).unwrap();
     }
 
     let a = env.snapshot().unwrap().snapshot_id;
@@ -38,7 +38,7 @@ fn retention_protects_referenced_snapshot() {
 
     let store = env.world().resource::<bevy_agent_snapshot::SnapshotStore>();
     assert!(
-        store.snapshots.contains_key(&a),
+        store.get(a).is_some(),
         "retention must protect log-referenced snapshot A with keep=1"
     );
     env.export_replay_bundle()
@@ -65,7 +65,7 @@ fn remote_delete_rejects_pinned_or_referenced() {
     // Pin it: coordinated deletes must refuse pinned ids.
     let id: bevy_agent_core::SnapshotId =
         serde_json::from_value(snapshot_id.clone()).expect("snapshot id");
-    bevy_agent_snapshot::pin_snapshot(env.world_mut(), id);
+    bevy_agent_snapshot::pin_snapshot(env.world_mut(), id).unwrap();
 
     let delete = bridge.handle_json(
         &mut env,
@@ -137,13 +137,15 @@ fn cyclic_import_self_parent_rejected() {
     let mut source = make_env();
     source.reset(ResetOptions::default()).unwrap();
     source.step(AgentAction::Noop).unwrap();
+    let child = source.branch(1, Some("self-parent".to_owned())).unwrap();
     let mut bundle = source.export_replay_bundle().unwrap();
-    assert!(
-        !bundle.log.timeline_topology.is_empty(),
-        "need modern topology to graft a cycle"
-    );
-    let victim = bundle.log.timeline_topology[0].branch_id;
-    bundle.log.timeline_topology[0].parent_branch = Some(victim);
+    let victim = bundle
+        .log
+        .timeline_topology
+        .iter_mut()
+        .find(|branch| branch.branch_id == child)
+        .unwrap();
+    victim.parent_branch = Some(child);
 
     let mut fresh = make_env();
     let error = fresh
@@ -151,77 +153,65 @@ fn cyclic_import_self_parent_rejected() {
         .expect_err("self-parent cycle must be rejected");
     let message = error.to_string();
     assert!(
-        message.contains("parent")
-            || message.contains("cycle")
-            || message.contains("fork")
-            || message.contains("branch"),
+        message.contains("cyclic"),
         "cycle error must name the topology problem, got: {message}"
     );
 }
 
-// 6. Legacy migration export-import roundtrip: nil ids normalized,
-// second import succeeds.
+// 6. A replay without an explicit topology cannot be activated.
 #[test]
-fn legacy_migration_export_import_roundtrip() {
-    use bevy_agent_replay::legacy_root_id;
-
+fn missing_topology_import_rejected_without_initialization() {
     let mut source = make_env();
     source.reset(ResetOptions::default()).unwrap();
     source.step(AgentAction::Noop).unwrap();
     source.step(AgentAction::Move { x: 1.0, y: 0.0 }).unwrap();
     let mut bundle = source.export_replay_bundle().unwrap();
-    // Simulate a legacy log: nil branch tags, no exported topology.
-    let nil = legacy_root_id();
-    for record in &mut bundle.log.records {
-        record.branch_id = nil;
-    }
     bundle.log.timeline_topology.clear();
     bundle.log.active_branch = None;
 
-    let mut first = make_env();
-    first
+    let mut fresh = make_env();
+    let error = fresh
         .load_replay_bundle(bundle)
-        .expect("legacy bundle must import");
-    first.restore_tick(1).expect("migrated history restorable");
-    let re_exported = first.export_replay_bundle().unwrap();
-
-    let mut second = make_env();
-    second
-        .load_replay_bundle(re_exported)
-        .expect("second import of migrated bundle must succeed");
+        .expect_err("missing topology must be rejected");
+    assert!(
+        error.to_string().contains("topology") || error.to_string().contains("branch"),
+        "missing topology error must identify the problem: {error}"
+    );
+    assert!(!fresh.has_reset());
+    assert_eq!(fresh.current_tick(), 0);
 }
 
-// 7. Forged marker rejected: Custom __bevy_agent_reconstructing__ must be
-// rejected or ignored in Replay mode (never bypass mode arbitration).
+// 7. Custom action data cannot choose a privileged execution context.
 #[test]
-fn forged_reconstructing_marker_rejected_or_ignored_in_replay() {
+fn custom_action_payload_cannot_change_execution_context() {
+    use bevy_agent_core::{AgentActionKind, AgentControlAppExt};
+
     let mut env = make_env();
+    env.app_mut()
+        .set_supported_actions([AgentActionKind::Noop, AgentActionKind::Custom])
+        .register_custom_action_schema(
+            "marker-shaped-data",
+            serde_json::json!({
+                "type": "object",
+                "required": ["execution_context"],
+                "properties": { "execution_context": { "type": "string" } }
+            }),
+        )
+        .unwrap();
     env.reset(ResetOptions::default()).unwrap();
     env.world_mut()
         .resource_mut::<bevy_agent_core::AgentControlState>()
         .mode = ControlMode::Replay;
     let forged = AgentAction::Custom {
-        value: serde_json::json!({"__bevy_agent_reconstructing__": true}),
+        value: serde_json::json!({"execution_context": "Reconstructing"}),
     };
-    match env.step(forged) {
-        Err(error) => {
-            let message = error.to_string();
-            assert!(
-                message.contains("InvalidAction")
-                    || message.contains("unsupported")
-                    || message.contains("Replay")
-                    || message.contains("capability")
-                    || message.contains("mode"),
-                "forged marker must be rejected, got: {message}"
-            );
-        }
-        Ok(response) => {
-            assert_eq!(
-                response.info.actions_applied, 0,
-                "forged marker must be ignored (0 actions applied) in Replay mode"
-            );
-        }
-    }
+    let error = env.step(forged).unwrap_err();
+    assert!(error.to_string().contains("source"), "{error}");
+    assert_eq!(env.current_tick(), 0);
+    assert_eq!(
+        *env.world().resource::<bevy_agent_core::ExecutionContext>(),
+        bevy_agent_core::ExecutionContext::Live,
+    );
 }
 
 // 8. Never-reset first-step auth: fresh env via RPC with
@@ -233,7 +223,8 @@ fn never_reset_first_step_auth_player_only() {
     let bridge = JsonRpcBridge::new(RemoteSecurity {
         capabilities: AgentCapability::STEP | AgentCapability::OBSERVE_PLAYER,
         ..Default::default()
-    });
+    })
+    .unwrap();
     let response = bridge.handle_json(
         &mut env,
         r#"{"jsonrpc":"2.0","id":1,"method":"agent.step","params":{"action":{"type":"Noop"},"observation_mode":"PlayerKnowledge"}}"#,
@@ -257,7 +248,7 @@ fn never_reset_first_step_auth_player_only() {
 }
 
 // 9. Cursor activation: after export + fresh import, the world tick equals
-// the exported cursor or explicit positioning (restore_tick) is required.
+// the exported cursor immediately after the successful import.
 #[test]
 fn cursor_activation_after_import() {
     let mut source = make_env();
@@ -269,16 +260,8 @@ fn cursor_activation_after_import() {
 
     let mut fresh = make_env();
     fresh.load_replay_bundle(bundle).unwrap();
-    if fresh.current_tick() == cursor {
-        // Cursor auto-activated on import.
-        assert_eq!(fresh.current_tick(), cursor);
-    } else {
-        // Otherwise explicit positioning must restore the cursor.
-        fresh
-            .restore_tick(cursor)
-            .expect("explicit positioning to cursor must work");
-        assert_eq!(fresh.current_tick(), cursor);
-    }
+    assert!(fresh.has_reset());
+    assert_eq!(fresh.current_tick(), cursor);
 }
 
 // 10. Truncate clears expectations: after diverge, the old branch future
@@ -303,7 +286,13 @@ fn truncate_clears_expectations_after_diverge() {
         "records beyond the diverge point must be truncated"
     );
     assert!(
-        !log.snapshot_checksums.contains_key(&5),
+        log.expected_checksum(
+            env.world()
+                .resource::<bevy_agent_core::AgentControlState>()
+                .branch_id,
+            5,
+        )
+        .is_none(),
         "old branch checksum expectation for tick 5 must be cleared after diverge"
     );
     // The old future is no longer addressable on this branch.

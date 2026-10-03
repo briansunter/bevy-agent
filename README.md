@@ -2,6 +2,9 @@
 
 A Bevy 0.18.1 workspace for driving a game as a deterministic simulation that an AI agent can step, inspect, snapshot, restore, replay, and branch.
 
+Snapshots and replay bundles use the current version-3 contracts. Regenerate
+older artifacts; legacy formats and compatibility aliases have been removed.
+
 The workspace is organized around small crates with one responsibility each:
 
 - `bevy_agent_core`: schedules, `SimClock`, domain actions, input frames, observations, rewards, terminal state, checksums.
@@ -22,7 +25,7 @@ Run the commands below from the repository root. The HTTP server examples are lo
 ## Repository Layout
 
 - `crates/`: reusable runtime crates, the `agentctl` CLI, and the sample platformer.
-- `python/`: an optional stdlib-only HTTP client.
+- `python/`: optional stdlib HTTP and stdio clients.
 - `docs/`: user, integration, and publishing guides; start with [`docs/README.md`](docs/README.md).
 - `skills/`: Codex skills and their protocol/integration references.
 - `Cargo.toml` and `Cargo.lock`: workspace metadata and the locked dependency graph.
@@ -30,6 +33,7 @@ Run the commands below from the repository root. The HTTP server examples are lo
 ## Documentation
 
 - [`docs/README.md`](docs/README.md): documentation index.
+- [`docs/architecture.md`](docs/architecture.md): detailed architecture, invariants, and improvement plan.
 - [`docs/codex-interaction.md`](docs/codex-interaction.md): step, capture, snapshot, restore, branch, replay, and security commands.
 - [`docs/controllable-game.md`](docs/controllable-game.md): integration checklist for a Bevy game.
 - [`docs/publishing.md`](docs/publishing.md): package and publish checks.
@@ -42,7 +46,7 @@ Run the commands below from the repository root. The HTTP server examples are lo
 use bevy_agent_core::AgentAction;
 use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions};
 
-let mut env = AgentApp::new(sample_platformer::build_headless_app);
+let mut env = AgentApp::new(sample_platformer::build_headless_app)?;
 let obs0 = env.reset(ResetOptions::default())?;
 let step1 = env.step(AgentAction::Move { x: 1.0, y: 0.0 })?;
 let snapshot = env.snapshot()?;
@@ -57,7 +61,7 @@ Install the standard Bevy agent stack with a plugin group:
 ```rust
 use bevy_agent_runner::AgentControlPlugins;
 
-app.add_plugins(AgentControlPlugins::deterministic())
+app.add_plugins(AgentControlPlugins::default())
     .add_plugins(GamePlugin);
 ```
 
@@ -77,8 +81,8 @@ The example creates `./artifacts`, sets it as the artifact root, and grants
 the `FILESYSTEM` capability so screenshot captures and replay file exports
 work out of the box. All `path` / `output_dir` arguments stay confined under
 that root. The library default is restrictive (no `FILESYSTEM`); without it,
-filesystem-touching calls are rejected and replay bundles must be transferred
-inline as base64 (`bundle_base64` in `agent.replay.export`).
+filesystem-touching calls are rejected and replay bundles are transferred
+inline as JSON (`bundle` in `agent.replay.export`).
 
 The server exposes `POST /rpc`, `GET /health`, and `GET /ws`. For a command-by-command interaction guide, see [`docs/codex-interaction.md`](docs/codex-interaction.md).
 
@@ -93,7 +97,7 @@ cargo run -p agentctl -- snapshot
 cargo run -p agentctl -- replay-export replay.json
 ```
 
-Or drive it from Python:
+Or run `PYTHONPATH=python python3` from the repository root and drive it from Python:
 
 ```python
 from bevy_agent_client import AgentClient
@@ -137,19 +141,34 @@ Capture output lands under the artifact root (`./artifacts/screenshots/`),
 and the replay file export under `./artifacts/replay.json`, because relative
 `output_dir` / `path` arguments resolve against `--artifact-dir`. To fetch a
 replay without filesystem access instead, omit the export path and save the
-inline base64 payload client-side.
+inline JSON bundle client-side.
 
 `agent.visual.capture` returns a PNG path plus tick/frame/size metadata. Set `source` to `software`, `primary_window`, or `auto`. Games can register a software capture renderer for headless runs, as the sample platformer does.
 
 Start the sample with visual/render features when you want render plugins and primary-window screenshot support compiled in:
 
 ```sh
-cargo run -p sample_platformer --features visual --example remote_http_visual -- 127.0.0.1:4000
+cargo run -p sample_platformer --features visual --example remote_http_visual -- 127.0.0.1:4000 --artifact-dir ./artifacts
 ```
 
 The visual example installs `BevyRemoteControlPlugin` in the normal Bevy app and
 then calls `app.run()`. Network I/O stays on a background thread while Bevy
-state changes and primary-window capture are handled on the main thread.
+state changes and primary-window capture are handled on the main thread. A
+bounded worker pool serves connections while one simulation owner executes
+commands. Timeout errors include an opaque operation ID; use
+`agent.operations.status`, Python `operation_status(id)`, or CLI
+`operation-status <id>` to retrieve the retained outcome. Supply an envelope
+`retry_key` before a mutation to deduplicate retries after a lost response:
+Python `step(action, retry_key="episode-1.tick-1")`, CLI `--retry-key KEY step ...`.
+Status also accepts the key: `operation_status(retry_key=KEY)` or
+`operation-status --key KEY`. Keys expire with the retained outcome and belong
+to one server instance. Stdio has no retry ledger.
+
+Batches always stop at terminal state. Errors after mutation begins report the
+committed tick and whether recovery is required; Python preserves this in
+`RemoteError.data`. A faulted world requires a successful reset. Snapshot and
+replay owners each default to a configurable 64 MiB retention budget. Manual
+pins persist; automatic history protection expires when history is replaced.
 
 ## JSON-RPC Example
 
@@ -169,6 +188,7 @@ The JSON-RPC bridge is deliberately transport-light so it can be embedded into t
 
 The sample also includes:
 
+- `primary_window_smoke`: real rendered capture and listener shutdown checks under Xvfb/Mesa.
 - `remote_stdio`: JSON-RPC over newline-delimited stdin/stdout.
 - `remote_http`: HTTP `POST /rpc`, `GET /health`, and WebSocket JSON-RPC at `GET /ws`.
 - `remote_http_visual`: visual-feature remote with render plugins and primary-window screenshot support.
@@ -191,9 +211,12 @@ Gameplay systems that need replayable behavior should:
 - use `StableHasher` or an equivalent deterministic checksum path for replay validation;
 - keep rendering/UI systems read-only with respect to authoritative simulation state.
 
-Call `set_environment_metadata`, `set_supported_actions`, and
-`set_observation_schema` during integration so remote discovery describes the
-game rather than the library defaults. Replay exports are portable bundles that
+Declare environment metadata, supported actions, supported observation modes,
+and a schema for the complete serialized `Observation`. Install observation and
+checksum extractors. `AgentApp::new` validates this contract and returns `Result`.
+Custom action schemas are compiled once and enforced before input admission.
+Gameplay snapshot types implement `SnapshotType` with a stable wire ID and an
+explicit per-type schema version; registration is fallible. Replay exports are portable bundles that
 include all referenced initial and checkpoint snapshots.
 
 The sample platformer follows this contract: movement, gravity, collision, coin pickup, reward, terminal checks, observation extraction, snapshots, replay, and branches all run headlessly under explicit agent control.

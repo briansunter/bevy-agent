@@ -13,8 +13,10 @@ categories = ["game-development", "simulation"]
 
 [dependencies]
 bevy.workspace = true
+jsonschema.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

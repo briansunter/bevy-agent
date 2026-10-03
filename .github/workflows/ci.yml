@@ -4,18 +4,26 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  ci:
+  headless:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust 1.91
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.91.0
-          override: true
           components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -23,34 +31,32 @@ jobs:
           python-version: "3.12"
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Cargo tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Documentation tests
+        run: cargo test --workspace --doc --locked
+
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
 
       - name: Python tests
         run: python3 -m unittest discover -s python/tests
 
-  extended:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      - name: Build clients and headless examples
+        run: cargo build --workspace --bins --examples --locked
 
-      - name: Install Rust 1.91
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: 1.91.0
-          override: true
-          components: rustfmt, clippy
-
-      - name: Cargo tests (all targets)
-        run: cargo test --workspace --all-targets --locked
-
-      - name: Locked build
-        run: cargo build --workspace --locked
+      - name: Real transport smoke checks
+        run: python3 scripts/smoke.py
 
   visual:
     runs-on: ubuntu-latest
@@ -58,24 +64,63 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust 1.91
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.91.0
-          override: true
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: visual
 
       - name: Install Bevy Linux dependencies
-        run: sudo apt-get update && sudo apt-get install -y g++ pkg-config libx11-dev libasound2-dev libudev-dev libxkbcommon-x11-0 libwayland-dev libxkbcommon-dev
+        run: sudo apt-get update && sudo apt-get install -y g++ pkg-config libx11-dev libasound2-dev libudev-dev libxkbcommon-x11-0 libwayland-dev libxkbcommon-dev xvfb xauth mesa-vulkan-drivers
 
-      - name: Visual feature compile check
-        # Screenshot runtime is covered by capture integration tests; this job
-        # ensures every feature/target compiles.
-        run: cargo check --workspace --all-targets --all-features --locked
+      - name: All-feature Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: All-feature tests
+        run: cargo test --workspace --all-targets --all-features --locked
+
+      - name: Build primary-window capture smoke test
+        run: cargo build -p sample_platformer --example primary_window_smoke --features visual --locked
+
+      - name: Exercise real rendering and primary-window capture
+        env:
+          WGPU_BACKEND: vulkan
+        run: xvfb-run -a -s '-screen 0 1280x720x24' target/debug/examples/primary_window_smoke "$RUNNER_TEMP/primary-window-smoke"
+
+      - name: Save rendered capture evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: primary-window-capture
+          path: ${{ runner.temp }}/primary-window-smoke
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+          key: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Exercise the JSON-RPC parser with libFuzzer
+        working-directory: fuzz
+        run: cargo fuzz run rpc_request -- -max_total_time=30 -max_len=1048576
 
   python:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
 

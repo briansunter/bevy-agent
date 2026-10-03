@@ -34,7 +34,7 @@ Snapshot, restore, and branch:
 ```sh
 cargo run -p agentctl -- snapshot
 cargo run -p agentctl -- restore <snapshot-id>
-cargo run -p agentctl -- branch --from-tick 10 --label try_jump
+cargo run -p agentctl -- branch --from-tick 3 --label try_jump
 ```
 
 Replay files:
@@ -62,3 +62,46 @@ cargo run -p sample_platformer --example remote_stdio
 ```
 
 Then send one JSON-RPC request per line.
+
+## Recovering a timed-out operation
+
+An HTTP/WebSocket server timeout error includes `error.data.operation_id` and
+`execution_state`. A queued operation can be cancelled before execution; a
+running operation can still complete. Preserve its opaque string identifier and
+query the outcome before repeating a mutation:
+
+```sh
+cargo run -p agentctl -- operation-status <operation-id>
+```
+
+Python exposes `env.operation_status(operation_id)`. Status retrieval uses the
+same session token and returns `queued`, `running`, `completed`, `cancelled`, or
+`error`, plus the original JSON-RPC response when available. Default retention
+is five minutes, bounded by 256 entries and 64 MiB; older terminal results can
+be evicted sooner under pressure. An unknown result does not prove a mutation
+never happened.
+
+To survive a disconnect before receiving an operation ID, choose a retry key
+before sending the mutation:
+
+```sh
+cargo run -p agentctl -- --retry-key episode-1.tick-1 step '{"type":"Noop"}'
+cargo run -p agentctl -- operation-status --key episode-1.tick-1
+```
+
+Python supports `env.step(action, retry_key="episode-1.tick-1")` and
+`env.operation_status(retry_key="episode-1.tick-1")`. Identical retries share one
+execution while the outcome is retained. A changed method or payload with the
+same key is rejected. Keys belong to one server instance and expire with the
+outcome; they do not survive server restart. Use a new key for a new intent.
+
+Step/reset errors after mutation begins include committed-tick and recovery
+information in `error.data`; Python exposes it through `RemoteError.data`.
+When `recovery_required` is true, reset must complete successfully before
+stepping, observing, exporting, or navigating again. Batches always stop at
+terminal state; the former `stop_on_done` parameter is rejected.
+
+Discovery lists only the game's supported actions and observation modes. The
+sample supports `PlayerKnowledge` and `Hybrid`; requesting another mode returns
+an error. Step and observe inherit the current mode when none is supplied.
+Snapshot, replay-log, and bundle formats are version 3; regenerate older files.

@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target/
+/fuzz/target/
+/fuzz/artifacts/
 **/*.rs.bk
 
 # Python bytecode
@@ -8,6 +10,7 @@ __pycache__/
 
 # Local runtime output from the examples and agentctl
 /screenshots/
+/artifacts/
 /replay.json
 
 # Local coverage output

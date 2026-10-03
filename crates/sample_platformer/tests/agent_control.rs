@@ -8,7 +8,7 @@ use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions};
 use std::path::PathBuf;
 
 fn make_env() -> AgentApp {
-    AgentApp::new(sample_platformer::build_headless_app)
+    AgentApp::new(sample_platformer::build_headless_app).unwrap()
 }
 
 fn player_x(observation: &Observation) -> f32 {
@@ -39,6 +39,16 @@ fn checksum(env: &AgentApp) -> u64 {
         .expect("step response checksum")
 }
 
+fn assert_result_fields(response: &serde_json::Value, fields: &[&str]) {
+    let actual = response["result"]
+        .as_object()
+        .expect("successful response object")
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual, fields.iter().copied().collect());
+}
+
 #[test]
 fn step_increments_tick_by_one() {
     let mut env = make_env();
@@ -60,7 +70,8 @@ fn queued_future_action_applies_on_correct_tick_and_once() {
         2,
         bevy_agent_core::ActionSource::Test,
         AgentAction::Move { x: 1.0, y: 0.0 },
-    );
+    )
+    .unwrap();
     let tick_1 = env.step(AgentAction::Noop).unwrap();
     let tick_2 = env.step(AgentAction::Noop).unwrap();
     let tick_3 = env.step(AgentAction::Noop).unwrap();
@@ -198,13 +209,15 @@ fn branch_does_not_mutate_parent_timeline() {
     env.snapshot().unwrap();
 
     let timeline_before = env.world().resource::<Timeline>().clone();
-    let parent_branch = timeline_before.current_branch;
-    let parent_actions_before = timeline_before
-        .branches
-        .get(&parent_branch)
+    let parent_branch = timeline_before.current_branch();
+    let parent_actions_before: Vec<_> = env
+        .replay_log()
         .unwrap()
-        .actions
-        .len();
+        .records
+        .iter()
+        .filter(|record| record.branch_id == parent_branch)
+        .cloned()
+        .collect();
 
     let child = env.branch(1, Some("alternate".to_string())).unwrap();
     env.step(AgentAction::Jump).unwrap();
@@ -212,16 +225,17 @@ fn branch_does_not_mutate_parent_timeline() {
     let timeline_after = env.world().resource::<Timeline>();
     assert_ne!(child, parent_branch);
     assert_eq!(
-        timeline_after
-            .branches
-            .get(&parent_branch)
+        env.replay_log()
             .unwrap()
-            .actions
-            .len(),
+            .records
+            .iter()
+            .filter(|record| record.branch_id == parent_branch)
+            .cloned()
+            .collect::<Vec<_>>(),
         parent_actions_before
     );
     assert_eq!(
-        timeline_after.branches.get(&child).unwrap().parent_branch,
+        timeline_after.branches().get(&child).unwrap().parent_branch,
         Some(parent_branch)
     );
 }
@@ -276,7 +290,21 @@ fn remote_action_and_observation_spaces_include_json_schema() {
     );
     let observation: serde_json::Value = serde_json::from_str(&observation_response).unwrap();
     assert_eq!(observation["result"]["default"], "Hybrid");
-    assert!(observation["result"]["schema"]["$defs"]["player"].is_object());
+    assert_eq!(
+        observation["result"]["modes"],
+        serde_json::json!(["PlayerKnowledge", "Hybrid"]),
+    );
+    let domain_schema = env
+        .world()
+        .resource::<bevy_agent_core::AgentObservationCatalog>()
+        .schema()
+        .unwrap();
+    for field in ["oneOf", "$defs"] {
+        assert_eq!(
+            observation["result"]["schema"][field], domain_schema[field],
+            "discovery must expose the domain's validated observation contract",
+        );
+    }
 }
 
 #[test]
@@ -287,9 +315,9 @@ fn remote_replay_export_and_load_round_trip() {
     let bridge = JsonRpcBridge::new(RemoteSecurity {
         artifact_root: Some(artifact_root.clone()),
         capabilities: AgentCapability::default() | AgentCapability::FILESYSTEM,
-        allow_absolute_paths: true,
         ..Default::default()
-    });
+    })
+    .unwrap();
     bridge.handle_json(
         &mut env,
         r#"{"jsonrpc":"2.0","id":1,"method":"agent.reset","params":{"options":{"seed":7,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,
@@ -299,7 +327,7 @@ fn remote_replay_export_and_load_round_trip() {
         r#"{"jsonrpc":"2.0","id":2,"method":"agent.step_many","params":{"actions":[{"type":"Move","x":1.0,"y":0.0},{"type":"Jump"}],"return_observations":"last"}}"#,
     );
 
-    let path = artifact_root.join("replay.json");
+    let path = "replay.json";
     let export_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 3,
@@ -308,13 +336,14 @@ fn remote_replay_export_and_load_round_trip() {
     });
     let export_response = bridge.handle_json(&mut env, &export_request.to_string());
     let export: serde_json::Value = serde_json::from_str(&export_response).unwrap();
+    assert_result_fields(&export, &["records", "checkpoints", "path"]);
     assert_eq!(export["result"]["records"], 2);
 
     let load_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 4,
         "method": "agent.replay.load",
-        "params": { "path": export["result"]["path"].as_str().unwrap() }
+        "params": { "path": path }
     });
     let load_response = bridge.handle_json(&mut env, &load_request.to_string());
     let load: serde_json::Value = serde_json::from_str(&load_response).unwrap();
@@ -408,7 +437,8 @@ fn remote_rejects_missing_token_and_missing_capability() {
     let token_bridge = JsonRpcBridge::new(RemoteSecurity {
         session_token: Some("secret".to_string()),
         ..Default::default()
-    });
+    })
+    .unwrap();
     let token_response = token_bridge.handle_json(
         &mut env,
         r#"{"jsonrpc":"2.0","id":1,"method":"agent.step","params":{"action":{"type":"Noop"}}}"#,
@@ -424,7 +454,8 @@ fn remote_rejects_missing_token_and_missing_capability() {
     let capability_bridge = JsonRpcBridge::new(RemoteSecurity {
         capabilities: AgentCapability::OBSERVE_PLAYER,
         ..Default::default()
-    });
+    })
+    .unwrap();
     let capability_response = capability_bridge.handle_json(
         &mut env,
         r#"{"jsonrpc":"2.0","id":2,"method":"agent.step","params":{"action":{"type":"Noop"}}}"#,
@@ -446,9 +477,9 @@ fn remote_visual_capture_writes_png_file() {
     let bridge = JsonRpcBridge::new(RemoteSecurity {
         artifact_root: Some(artifact_root.clone()),
         capabilities: AgentCapability::default() | AgentCapability::FILESYSTEM,
-        allow_absolute_paths: true,
         ..Default::default()
-    });
+    })
+    .unwrap();
     bridge.handle_json(
         &mut env,
         r#"{"jsonrpc":"2.0","id":1,"method":"agent.reset","params":{"options":{"seed":1,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,
@@ -458,7 +489,6 @@ fn remote_visual_capture_writes_png_file() {
         r#"{"jsonrpc":"2.0","id":2,"method":"agent.step","params":{"action":{"type":"Move","x":1.0,"y":0.0}}}"#,
     );
 
-    let output_dir = artifact_root.join("capture");
     let response = bridge.handle_json(
         &mut env,
         &serde_json::json!({
@@ -466,7 +496,7 @@ fn remote_visual_capture_writes_png_file() {
             "id": 3,
             "method": "agent.visual.capture",
             "params": {
-                "output_dir": output_dir,
+                "output_dir": "capture",
                 "label": "after step"
             }
         })
@@ -489,7 +519,8 @@ fn remote_visual_capture_requires_capability() {
     let bridge = JsonRpcBridge::new(RemoteSecurity {
         capabilities: AgentCapability::STEP,
         ..Default::default()
-    });
+    })
+    .unwrap();
     let response = bridge.handle_json(
         &mut env,
         r#"{"jsonrpc":"2.0","id":1,"method":"agent.visual.capture","params":{}}"#,
@@ -572,8 +603,10 @@ fn remote_replay_start_and_stop_reset_recording_log() {
         r#"{"jsonrpc":"2.0","id":5,"method":"agent.replay.stop","params":{}}"#,
     );
     let stop_value: serde_json::Value = serde_json::from_str(&stop).unwrap();
-    assert_eq!(stop_value["result"]["recording"], false);
-    assert_eq!(stop_value["result"]["records"], 1);
+    assert_eq!(
+        stop_value["result"],
+        serde_json::json!({"recording": false, "records": 1}),
+    );
 }
 
 #[test]
@@ -674,7 +707,7 @@ fn remote_step_many_return_modes_and_restore_tick_work() {
 }
 
 #[test]
-fn remote_snapshot_restore_and_replay_load_inline_log_work() {
+fn remote_snapshot_restore_and_replay_load_inline_bundle_work() {
     let mut env = make_env();
     let bridge = JsonRpcBridge::default();
     bridge.handle_json(
@@ -710,6 +743,7 @@ fn remote_snapshot_restore_and_replay_load_inline_log_work() {
         r#"{"jsonrpc":"2.0","id":5,"method":"agent.replay.export","params":{}}"#,
     );
     let export: serde_json::Value = serde_json::from_str(&export).unwrap();
+    assert_result_fields(&export, &["records", "checkpoints", "bundle"]);
     let load = bridge.handle_json(
         &mut env,
         &serde_json::json!({
@@ -734,13 +768,13 @@ fn reset_clears_replay_log_and_starts_root_timeline_preserving_recording() {
     assert!(records_before >= 2);
 
     // Flip recording off and capture the current timeline identity.
-    env.world_mut().resource_mut::<ReplayRecorder>().recording = false;
-    let timeline_before = env.world().resource::<Timeline>().timeline_id;
+    env.stop_recording().unwrap();
+    let timeline_before = env.world().resource::<Timeline>().timeline_id();
 
     env.reset(ResetOptions::default()).unwrap();
 
     // The recording flag is preserved across the episode boundary.
-    assert!(!env.world().resource::<ReplayRecorder>().recording);
+    assert!(!env.world().resource::<ReplayRecorder>().is_recording());
     // Prior replay records are cleared (the fresh initial snapshot seeds the log
     // metadata but adds no step records).
     assert!(env.replay_log().unwrap().records.is_empty());
@@ -748,18 +782,18 @@ fn reset_clears_replay_log_and_starts_root_timeline_preserving_recording() {
     // A fresh timeline root was started and the control state tracks it.
     let timeline = env.world().resource::<Timeline>();
     let control = env.world().resource::<AgentControlState>();
-    assert_ne!(timeline.timeline_id, timeline_before);
-    assert_eq!(timeline.branches.len(), 1);
+    assert_ne!(timeline.timeline_id(), timeline_before);
+    assert_eq!(timeline.branches().len(), 1);
     assert_eq!(
         timeline
-            .branches
-            .get(&timeline.current_branch)
+            .branches()
+            .get(&timeline.current_branch())
             .unwrap()
             .parent_branch,
         None
     );
-    assert_eq!(timeline.timeline_id, control.timeline_id);
-    assert_eq!(timeline.current_branch, control.branch_id);
+    assert_eq!(timeline.timeline_id(), control.timeline_id);
+    assert_eq!(timeline.current_branch(), control.branch_id);
 }
 
 #[test]
@@ -805,10 +839,11 @@ fn restore_realigns_frame_to_next_tick() {
 fn restore_tick_reproduces_multi_action_tick_without_appending_records() {
     let mut env = make_env();
     env.reset(ResetOptions::default()).unwrap();
-    // Two opposing moves at the same tick make the outcome order-sensitive: the
-    // last move wins for horizontal velocity.
-    env.enqueue_action_at(1, ActionSource::Agent, AgentAction::Move { x: 1.0, y: 0.0 });
-    env.enqueue_action_at(1, ActionSource::Test, AgentAction::Move { x: -1.0, y: 0.0 });
+    // Opposing moves cancel, and all accepted actions must be replayed.
+    env.enqueue_action_at(1, ActionSource::Agent, AgentAction::Move { x: 1.0, y: 0.0 })
+        .unwrap();
+    env.enqueue_action_at(1, ActionSource::Test, AgentAction::Move { x: -1.0, y: 0.0 })
+        .unwrap();
     let original = env.step(AgentAction::Noop).unwrap();
     // The two enqueued moves plus the step's Noop all land on tick 1.
     assert_eq!(original.info.actions_applied, 3);
@@ -834,15 +869,16 @@ fn restore_tick_reproduces_multi_action_tick_without_appending_records() {
 fn restore_tick_preserves_pending_actions_after_target_tick() {
     let mut env = make_env();
     env.reset(ResetOptions::default()).unwrap();
-    env.enqueue_action_at(5, ActionSource::Test, AgentAction::Jump);
+    env.enqueue_action_at(5, ActionSource::Test, AgentAction::Jump)
+        .unwrap();
     env.snapshot().unwrap();
     env.step(AgentAction::Noop).unwrap();
 
     env.restore_tick(1).unwrap();
 
     let queue = env.world().resource::<AgentActionQueue>();
-    assert_eq!(queue.pending.len(), 1);
-    assert_eq!(queue.pending.front().unwrap().tick, 5);
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue.iter().next().unwrap().tick, 5);
 }
 
 #[test]
@@ -862,20 +898,6 @@ fn paused_and_inspect_only_modes_block_step_without_advancing() {
     assert!(inspect_error.to_string().contains("InspectOnly"));
 }
 
-#[allow(dead_code)]
-fn replay_temp_path() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "bevy-agent-replay-{}-{}.json",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    path
-}
-
 fn capture_temp_dir() -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
@@ -889,7 +911,7 @@ fn capture_temp_dir() -> PathBuf {
     path
 }
 
-// ---- Adversarial coverage (append-only; existing tests untouched) ----
+// Adversarial replay checks.
 
 #[test]
 fn adversarial_parent_future_excluded_from_child_restore_state() {
@@ -943,7 +965,7 @@ fn adversarial_parent_future_excluded_from_child_restore_state() {
     assert_eq!(env.world().resource::<AgentControlState>().branch_id, child);
     // Parent early checkpoint is still addressable on the parent lineage.
     let parent = timeline
-        .branches
+        .branches()
         .get(&child)
         .unwrap()
         .parent_branch
@@ -969,12 +991,12 @@ fn adversarial_retention_1_returns_surviving_id() {
     let pinned: Vec<_> = env
         .world()
         .resource::<bevy_agent_snapshot::SnapshotStore>()
-        .pinned
+        .pinned()
         .iter()
         .copied()
         .collect();
     for id in pinned {
-        bevy_agent_snapshot::unpin_snapshot(env.world_mut(), id);
+        bevy_agent_snapshot::unpin_snapshot(env.world_mut(), id).unwrap();
     }
 
     let s1 = env.snapshot().unwrap().snapshot_id;
@@ -983,7 +1005,7 @@ fn adversarial_retention_1_returns_surviving_id() {
 
     let store = env.world().resource::<bevy_agent_snapshot::SnapshotStore>();
     assert!(
-        store.snapshots.contains_key(&s3),
+        store.get(s3).is_some(),
         "retention-1 must return surviving id"
     );
     // Surviving id restores.
@@ -1000,7 +1022,6 @@ fn adversarial_retention_1_returns_surviving_id() {
         .log
         .initial_snapshot
         .into_iter()
-        .chain(bundle.log.checkpoints.values().copied())
         .chain(bundle.log.branch_checkpoints.iter().map(|c| c.snapshot_id))
     {
         assert!(ids.contains(&id), "referenced snapshot {id:?} must exist");
@@ -1024,8 +1045,9 @@ fn adversarial_reset_cross_episode_isolation() {
     env.world_mut()
         .resource_mut::<bevy_agent_core::RewardState>()
         .cumulative_reward = 999.0;
-    env.enqueue_action_at(99, ActionSource::Test, AgentAction::Jump);
-    let timeline_before = env.world().resource::<Timeline>().timeline_id;
+    env.enqueue_action_at(99, ActionSource::Test, AgentAction::Jump)
+        .unwrap();
+    let timeline_before = env.world().resource::<Timeline>().timeline_id();
     let records_before = env.replay_log().unwrap().records.len();
     assert!(records_before >= 2);
 
@@ -1047,18 +1069,13 @@ fn adversarial_reset_cross_episode_isolation() {
             .cumulative_reward,
         0.0
     );
-    assert!(
-        env.world()
-            .resource::<AgentActionQueue>()
-            .pending
-            .is_empty()
-    );
+    assert!(env.world().resource::<AgentActionQueue>().is_empty());
     assert!(env.replay_log().unwrap().records.is_empty());
     let timeline = env.world().resource::<Timeline>();
     let control = env.world().resource::<AgentControlState>();
-    assert_ne!(timeline.timeline_id, timeline_before);
-    assert_eq!(timeline.timeline_id, control.timeline_id);
-    assert_eq!(timeline.current_branch, control.branch_id);
+    assert_ne!(timeline.timeline_id(), timeline_before);
+    assert_eq!(timeline.timeline_id(), control.timeline_id);
+    assert_eq!(timeline.current_branch(), control.branch_id);
 }
 
 #[test]
@@ -1073,7 +1090,8 @@ fn adversarial_first_step_restricted_capability_player_only() {
     let bridge = JsonRpcBridge::new(RemoteSecurity {
         capabilities: AgentCapability::STEP | AgentCapability::OBSERVE_PLAYER,
         ..Default::default()
-    });
+    })
+    .unwrap();
     let reset_response = bridge.handle_json(
         &mut env,
         r#"{"jsonrpc":"2.0","id":0,"method":"agent.reset","params":{"options":{"seed":0,"observation_mode":"PlayerKnowledge","create_initial_snapshot":true}}}"#,
@@ -1186,8 +1204,7 @@ fn adversarial_checksum_post_prepare_failure_valid_decode_mismatch() {
     let mut tampered = env
         .world()
         .resource::<bevy_agent_snapshot::SnapshotStore>()
-        .snapshots
-        .get(&created.snapshot_id)
+        .get(created.snapshot_id)
         .cloned()
         .expect("snapshot in store");
     // Find the Player component ({"health": 100.0}) and bump health to a
@@ -1195,7 +1212,9 @@ fn adversarial_checksum_post_prepare_failure_valid_decode_mismatch() {
     let mut mutated = false;
     for entity in &mut tampered.entities {
         for component in &mut entity.components {
-            if component.type_name.contains("Player") && component.value.get("health").is_some() {
+            if component.type_id == "sample_platformer.player"
+                && component.value.get("health").is_some()
+            {
                 component.value["health"] = serde_json::json!(1.0);
                 mutated = true;
             }

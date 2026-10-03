@@ -1,12 +1,11 @@
 use bevy_agent_core::{
     ActionSource, AgentAction, AgentActionQueue, AgentControlState, Observation,
 };
-use bevy_agent_remote::{AgentCapability, JsonRpcBridge, RemoteSecurity};
-use bevy_agent_replay::ReplayRecorder;
+use bevy_agent_remote::JsonRpcBridge;
 use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions};
 
 fn make_env() -> AgentApp {
-    AgentApp::new(sample_platformer::build_headless_app)
+    AgentApp::new(sample_platformer::build_headless_app).unwrap()
 }
 
 fn symbolic_entities(observation: &Observation) -> Vec<(String, [f32; 3])> {
@@ -35,12 +34,12 @@ fn auto_retention_interval_1_keep_1_export_resolves() {
     let pinned: Vec<_> = env
         .world()
         .resource::<bevy_agent_snapshot::SnapshotStore>()
-        .pinned
+        .pinned()
         .iter()
         .copied()
         .collect();
     for id in pinned {
-        bevy_agent_snapshot::unpin_snapshot(env.world_mut(), id);
+        bevy_agent_snapshot::unpin_snapshot(env.world_mut(), id).unwrap();
     }
 
     for _ in 0..4 {
@@ -57,7 +56,6 @@ fn auto_retention_interval_1_keep_1_export_resolves() {
         .log
         .initial_snapshot
         .into_iter()
-        .chain(bundle.log.checkpoints.values().copied())
         .chain(bundle.log.branch_checkpoints.iter().map(|c| c.snapshot_id))
     {
         assert!(ids.contains(&id), "referenced snapshot {id:?} must exist");
@@ -115,7 +113,8 @@ fn corrupt_import_rejected_tampered_checksum() {
     for snapshot in &mut bundle.snapshots {
         for entity in &mut snapshot.entities {
             for component in &mut entity.components {
-                if component.type_name.contains("Player") && component.value.get("health").is_some()
+                if component.type_id == "sample_platformer.player"
+                    && component.value.get("health").is_some()
                 {
                     component.value["health"] = serde_json::json!(1.0);
                     mutated = true;
@@ -126,34 +125,13 @@ fn corrupt_import_rejected_tampered_checksum() {
     assert!(mutated, "expected a Player component to corrupt");
 
     let mut fresh = make_env();
-    // Either the install or the subsequent positioning must reject the
-    // tampered bundle (load validates topology/refs; restore verifies
-    // checksums).
-    match fresh.load_replay_bundle(bundle) {
-        Err(error) => {
-            let message = error.to_string();
-            assert!(
-                message.contains("checksum")
-                    || message.contains("mismatch")
-                    || message.contains("missing")
-                    || message.contains("snapshot"),
-                "load must name the corruption, got: {message}"
-            );
-        }
-        Ok(()) => {
-            let cursor = fresh.replay_log().map(|log| log.cursor_tick).unwrap_or(2);
-            let target = cursor.max(1);
-            let error = fresh.restore_tick(target).unwrap_err();
-            let message = error.to_string();
-            assert!(
-                message.contains("checksum")
-                    || message.contains("mismatch")
-                    || message.contains("verification")
-                    || message.contains("rolled back"),
-                "restore of tampered import must fail verification, got: {message}"
-            );
-        }
-    }
+    let error = fresh.load_replay_bundle(bundle).unwrap_err();
+    assert!(
+        error.to_string().contains("checksum"),
+        "load must reject the corrupt checksum before installation: {error}"
+    );
+    assert!(!fresh.has_reset());
+    assert_eq!(fresh.current_tick(), 0);
 }
 
 // 4. Fork-snapshot completeness: branch, then a child snapshot replaces the
@@ -217,36 +195,24 @@ fn branch_checksum_lookup_distinct_per_branch() {
 // 5b. Parent checksum expectation survives a child step.
 #[test]
 fn branch_checksum_preserved_after_child_step() {
-    use bevy_agent_core::SnapshotChecksum;
-
     let mut env = make_env();
     env.reset(ResetOptions::default()).unwrap();
     env.step(AgentAction::Noop).unwrap();
+    env.snapshot().unwrap();
     let parent = env.world().resource::<AgentControlState>().branch_id;
+    let expected = env
+        .replay_log()
+        .unwrap()
+        .expected_checksum(parent, 1)
+        .cloned()
+        .unwrap();
     let child = env.branch(1, Some("checksum-keep".to_string())).unwrap();
-    // Seed a parent expectation in the live log, then step the child.
-    env.world_mut()
-        .resource_mut::<ReplayRecorder>()
-        .log
-        .insert_branch_checksum(
-            parent,
-            1,
-            SnapshotChecksum {
-                tick: 1,
-                hash: 4242,
-            },
-        );
     env.step(AgentAction::Jump).unwrap();
     assert_eq!(env.current_tick(), 2);
-
-    let log = env.replay_log().unwrap().clone();
-    let key = bevy_agent_replay::branch_checksum_key(parent);
-    assert!(
-        log.branch_checksums
-            .get(&key)
-            .and_then(|per_branch| per_branch.get(&1))
-            .is_some_and(|checksum| checksum.hash == 4242),
-        "parent branch checksum must survive child stepping (child {child:?})"
+    assert_eq!(
+        env.replay_log().unwrap().expected_checksum(parent, 1),
+        Some(&expected),
+        "parent checksum must survive child {child:?} stepping",
     );
 }
 
@@ -282,7 +248,7 @@ fn stale_truncation_diverge_drops_tick5_future() {
 
 // 7. Rollback metadata: forced verify failure leaves control.frame restored.
 #[test]
-fn rollback_metadata_frame_restored_on_verify_failure() {
+fn failed_snapshot_bundle_import_preserves_control_metadata() {
     let mut env = make_env();
     env.reset(ResetOptions::default()).unwrap();
     for _ in 0..5 {
@@ -295,29 +261,25 @@ fn rollback_metadata_frame_restored_on_verify_failure() {
     let frame_before = env.world().resource::<AgentControlState>().frame;
     let tick_before = env.current_tick();
 
-    // Corrupt the stored snapshot payload (valid value, stale checksum).
+    // Portable DTOs are mutable; installed snapshot storage is read-only.
+    let mut bundle = env.export_replay_bundle().unwrap();
+    let snapshot = bundle
+        .snapshots
+        .iter_mut()
+        .find(|snapshot| snapshot.manifest.snapshot_id == created.snapshot_id)
+        .expect("snapshot in exported bundle");
     let mut mutated = false;
-    {
-        let mut store = env
-            .world_mut()
-            .resource_mut::<bevy_agent_snapshot::SnapshotStore>();
-        let snapshot = store
-            .snapshots
-            .get_mut(&created.snapshot_id)
-            .expect("snapshot in store");
-        for entity in &mut snapshot.entities {
-            for component in &mut entity.components {
-                if component.type_name.contains("Player") && component.value.get("health").is_some()
-                {
-                    component.value["health"] = serde_json::json!(1.0);
-                    mutated = true;
-                }
+    for entity in &mut snapshot.entities {
+        for component in &mut entity.components {
+            if component.type_id == "sample_platformer.player" {
+                component.value["health"] = serde_json::json!(1.0);
+                mutated = true;
             }
         }
     }
     assert!(mutated, "expected a Player component to corrupt");
 
-    let error = env.restore(created.snapshot_id).unwrap_err();
+    let error = env.load_replay_bundle(bundle).unwrap_err();
     assert!(
         error.to_string().contains("checksum"),
         "must fail at checksum, got: {error}"
@@ -336,15 +298,22 @@ fn rollback_metadata_frame_restored_on_verify_failure() {
 fn queue_multiplicity_identical_jumps_preserved() {
     let mut env = make_env();
     env.reset(ResetOptions::default()).unwrap();
-    env.enqueue_action_at(5, ActionSource::Test, AgentAction::Jump);
-    env.enqueue_action_at(5, ActionSource::Test, AgentAction::Jump);
-    assert_eq!(env.world().resource::<AgentActionQueue>().pending.len(), 2);
+    env.enqueue_action_at(5, ActionSource::Test, AgentAction::Jump)
+        .unwrap();
+    env.enqueue_action_at(5, ActionSource::Test, AgentAction::Jump)
+        .unwrap();
+    assert_eq!(env.world().resource::<AgentActionQueue>().len(), 2);
 
     let snapshot = env.snapshot().unwrap();
     env.step(AgentAction::Noop).unwrap();
     env.restore(snapshot.snapshot_id).unwrap();
 
-    let pending = env.world().resource::<AgentActionQueue>().pending.clone();
+    let pending = env
+        .world()
+        .resource::<AgentActionQueue>()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     let jumps = pending
         .iter()
         .filter(|scheduled| scheduled.tick == 5 && scheduled.action == AgentAction::Jump)
@@ -359,11 +328,7 @@ fn queue_multiplicity_identical_jumps_preserved() {
 #[test]
 fn remote_baseline_path_start_after_ticks_then_restore() {
     let mut env = make_env();
-    let bridge = JsonRpcBridge::new(RemoteSecurity {
-        capabilities: AgentCapability::default() | AgentCapability::FILESYSTEM,
-        allow_absolute_paths: true,
-        ..Default::default()
-    });
+    let bridge = JsonRpcBridge::default();
     bridge.handle_json(
         &mut env,
         r#"{"jsonrpc":"2.0","id":1,"method":"agent.reset","params":{"options":{"seed":1,"observation_mode":"Hybrid","create_initial_snapshot":true}}}"#,

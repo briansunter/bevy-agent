@@ -19,7 +19,6 @@ visual = ["bevy/2d", "bevy/png", "bevy_agent_runner/visual", "bevy_agent_remote/
 anyhow.workspace = true
 bevy.workspace = true
 bevy_agent_core.workspace = true
-bevy_agent_replay.workspace = true
 bevy_agent_runner.workspace = true
 bevy_agent_snapshot.workspace = true
 image.workspace = true
@@ -27,8 +26,13 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+bevy_agent_replay.workspace = true
 bevy_agent_remote.workspace = true
 
 [[example]]
 name = "remote_http_visual"
+required-features = ["visual"]
+
+[[example]]
+name = "primary_window_smoke"
 required-features = ["visual"]
