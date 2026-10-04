@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.3 — Unreleased
+## 0.0.3 — 2026-10-03
 
 - Correct loopback addresses in CLI and server documentation to `127.0.0.1`.
 - Keep companion crates synchronized for this documentation patch; runtime behavior and wire formats are unchanged.

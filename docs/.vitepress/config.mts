@@ -24,7 +24,7 @@ export default defineConfig({
     nav: [
       { text: 'Guide', link: '/getting-started', activeMatch: '/(getting-started|concepts|guides|controllable-game)' },
       { text: 'Reference', link: '/reference/crates', activeMatch: '/(reference|architecture)' },
-      { text: '0.0.2', items: [
+      { text: '0.0.3', items: [
         { text: 'Release notes', link: '/reference/releases' },
         { text: 'Crates on crates.io', link: 'https://crates.io/users/briansunter' },
       ] },

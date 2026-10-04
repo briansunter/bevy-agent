@@ -4,7 +4,7 @@
 
 Built for **Bevy 0.18.1** and **Rust 1.91+**, with headless defaults and optional rendering. HTTP, WebSocket, stdio, CLI, and Python clients share the same JSON-RPC control surface.
 
-> **Version 0.0.2** is an experimental release before 1.0. Cargo version numbers, snapshot/replay format versions, and game schema versions are separate contracts. Pin companion crates to the same exact release; breaking changes may occur before 1.0.
+> **Version 0.0.3** is an experimental release before 1.0. Cargo version numbers, snapshot/replay format versions, and game schema versions are separate contracts. Pin companion crates to the same exact release; breaking changes may occur before 1.0.
 
 **[Read the documentation](https://briansunter.github.io/bevy-agent/)** · [Getting started](https://briansunter.github.io/bevy-agent/getting-started.html) · [Crates and API](https://briansunter.github.io/bevy-agent/reference/crates.html)
 
@@ -28,11 +28,11 @@ Add the runtime crates you need:
 ```toml
 [dependencies]
 bevy = { version = "0.18.1", default-features = false, features = ["std"] }
-bevy_agent_core = "=0.0.2"
-bevy_agent_runner = "=0.0.2"
-bevy_agent_snapshot = "=0.0.2"
+bevy_agent_core = "=0.0.3"
+bevy_agent_runner = "=0.0.3"
+bevy_agent_snapshot = "=0.0.3"
 # Optional JSON-RPC server:
-bevy_agent_remote = "=0.0.2"
+bevy_agent_remote = "=0.0.3"
 ```
 
 For local development, use these crates as path dependencies or run the repository examples. The integration guide explains the additional dependencies needed for serializable game state.
@@ -86,7 +86,7 @@ cargo run -p bevy_agent_cli --bin agentctl -- snapshot
 cargo run -p bevy_agent_cli --bin agentctl -- replay-export replay.json
 ```
 
-Install with `cargo install bevy_agent_cli --version 0.0.2 --locked`, then run `agentctl` directly. The default endpoint is `http://127.0.0.1:4000/rpc`; pass `--url` for another server and `--token` or `AGENT_TOKEN` for authentication.
+Install with `cargo install bevy_agent_cli --version 0.0.3 --locked`, then run `agentctl` directly. The default endpoint is `http://127.0.0.1:4000/rpc`; pass `--url` for another server and `--token` or `AGENT_TOKEN` for authentication.
 
 The example grants filesystem access under `./artifacts`: captures land in `artifacts/screenshots/` and the replay in `artifacts/replay.json`. The library default disables filesystem access; replay bundles can also be transferred inline as JSON. Bind to loopback for local use and configure authentication before exposing a listener beyond it.
 

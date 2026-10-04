@@ -5,11 +5,11 @@ Use a remote server when your agent or test harness runs in another process. The
 ## 1. Install the client
 
 ```sh
-cargo install bevy_agent_cli --version 0.0.2 --locked
+cargo install bevy_agent_cli --version 0.0.3 --locked
 agentctl --version
 ```
 
-Expected: `agentctl 0.0.2`. The package is `bevy_agent_cli`; the executable is `agentctl`. The crates.io package named `agentctl` belongs to another project.
+Expected: `agentctl 0.0.3`. The package is `bevy_agent_cli`; the executable is `agentctl`. The crates.io package named `agentctl` belongs to another project.
 
 ## 2. Start a complete game server
 
@@ -46,7 +46,7 @@ Read the returned observation and check terminal state before choosing the next 
 
 ## Add a server to your own environment
 
-Add `bevy_agent_remote = "=0.0.2"` to the [getting-started manifest](../getting-started.md#_1-create-a-small-rust-project). After building your `AgentApp`:
+Add `bevy_agent_remote = "=0.0.3"` to the [getting-started manifest](../getting-started.md#_1-create-a-small-rust-project). After building your `AgentApp`:
 
 ```rust
 use bevy_agent_remote::{HttpRemoteServer, JsonRpcBridge, RemoteSecurity};
@@ -63,7 +63,9 @@ This library configuration disables filesystem operations. The sample explicitly
 ## Call JSON-RPC directly
 
 ```sh
-curl -s http://127.0.0.1:4000/rpc   -H 'content-type: application/json'   -d '{"jsonrpc":"2.0","id":1,"method":"agent.info","params":{}}'
+curl -s http://127.0.0.1:4000/rpc \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"agent.info","params":{}}'
 ```
 
 The server also exposes `GET /health` and the WebSocket endpoint `GET /ws`. Always inspect the JSON-RPC body: authentication and capability failures can arrive in an HTTP 200 response.

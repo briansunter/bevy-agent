@@ -45,5 +45,27 @@ const crates = readFileSync(join(root, 'reference/crates.html'), 'utf8')
 for (const name of ['core', 'snapshot', 'replay', 'runner', 'remote', 'cli']) {
   if (!crates.includes('https://crates.io/crates/bevy_agent_' + name)) failures.push('Crate link missing: ' + name)
 }
+const version = readFileSync('Cargo.toml', 'utf8').match(/^version = "([^"]+)"$/m)?.[1]
+if (!version) failures.push('Workspace release version missing')
+if (!readFileSync('docs/getting-started.md', 'utf8').includes('experimental release ' + version + '.')) failures.push('Getting-started release description out of date')
+const sources = ['README.md', 'docs/getting-started.md', 'docs/guides/remote-control.md',
+  ...['core', 'snapshot', 'replay', 'runner', 'remote'].map(name => 'crates/bevy_agent_' + name + '/README.md'),
+  'crates/agentctl/README.md']
+for (const path of sources) {
+  const text = readFileSync(path, 'utf8')
+  for (const match of text.matchAll(/bevy_agent_\w+\s*=\s*"=([^"]+)"/g)) {
+    if (match[1] !== version) failures.push(path + ': companion version differs from workspace: ' + match[1])
+  }
+  if (/127\.0\.0\.(?!1\b)\d+/.test(text)) failures.push(path + ': loopback examples must use 127.0.0.1')
+  for (const match of text.matchAll(/cargo install bevy_agent_cli --version ([\d.]+)/g)) {
+    if (match[1] !== version) failures.push(path + ': CLI installation version differs from workspace')
+  }
+}
+for (const path of ['crates/agentctl/README.md', 'docs/guides/remote-control.md']) {
+  if (!readFileSync(path, 'utf8').includes('http://127.0.0.1:4000/rpc')) failures.push(path + ': CLI default endpoint missing')
+}
+for (const name of ['core', 'snapshot', 'replay', 'runner', 'remote', 'cli']) {
+  if (!crates.includes('https://crates.io/crates/bevy_agent_' + name + '/' + version)) failures.push('Crate release link out of date: ' + name)
+}
 if (failures.length) { console.error(failures.join('\n')); process.exit(1) }
-console.log('Verified ' + pages.length + ' pages and ' + checked + ' local links/assets, including code, anchors, and all six crates.')
+console.log('Verified ' + pages.length + ' pages and ' + checked + ' local links/assets, including code, anchors, all six crates, release versions, and CLI endpoints.')
