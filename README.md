@@ -1,153 +1,129 @@
-# bevy-agent
+# Bevy Agent
 
-**Deterministic control for Bevy games and simulations.** Give an AI agent, test harness, or Rust client an explicit loop: reset the world, apply an action, advance a tick, and inspect the result. Save snapshots, replay inputs, and branch from earlier states to compare decisions.
+**Step, inspect, snapshot, and replay your Bevy game.**
 
-Built for **Bevy 0.18.1** and **Rust 1.91+**, with headless defaults and optional rendering. HTTP, WebSocket, stdio, CLI, and Python clients share the same JSON-RPC control surface.
+![Concept illustration: a simulation advances through states, then branches into two possible futures.](docs/public/images/simulation-branches.png)
 
-> **Version 0.0.3** is an experimental release before 1.0. Cargo version numbers, snapshot/replay format versions, and game schema versions are separate contracts. Pin companion crates to the same exact release; breaking changes may occur before 1.0.
+Bevy Agent gives a game or simulation an explicit control loop: reset an episode, submit an action, advance one tick, and read the result. Use it for agent experiments, automated gameplay tests, reproducible bug reports, and comparing decisions from the same saved state.
 
-**[Read the documentation](https://briansunter.github.io/bevy-agent/)** · [Getting started](https://briansunter.github.io/bevy-agent/getting-started.html) · [Crates and API](https://briansunter.github.io/bevy-agent/reference/crates.html)
+[**Documentation**](https://briansunter.github.io/bevy-agent/) · [Getting started](https://briansunter.github.io/bevy-agent/getting-started.html) · [Examples](https://briansunter.github.io/bevy-agent/examples.html) · [Changelog](CHANGELOG.md)
+
+| Release | Bevy | Rust | License |
+| --- | --- | --- | --- |
+| **0.0.4 · experimental** | **0.18.1** | **1.91+** | MIT or Apache-2.0 |
+
+APIs may change before 1.0. Pin companion crates to the same exact version. The runtime is headless by default; rendering is optional.
+
+## Start here
+
+| I want to… | Start with |
+| --- | --- |
+| Try a working simulation | [Run the counter below](#try-it) |
+| Build a new environment | [Complete standalone Rust tutorial](https://briansunter.github.io/bevy-agent/getting-started.html) |
+| Integrate an existing Bevy game | [Game integration guide](https://briansunter.github.io/bevy-agent/controllable-game.html) |
+| Control a game from another process | [CLI and HTTP](https://briansunter.github.io/bevy-agent/guides/remote-control.html) or [Python](https://briansunter.github.io/bevy-agent/guides/python.html) |
+| Catch simulation regressions | [Testing and reproducibility](https://briansunter.github.io/bevy-agent/guides/testing.html) |
 
 ## Try it
 
-Clone the repository and run a complete environment:
+No API key, model service, or window is needed for the counter:
 
 ```sh
 git clone https://github.com/briansunter/bevy-agent.git
 cd bevy-agent
-cargo run -p bevy_agent_runner --example counter
-cargo run -p sample_platformer --example agent_play
+cargo run -p bevy_agent_runner --example counter --locked
 ```
 
-The [counter example](crates/bevy_agent_runner/examples/counter.rs) is a small, complete integration using only runtime crates. The [platformer](crates/sample_platformer) adds movement, collisions, coins, rewards, terminal conditions, and screenshots.
+Expected output:
 
-## Add it to your game
+```text
+Snapshot restore and replay matched; counter is back at tick 1.
+```
 
-Add the runtime crates you need:
+The [complete counter source](crates/bevy_agent_runner/examples/counter.rs) defines the world, registers its state, and checks that restoring and repeating an action produces the same checksum. Run its regression tests with:
+
+```sh
+cargo test -p bevy_agent_runner --example counter --locked
+```
+
+For a game with movement, collisions, coins, rewards, and terminal conditions:
+
+```sh
+cargo run -p sample_platformer --example agent_play --locked
+```
+
+The platformer and Python client live in this repository. They are not separate registry packages.
+
+## How it fits together
+
+![Control loop: a client sends an action, AgentApp validates it, controlled schedules advance gameplay, and the response informs the next decision.](docs/public/images/control-loop.svg)
+
+Your game owns its rules and authoritative state. Bevy Agent provides controlled schedules, input validation, history, and the client interface. It does not choose actions for you or make arbitrary frame-driven gameplay deterministic.
+
+For a new Rust environment, begin with:
 
 ```toml
 [dependencies]
-bevy = { version = "0.18.1", default-features = false, features = ["std"] }
-bevy_agent_core = "=0.0.3"
-bevy_agent_runner = "=0.0.3"
-bevy_agent_snapshot = "=0.0.3"
-# Optional JSON-RPC server:
-bevy_agent_remote = "=0.0.3"
+bevy = { version = "=0.18.1", default-features = false, features = ["std", "bevy_log", "bevy_state", "serialize"] }
+bevy_agent_core = "=0.0.4"
+bevy_agent_runner = "=0.0.4"
+bevy_agent_snapshot = "=0.0.4"
 ```
 
-For local development, use these crates as path dependencies or run the repository examples. The integration guide explains the additional dependencies needed for serializable game state.
+The [getting-started guide](https://briansunter.github.io/bevy-agent/getting-started.html) supplies the complete manifest and app, including serialization dependencies. Install `AgentControlPlugins::default()`, run gameplay in `AgentTick`, register snapshot state, and provide observation and checksum extractors. There is no umbrella `bevy_agent` crate.
 
-Install `AgentControlPlugins::default()`, register authoritative gameplay state, declare the action/observation contract, and supply observation and checksum extractors. Then control the integrated app:
+## Control a game from the terminal
 
-```rust
-use bevy_agent_core::AgentAction;
-use bevy_agent_runner::{AgentApp, AgentEnvironment, ResetOptions};
-
-// In this repository, the sample supplies a complete app builder.
-let mut env = AgentApp::new(sample_platformer::build_headless_app)?;
-env.reset(ResetOptions::default())?;
-let saved = env.snapshot()?;
-let moved = env.step(AgentAction::Move { x: 1.0, y: 0.0 })?;
-env.restore(saved.snapshot_id)?;
-let alternate = env.step(AgentAction::Jump)?;
-```
-
-See [Getting started](docs/getting-started.md) for the complete setup and [Making a game controllable](docs/controllable-game.md) for integration details. The sample game stays in the repository and is not a crates.io dependency.
-
-## Choose your crates
-
-| Package | Purpose | API |
-| --- | --- | --- |
-| [`bevy_agent_core`](crates/bevy_agent_core) | Schedules, actions, clock, observations, rewards, identities, checksums | [docs.rs](https://docs.rs/bevy_agent_core) |
-| [`bevy_agent_snapshot`](crates/bevy_agent_snapshot) | Registered gameplay snapshots, checked restore, retention | [docs.rs](https://docs.rs/bevy_agent_snapshot) |
-| [`bevy_agent_replay`](crates/bevy_agent_replay) | Input logs, checkpoint indexes, timeline topology | [docs.rs](https://docs.rs/bevy_agent_replay) |
-| [`bevy_agent_runner`](crates/bevy_agent_runner) | `AgentApp`, plugin composition, stepping, restore, branches, capture | [docs.rs](https://docs.rs/bevy_agent_runner) |
-| [`bevy_agent_remote`](crates/bevy_agent_remote) | JSON-RPC over HTTP, WebSocket, and stdio | [docs.rs](https://docs.rs/bevy_agent_remote) |
-| [`bevy_agent_cli`](crates/agentctl) | Installs the `agentctl` command-line client | CLI |
-
-There is no umbrella Cargo package: depend directly on the crates you use. `AgentControlPlugins` composes core, snapshots, and replay. The runner and remote `visual` features enable Bevy render/window capture support; headless software capture uses a game-supplied renderer.
-
-## Drive it remotely
-
-Run a local server from the repository:
+From the checkout, start the sample server in one terminal:
 
 ```sh
-cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000 --artifact-dir ./artifacts
+cargo run -p sample_platformer --example remote_http --locked -- 127.0.0.1:4000 --artifact-dir ./artifacts
 ```
 
-Leave it running and use another terminal:
+In a second terminal:
 
 ```sh
-cargo run -p bevy_agent_cli --bin agentctl -- info
-cargo run -p bevy_agent_cli --bin agentctl -- reset --seed 42
-cargo run -p bevy_agent_cli --bin agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
-cargo run -p bevy_agent_cli --bin agentctl -- capture --out-dir screenshots --label after_step
-cargo run -p bevy_agent_cli --bin agentctl -- snapshot
-cargo run -p bevy_agent_cli --bin agentctl -- replay-export replay.json
+cargo install bevy_agent_cli --version 0.0.4 --locked
+agentctl info
+agentctl action-space
+agentctl reset --seed 42
+agentctl step '{"type":"Move","x":1.0,"y":0.0}'
+agentctl observe
 ```
 
-Install with `cargo install bevy_agent_cli --version 0.0.3 --locked`, then run `agentctl` directly. The default endpoint is `http://127.0.0.1:4000/rpc`; pass `--url` for another server and `--token` or `AGENT_TOKEN` for authentication.
+The Cargo package **`bevy_agent_cli`** installs **`agentctl`**. The CLI connects to `http://127.0.0.1:4000/rpc`; it does not launch a game. Discover the action catalog before controlling another environment. See the [CLI guide](https://briansunter.github.io/bevy-agent/guides/remote-control.html) for response fields, authentication, files, and error handling.
 
-The example grants filesystem access under `./artifacts`: captures land in `artifacts/screenshots/` and the replay in `artifacts/replay.json`. The library default disables filesystem access; replay bundles can also be transferred inline as JSON. Bind to loopback for local use and configure authentication before exposing a listener beyond it.
+## Packages
 
-For a rendered window and primary-window screenshots:
+| Crate | Responsibility |
+| --- | --- |
+| [bevy_agent_core](https://crates.io/crates/bevy_agent_core/0.0.4) | Schedules, actions, clock, RNG, observations, rewards, checksums |
+| [bevy_agent_snapshot](https://crates.io/crates/bevy_agent_snapshot/0.0.4) | Registered gameplay state, validated snapshots and restore |
+| [bevy_agent_replay](https://crates.io/crates/bevy_agent_replay/0.0.4) | Input logs, checkpoints, branching timeline topology |
+| [bevy_agent_runner](https://crates.io/crates/bevy_agent_runner/0.0.4) | `AgentApp`, plugin composition, stepping, history, capture |
+| [bevy_agent_remote](https://crates.io/crates/bevy_agent_remote/0.0.4) | JSON-RPC over HTTP, WebSocket, and stdio |
+| [bevy_agent_cli](https://crates.io/crates/bevy_agent_cli/0.0.4) | The `agentctl` command-line client |
+
+[Choose dependencies and features →](https://briansunter.github.io/bevy-agent/reference/crates.html)
+
+## Guarantees and boundaries
+
+- **Determinism is a game contract.** Use `SimClock`, seeded randomness, stable identities, complete state coverage, and explicitly ordered systems. Cross-platform floating-point equivalence is not guaranteed.
+- **Snapshots contain registered gameplay state.** Keep rendering, UI, audio, and sockets separate. Snapshot/replay format **3** is independent of the Cargo version; older formats are rejected.
+- **History is bounded.** Snapshot and replay owners each default to configurable 64 MiB retention budgets. Checksums detect inconsistencies; they do not authenticate artifacts.
+- **Remote mutations need recovery discipline.** HTTP/WebSocket retry keys deduplicate one intended request while its result is retained. A faulted environment requires a successful reset. See [retries and recovery](https://briansunter.github.io/bevy-agent/guides/recovery.html).
+- **File access is explicit.** The library disables it by default. Sample-server files resolve under `./artifacts`. Bind locally or configure authentication for a network listener.
+
+## Contributing
+
+[Development commands](https://briansunter.github.io/bevy-agent/reference/contributing.html) · [Architecture](https://briansunter.github.io/bevy-agent/architecture.html) · [Publishing](https://briansunter.github.io/bevy-agent/publishing.html) · [Report an issue](https://github.com/briansunter/bevy-agent/issues)
 
 ```sh
-cargo run -p sample_platformer --features visual --example remote_http_visual -- 127.0.0.1:4000 --artifact-dir ./artifacts
+npm ci
+npm run docs:dev
 ```
 
-For Python, use the optional standard-library client from the checkout (Python 3.10+):
-
-```sh
-PYTHONPATH=python python3
-```
-
-```python
-from bevy_agent_client import AgentClient
-
-client = AgentClient("http://127.0.0.1:4000/rpc")
-initial = client.reset(seed=42)
-step = client.step({"type": "Move", "x": 1.0, "y": 0.0})
-saved = client.snapshot()
-client.restore(saved["snapshot_id"])
-```
-
-The server exposes `POST /rpc`, `GET /health`, and `GET /ws`. The [interaction guide](docs/codex-interaction.md) covers discovery, captures, retries, operation status, replay transfers, and stdio.
-
-## Determinism and compatibility
-
-- Run authoritative gameplay in `AgentTick`; use `AgentDecision` for a policy that runs once before each controlled tick.
-- Consume `CurrentInputFrame<AgentAction>` and read `SimClock`; use seeded randomness and explicit system ordering.
-- Register all authoritative state, including hidden state, with stable snapshot type IDs and schema versions. Give gameplay entities stable identities.
-- Declare supported actions, observation modes, and any JSON schemas. Install both observation and checksum extractors; `AgentApp::new` validates integration.
-- Keep rendering, UI, audio, and network state outside authoritative gameplay.
-
-Determinism is an integration contract: this library does not make arbitrary frame-driven gameplay deterministic or guarantee identical floating-point results across platforms. Checksums detect consistency errors and do not authenticate imported artifacts.
-
-Snapshot/replay artifacts currently use **format version 3**. Older artifacts are rejected and must be regenerated. Snapshot and replay owners each default to a configurable **64 MiB** retention budget. Batches stop at terminal state. A mutation failure reports its committed tick and recovery requirement; a faulted world needs a successful reset.
-
-HTTP/WebSocket mutations support request `retry_key` deduplication and retained operation status after timeouts. Keys belong to one server instance and expire with retained results. Stdio does not have this ledger.
-
-## Documentation and development
-
-- [Documentation index](docs/README.md)
-- [Getting started](docs/getting-started.md)
-- [Game integration](docs/controllable-game.md)
-- [Protocol and clients](docs/codex-interaction.md)
-- [Architecture and invariants](docs/architecture.md)
-- [Publishing guide](docs/publishing.md) and [changelog](CHANGELOG.md)
-- [Agent control skill](skills/control-bevy-agent-game/SKILL.md) and [integration skill](skills/integrate-bevy-agent-control/SKILL.md)
-
-```sh
-cargo fmt --all -- --check
-cargo test --workspace --all-targets --locked
-cargo test --workspace --doc --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
-python3 -m unittest discover -s python/tests
-```
-
-CI is manually dispatched and also covers all-feature tests, real transports, fuzzing, and rendered capture under Xvfb/Mesa. See the publishing guide for package validation and host-specific build storage requirements.
+To build and check the guide, run `npm run docs:build && npm run docs:check`. CI and documentation deployment use manual GitHub Actions workflows. On the pinned personal Mac mini, follow the [build-storage instructions](https://briansunter.github.io/bevy-agent/reference/contributing.html#personal-mac-mini) before native builds.
 
 ## License
 

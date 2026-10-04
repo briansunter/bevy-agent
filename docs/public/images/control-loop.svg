@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="580" viewBox="0 0 840 580" role="img" aria-labelledby="title desc">
+<title id="title">One controlled simulation tick</title>
+<desc id="desc">A client submits an action to AgentApp. After validation, controlled schedules run game logic, finalize the tick, and return observation, reward, terminal state, and checksum. The client uses this response for its next decision. Reset starts a new episode.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#4158c5"/></marker></defs>
+<rect width="840" height="580" rx="18" fill="#fafbfe"/>
+<g font-family="system-ui, sans-serif" fill="#18233b">
+<text x="40" y="47" font-size="26" font-weight="700">One action. One controlled tick.</text>
+<text x="40" y="78" font-size="17" fill="#58657e">Reset starts an episode. Each accepted step advances the simulation.</text>
+<rect x="170" y="112" width="510" height="80" rx="12" fill="#e7ecff" stroke="#bcc7ed"/>
+<text x="425" y="145" text-anchor="middle" font-size="22" font-weight="700">Client chooses an action</text>
+<text x="425" y="173" text-anchor="middle" font-size="17">Rust · agentctl · Python · JSON-RPC</text>
+<path d="M425 192 V232" stroke="#4158c5" stroke-width="3" marker-end="url(#arrow)"/>
+<rect x="170" y="240" width="510" height="80" rx="12" fill="#fff" stroke="#bcc7ed"/>
+<text x="425" y="272" text-anchor="middle" font-size="22" font-weight="700">AgentApp validates the request</text>
+<text x="425" y="300" text-anchor="middle" font-size="17">Supported action · schema · control state</text>
+<path d="M425 320 V354" stroke="#4158c5" stroke-width="3" marker-end="url(#arrow)"/>
+<rect x="170" y="362" width="510" height="80" rx="12" fill="#18233b"/>
+<text x="425" y="395" text-anchor="middle" font-size="22" fill="#fff" font-weight="700">Run controlled schedules</text>
+<text x="425" y="423" text-anchor="middle" font-size="17" fill="#e8edf8">AgentTick changes gameplay; finalization collects results</text>
+<path d="M425 442 V476" stroke="#4158c5" stroke-width="3" marker-end="url(#arrow)"/>
+<rect x="170" y="484" width="510" height="62" rx="12" fill="#e9f3f2" stroke="#a3c9c4"/>
+<text x="425" y="521" text-anchor="middle" font-size="18" font-weight="600">Observation · reward · terminal state · checksum</text>
+<path d="M170 515 H92 V152 H158" fill="none" stroke="#4158c5" stroke-width="3" marker-end="url(#arrow)"/>
+<text x="65" y="350" text-anchor="middle" font-size="17" transform="rotate(-90 65 350)">Inspect, then decide again</text>
+</g></svg>

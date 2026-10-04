@@ -2,11 +2,11 @@
 
 Deterministic simulation primitives for agent-controlled Bevy games.
 
-Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.3** is experimental; pin all companion crates to the same exact version.
+Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.4** is experimental; pin all companion crates to the same exact version.
 
 ```toml
 [dependencies]
-bevy_agent_core = "=0.0.3"
+bevy_agent_core = "=0.0.4"
 ```
 
 ## What this crate provides
@@ -20,6 +20,12 @@ bevy_agent_core = "=0.0.3"
 Run authoritative gameplay in `AgentTick`, consume domain actions, and read `SimClock` instead of frame time. A game must declare its supported actions and observation modes and install both observation and checksum extractors. Determinism depends on the game's state coverage and system ordering.
 
 For a complete environment, start with `bevy_agent_runner::AgentControlPlugins` and `AgentApp`; the runner composes core, snapshots, and replay.
+
+## How to use it
+
+Most games start with the runner's composed plugins and use this crate's types directly. Put authoritative systems in `AgentTick`, consume `CurrentInputFrame<AgentAction>`, and use `SimClock` for simulation time. A `Noop` action still advances the simulation; its gameplay effect belongs to your systems.
+
+The [complete counter](https://briansunter.github.io/bevy-agent/getting-started.html) shows metadata, a supported action catalog, observation schema, and both extractors in one app. Move on to [actions and observations](https://briansunter.github.io/bevy-agent/guides/actions-observations.html) for domain-specific commands.
 
 ## Next steps
 

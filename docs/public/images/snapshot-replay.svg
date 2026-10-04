@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="510" viewBox="0 0 960 510" role="img" aria-labelledby="title desc">
+<title id="title">Snapshots, replay, and alternate decisions</title>
+<desc id="desc">A recorded path runs from tick zero to tick one and tick two. A saved checkpoint at tick one can be restored directly. Replay reconstructs state from a checkpoint and recorded inputs. A branch from tick one preserves a separate alternate future.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#4158c5"/></marker><marker id="teal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#31796f"/></marker></defs>
+<rect width="960" height="510" rx="18" fill="#fafbfe"/>
+<g font-family="system-ui, sans-serif" fill="#18233b">
+<text x="40" y="48" font-size="27" font-weight="700">Keep a state. Reconstruct a path. Try another future.</text>
+<text x="40" y="80" font-size="18" fill="#58657e">History is limited to retained, compatible snapshots and recorded inputs.</text>
+<path d="M202 186 H380" stroke="#4158c5" stroke-width="3" marker-end="url(#arrow)"/><path d="M552 186 H730" stroke="#4158c5" stroke-width="3" marker-end="url(#arrow)"/>
+<text x="290" y="158" text-anchor="middle" font-size="17">action</text><text x="645" y="158" text-anchor="middle" font-size="17">action</text>
+<rect x="40" y="166" width="160" height="72" rx="12" fill="#e7ecff" stroke="#bcc7ed"/>
+<text x="120" y="197" text-anchor="middle" font-size="22" font-weight="700">Tick 0</text><text x="120" y="223" text-anchor="middle" font-size="16">reset state</text>
+<rect x="392" y="166" width="160" height="72" rx="12" fill="#18233b"/>
+<text x="472" y="197" text-anchor="middle" font-size="22" font-weight="700" fill="#fff">Tick 1</text><text x="472" y="223" text-anchor="middle" font-size="16" fill="#e8edf8">saved checkpoint</text>
+<rect x="744" y="166" width="176" height="72" rx="12" fill="#e7ecff" stroke="#bcc7ed"/>
+<text x="832" y="197" text-anchor="middle" font-size="22" font-weight="700">Tick 2</text><text x="832" y="223" text-anchor="middle" font-size="16">recorded future</text>
+<path d="M832 238 V280 H565 L553 249" fill="none" stroke="#4158c5" stroke-width="2.5" stroke-dasharray="7 6" marker-end="url(#arrow)"/>
+<text x="710" y="307" text-anchor="middle" font-size="17" fill="#4158c5">restore the saved state</text>
+<path d="M472 238 V350 H729" fill="none" stroke="#31796f" stroke-width="3" marker-end="url(#teal)"/>
+<text x="594" y="377" text-anchor="middle" font-size="17" fill="#31796f">branch + different action</text>
+<rect x="744" y="327" width="176" height="65" rx="12" fill="#e9f3f2" stroke="#a3c9c4"/>
+<text x="832" y="355" text-anchor="middle" font-size="21" font-weight="700">Tick 2</text><text x="832" y="380" text-anchor="middle" font-size="16">alternate future</text>
+<path d="M40 424 H920" stroke="#dfe4ee"/>
+<text x="40" y="460" font-size="18" font-weight="600">Snapshot = registered state at a tick</text>
+<text x="40" y="488" font-size="18">Replay = checkpoint + recorded inputs → reconstructed state</text>
+</g></svg>

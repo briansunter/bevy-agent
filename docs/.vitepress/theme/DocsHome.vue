@@ -12,10 +12,14 @@ import { withBase } from 'vitepress'
           <a class="primary" :href="withBase('/getting-started.html')">Build your first environment</a>
           <a :href="withBase('/guides/remote-control.html')">Connect a client</a>
         </div>
-        <p class="docs-meta"><span>Bevy 0.18.1</span><span>Rust 1.91+</span><span>Experimental 0.0.3</span></p>
+        <p class="docs-meta"><span>Bevy 0.18.1</span><span>Rust 1.91+</span><span>Experimental 0.0.4</span></p>
       </div>
       <CounterDemo />
     </section>
+    <figure class="simulation-art">
+      <img :src="withBase('/images/simulation-branches.png')" width="2172" height="724" loading="lazy" alt="Concept illustration of a platformer simulation advancing through saved states and branching into two possible futures." />
+      <figcaption>One saved state, several possible futures. A conceptual illustration of controlled simulation.</figcaption>
+    </figure>
     <section class="docs-path" aria-labelledby="path-title">
       <h2 id="path-title">Start small. Then bring your game.</h2>
       <p>One runnable counter teaches the same contract used by the full platformer.</p>
@@ -29,6 +33,8 @@ import { withBase } from 'vitepress'
       <h2 id="library-title">Find the next piece</h2>
       <p>The guides explain how to use the system. The reference explains its contracts.</p>
       <div class="library-links">
+        <a :href="withBase('/examples.html')"><strong>Examples</strong><span>Pick a runnable starting point</span></a>
+        <a :href="withBase('/guides/testing.html')"><strong>Testing</strong><span>Catch state and replay regressions</span></a>
         <a :href="withBase('/concepts.html')"><strong>Control loop</strong><span>Actions, ticks, and observations</span></a>
         <a :href="withBase('/guides/snapshots-replay.html')"><strong>History</strong><span>Save, restore, replay, and branch</span></a>
         <a :href="withBase('/guides/python.html')"><strong>Python</strong><span>Build a small policy loop</span></a>

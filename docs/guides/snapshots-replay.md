@@ -2,6 +2,8 @@
 
 Use a snapshot when you want to return to a known state. Use replay when you want to reproduce a sequence. Use a branch when you want to compare decisions from the same earlier state.
 
+[![A saved checkpoint at tick 1 supports restoring recorded state or branching into an alternate future. Replay combines checkpoints with recorded inputs.](/images/snapshot-replay.svg)](/images/snapshot-replay.svg)
+
 ## Save and restore a state
 
 ```rust

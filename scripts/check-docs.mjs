@@ -35,7 +35,7 @@ for (const page of pages) {
     checked++
   }
 }
-for (const route of ['getting-started.html', 'reference/crates.html', 'guides/remote-control.html', 'reference/protocol.html']) {
+for (const route of ['getting-started.html', 'examples.html', 'guides/testing.html', 'reference/crates.html', 'guides/remote-control.html', 'reference/protocol.html']) {
   if (!existsSync(join(root, route))) failures.push('Required route missing: ' + route)
 }
 const first = readFileSync(join(root, 'getting-started.html'), 'utf8')

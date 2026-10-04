@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.4 — 2026-10-03
+
+- Reorganize the README around runnable examples, integration choices, and the client/server workflow.
+- Add an example directory and a testing guide with two runnable counter regression tests.
+- Explain the getting-started state transitions, integration milestones, and CLI response fields.
+- Add a custom simulation illustration and editable control-loop and snapshot/replay diagrams.
+- Improve all six package READMEs and guide navigation. Runtime APIs and snapshot/replay format 3 are unchanged.
+
 ## 0.0.3 — 2026-10-03
 
 - Correct loopback addresses in CLI and server documentation to `127.0.0.1`.

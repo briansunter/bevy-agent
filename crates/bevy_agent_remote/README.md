@@ -2,12 +2,12 @@
 
 JSON-RPC control for Bevy agent environments over HTTP, WebSocket, and stdio.
 
-Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.3** is experimental; pin all companion crates to the same exact version.
+Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.4** is experimental; pin all companion crates to the same exact version.
 
 ```toml
 [dependencies]
-bevy_agent_remote = "=0.0.3"
-bevy_agent_runner = "=0.0.3"
+bevy_agent_remote = "=0.0.4"
+bevy_agent_runner = "=0.0.4"
 ```
 
 ## Serve a headless environment
@@ -31,6 +31,20 @@ For a rendered Bevy app, install `BevyRemoteControlPlugin` before `app.run()`. N
 Bind to loopback for local use. Configure a nonempty session token before exposing the listener beyond loopback. `RemoteSecurity` controls capabilities; filesystem access is disabled by default. Enable `FILESYSTEM` explicitly and set an artifact root when you need server-side captures or replay files.
 
 Timed-out mutations return an operation ID. Retrieve the retained result with `agent.operations.status`; use a request `retry_key` to deduplicate retries after a lost response. The retry ledger belongs to one running HTTP/WebSocket server and expires with retained outcomes; stdio does not provide it.
+
+## Connect a client
+
+Install `bevy_agent_cli` to get the `agentctl` executable, then use a second terminal while your server is running:
+
+```sh
+cargo install bevy_agent_cli --version 0.0.4 --locked
+agentctl info
+agentctl action-space
+agentctl reset --seed 42
+agentctl observe
+```
+
+Inspect the action catalog before sending game-specific commands. The [CLI walkthrough](https://briansunter.github.io/bevy-agent/guides/remote-control.html) includes a complete sample server and explains the JSON-RPC response. Use the [Python guide](https://briansunter.github.io/bevy-agent/guides/python.html) for a policy loop or [other transports](https://briansunter.github.io/bevy-agent/guides/transports.html) for WebSocket and stdio.
 
 ## Next steps
 

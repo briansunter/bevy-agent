@@ -1,8 +1,8 @@
 # Build your first environment
 
-Start with a counter, not a full game. Each action advances one simulation tick. You will save a snapshot, repeat a step, and verify that replay returns to the same state.
+Build a small counter environment with a complete manifest and source file. Each action advances one simulation tick. You will save a snapshot, repeat a step, and verify that replay returns to the same state.
 
-**You need:** Rust 1.91 or newer. These examples use Bevy 0.18.1 and the published experimental release 0.0.3.
+**You need:** Rust 1.91 or newer. These examples use Bevy 0.18.1 and the published experimental release 0.0.4.
 
 ::: tip Prefer to explore first?
 [Run the repository example](#run-the-repository-example) without copying any code. To control a running game from another process, follow [HTTP and the CLI](./guides/remote-control.md).
@@ -26,9 +26,9 @@ rust-version = "1.91"
 
 [dependencies]
 bevy = { version = "=0.18.1", default-features = false, features = ["std", "bevy_log", "bevy_state", "serialize"] }
-bevy_agent_core = "=0.0.3"
-bevy_agent_runner = "=0.0.3"
-bevy_agent_snapshot = "=0.0.3"
+bevy_agent_core = "=0.0.4"
+bevy_agent_runner = "=0.0.4"
+bevy_agent_snapshot = "=0.0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -40,7 +40,7 @@ There is no umbrella `bevy_agent` package. The runner composes core, snapshots, 
 
 Replace `src/main.rs` with this example. It is the same source shipped with `bevy_agent_runner`, so the guide and runnable example stay together.
 
-<<< ../crates/bevy_agent_runner/examples/counter.rs
+<<< ../crates/bevy_agent_runner/examples/counter.rs#environment
 
 The setup has four responsibilities:
 
@@ -62,6 +62,21 @@ Snapshot restore and replay matched; counter is back at tick 1.
 ```
 
 The assertions prove that restoring a snapshot and repeating the same action produces the same checksum, then `restore_tick(1)` reconstructs the earlier state. A checksum is a consistency check over your declared state; it does not prove arbitrary games deterministic across platforms.
+
+## 4. Understand the result
+
+The example deliberately uses `Noop`: the counter advances because the simulation ticks, even when the client requests no movement. An action is input to the game; the game decides its effect.
+
+| Operation | Tick | Counter | What you learned |
+| --- | --- | --- | --- |
+| Reset | 0 | 0 | Reset establishes the episode's initial state |
+| Step, then save | 1 | 1 | A snapshot captures registered state at this tick |
+| Step | 2 | 2 | The next action produces a checksum |
+| Restore saved state | 1 | 1 | Restore replaces state without a gameplay tick |
+| Repeat the step | 2 | 2 | The checksum matches the first transition |
+| Restore tick 1 | 1 | 1 | History can reconstruct a recorded point |
+
+Try changing the increment from `1` to `2` and updating the counter assertions in `main`. Then follow [Testing and reproducibility](./guides/testing.md) to turn the same contract into automated tests. To accept meaningful commands instead of `Noop`, continue with [Actions and observations](./guides/actions-observations.md).
 
 ## Run the repository example
 

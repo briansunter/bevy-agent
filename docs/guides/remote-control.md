@@ -5,11 +5,11 @@ Use a remote server when your agent or test harness runs in another process. The
 ## 1. Install the client
 
 ```sh
-cargo install bevy_agent_cli --version 0.0.3 --locked
+cargo install bevy_agent_cli --version 0.0.4 --locked
 agentctl --version
 ```
 
-Expected: `agentctl 0.0.3`. The package is `bevy_agent_cli`; the executable is `agentctl`. The crates.io package named `agentctl` belongs to another project.
+Expected: `agentctl 0.0.4`. The package is `bevy_agent_cli`; the executable is `agentctl`. The crates.io package named `agentctl` belongs to another project.
 
 ## 2. Start a complete game server
 
@@ -18,7 +18,7 @@ Clone the repository, then leave this command running:
 ```sh
 git clone https://github.com/briansunter/bevy-agent.git
 cd bevy-agent
-cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000 --artifact-dir ./artifacts
+cargo run -p sample_platformer --example remote_http --locked -- 127.0.0.1:4000 --artifact-dir ./artifacts
 ```
 
 The example includes the game. Installing the CLI alone does not start a server. `sample_platformer` is distributed through Git, not crates.io.
@@ -44,9 +44,40 @@ agentctl --url http://127.0.0.1:4001/rpc info
 
 Read the returned observation and check terminal state before choosing the next action. Discover supported actions; movement is part of the platformer's contract.
 
+## Read the response
+
+The CLI prints the full JSON-RPC envelope. Successful calls have a `result`; failed calls have an `error`. A successful `step` result includes:
+
+| Field | Meaning | What to do with it |
+| --- | --- | --- |
+| `tick` | Completed simulation tick | Confirm the intended transition happened |
+| `observation` | The game's exposed state | Choose the next action from it |
+| `reward` | Reward for this transition | Accumulate or evaluate it in your policy |
+| `done`, `truncated` | Episode termination or imposed stop | Stop stepping and reset when appropriate |
+| `checksum` | Hash of declared authoritative state | Compare equivalent runs |
+| `info` | Additional environment information | Inspect game-specific diagnostics |
+
+The [control-loop guide](../concepts.md#what-the-client-receives) shows an abbreviated response. `agentctl observe` reads the current state without advancing a tick. `agentctl schema` describes the available contracts.
+
+## Save, step, and restore
+
+```sh
+agentctl snapshot
+```
+
+Copy `result.snapshot_id` from that response. Step once, then restore by replacing the placeholder below with that ID:
+
+```sh
+agentctl step '{"type":"Move","x":1.0,"y":0.0}'
+agentctl restore <snapshot-id>
+agentctl observe
+```
+
+The observation should describe the saved state again. For history navigation and portable files, follow [Snapshots and replay](./snapshots-replay.md). A snapshot ID belongs to the server's retained state; keep a replay bundle when you need a portable artifact.
+
 ## Add a server to your own environment
 
-Add `bevy_agent_remote = "=0.0.3"` to the [getting-started manifest](../getting-started.md#_1-create-a-small-rust-project). After building your `AgentApp`:
+Add `bevy_agent_remote = "=0.0.4"` to the [getting-started manifest](../getting-started.md#_1-create-a-small-rust-project). After building your `AgentApp`:
 
 ```rust
 use bevy_agent_remote::{HttpRemoteServer, JsonRpcBridge, RemoteSecurity};

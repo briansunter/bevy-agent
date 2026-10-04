@@ -2,13 +2,13 @@
 
 Step, inspect, snapshot, restore, and branch a Bevy game through a Rust environment API.
 
-Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.3** is experimental; pin all companion crates to the same exact version.
+Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.4** is experimental; pin all companion crates to the same exact version.
 
 ```toml
 [dependencies]
-bevy_agent_core = "=0.0.3"
-bevy_agent_runner = "=0.0.3"
-bevy_agent_snapshot = "=0.0.3"
+bevy_agent_core = "=0.0.4"
+bevy_agent_runner = "=0.0.4"
+bevy_agent_snapshot = "=0.0.4"
 ```
 
 ## Control an integrated game
@@ -49,9 +49,19 @@ Run that command from the repository or this crate's unpacked source. [Read the 
 - Snapshot and replay owners each default to a configurable 64 MiB retention budget.
 - Checksums detect consistency errors; they do not authenticate artifacts or guarantee identical behavior across platforms.
 
-## Next steps
+## Verify your environment
 
-[Read the guide](https://briansunter.github.io/bevy-agent/getting-started.html) for an organized walkthrough, examples, and troubleshooting.
+The counter also includes two runnable tests:
+
+```sh
+cargo test -p bevy_agent_runner --example counter --locked
+```
+
+Run this from the repository or unpacked crate. It checks gameplay assertions, repeated seeded resets, snapshot restoration, and replay reconstruction. The [testing guide](https://briansunter.github.io/bevy-agent/guides/testing.html) explains how to adapt these checks to your game.
+
+After each step, inspect `done` and `truncated` before continuing. Read `observation` to choose the next action, and use `checksum` to compare equivalent transitions. Snapshots contain registered authoritative state; they do not clone rendering or transport resources.
+
+## Next steps
 
 - [Getting started](https://briansunter.github.io/bevy-agent/getting-started.html)
 - [Game integration guide](https://briansunter.github.io/bevy-agent/controllable-game.html)

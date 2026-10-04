@@ -2,6 +2,8 @@
 
 Bevy Agent gives your game an explicit boundary between a decision and the state it produces. The game owns the rules. The runtime validates input, advances controlled ticks, and manages history.
 
+[![A client submits an action; AgentApp validates it, runs controlled schedules, and returns observation, reward, terminal state, and checksum.](/images/control-loop.svg)](/images/control-loop.svg)
+
 ## One action, one controlled tick
 
 | Phase | What happens | Your responsibility |

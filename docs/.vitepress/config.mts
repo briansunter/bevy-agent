@@ -7,7 +7,7 @@ export default defineConfig({
   description: 'Build a Bevy simulation you can step, inspect, snapshot, and replay. Clear guides for Rust, CLI, and Python clients.',
   base: '/bevy-agent/',
   lang: 'en-US',
-  srcExclude: ['README.md', 'reference/architecture-review.md'],
+  srcExclude: ['README.md', 'public/**', 'reference/architecture-review.md'],
   lastUpdated: true,
   cleanUrls: false,
   sitemap: { hostname: site },
@@ -24,7 +24,7 @@ export default defineConfig({
     nav: [
       { text: 'Guide', link: '/getting-started', activeMatch: '/(getting-started|concepts|guides|controllable-game)' },
       { text: 'Reference', link: '/reference/crates', activeMatch: '/(reference|architecture)' },
-      { text: '0.0.3', items: [
+      { text: '0.0.4', items: [
         { text: 'Release notes', link: '/reference/releases' },
         { text: 'Crates on crates.io', link: 'https://crates.io/users/briansunter' },
       ] },
@@ -32,6 +32,7 @@ export default defineConfig({
     sidebar: [
       { text: 'Start here', items: [
         { text: 'Getting started', link: '/getting-started' },
+        { text: 'Runnable examples', link: '/examples' },
         { text: 'How the control loop works', link: '/concepts' },
         { text: 'Choose your crates', link: '/reference/crates' },
       ] },
@@ -39,6 +40,7 @@ export default defineConfig({
         { text: 'Integrate a Bevy game', link: '/controllable-game' },
         { text: 'Actions and observations', link: '/guides/actions-observations' },
         { text: 'Snapshots and replay', link: '/guides/snapshots-replay' },
+        { text: 'Testing and reproducibility', link: '/guides/testing' },
         { text: 'Screenshots and rendering', link: '/guides/capture' },
       ] },
       { text: 'Connect a client', items: [

@@ -2,14 +2,14 @@
 
 The `agentctl` command-line client for [bevy-agent](https://github.com/briansunter/bevy-agent) JSON-RPC environments.
 
-The Cargo package is named **`bevy_agent_cli`**; the installed executable is **`agentctl`**. Requires **Rust 1.91+**. Version **0.0.3** is experimental.
+The Cargo package is named **`bevy_agent_cli`**; the installed executable is **`agentctl`**. Requires **Rust 1.91+**. Version **0.0.4** is experimental.
 
 [Read the CLI guide](https://briansunter.github.io/bevy-agent/guides/remote-control.html) for installation, a complete server/client workflow, and troubleshooting.
 
 ## Install
 
 ```sh
-cargo install bevy_agent_cli --version 0.0.3 --locked
+cargo install bevy_agent_cli --version 0.0.4 --locked
 ```
 
 For local development, install from a repository checkout:
@@ -17,6 +17,18 @@ For local development, install from a repository checkout:
 ```sh
 cargo install --path crates/agentctl --locked
 ```
+
+## Start the example server
+
+From a separate terminal:
+
+```sh
+git clone https://github.com/briansunter/bevy-agent.git
+cd bevy-agent
+cargo run -p sample_platformer --example remote_http --locked -- 127.0.0.1:4000 --artifact-dir ./artifacts
+```
+
+Leave it running. This checkout supplies the game; the installed CLI is a client. The following movement command is specific to that platformer's action catalog.
 
 ## Control a running game
 
@@ -31,6 +43,8 @@ agentctl snapshot
 agentctl capture --out-dir screenshots --label after_step
 agentctl replay-export replay.json
 ```
+
+Successful output contains a JSON-RPC `result`; failures contain `error`. A step's result includes `tick`, `observation`, `reward`, `done`, `truncated`, and `checksum`. Check `done` and `truncated` before sending the next action. `agentctl observe` reads without advancing the simulation.
 
 Actions depend on the game's declared catalog. Discover it with `agentctl action-space`. Captures and file exports require server filesystem permission; paths resolve under the server's artifact root.
 

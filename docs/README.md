@@ -3,6 +3,8 @@
 Read the [Bevy Agent guide](https://briansunter.github.io/bevy-agent/) for searchable, organized documentation.
 
 - [Getting started](./getting-started.md): a complete standalone counter with expected output.
+- [Runnable examples](./examples.md): counter, platformer, HTTP, rendering, and stdio.
+- [Testing and reproducibility](./guides/testing.md): executable reset, restore, and replay checks.
 - [Control loop](./concepts.md): actions, ticks, observations, and authoritative state.
 - [Game integration](./controllable-game.md): registration and deterministic gameplay.
 - [Snapshots and replay](./guides/snapshots-replay.md): save, restore, reconstruct, and branch.

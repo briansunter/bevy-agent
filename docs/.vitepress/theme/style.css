@@ -99,3 +99,7 @@
   .vp-doc h1 { font-size: 30px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
+
+.simulation-art { margin: 44px 0 0; }
+.simulation-art img { display: block; width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--vp-c-divider); }
+.simulation-art figcaption { margin-top: 10px; color: var(--vp-c-text-2); font-size: 12px; line-height: 1.7; text-align: center; }

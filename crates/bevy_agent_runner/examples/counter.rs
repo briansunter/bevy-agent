@@ -1,5 +1,6 @@
 //! A complete headless environment using only published runtime crates.
 
+// #region environment
 use bevy::prelude::*;
 use bevy_agent_core::{
     AgentAction, AgentActionKind, AgentControlAppExt, AgentReset, AgentResetSet, AgentSet,
@@ -91,3 +92,54 @@ fn main() -> anyhow::Result<()> {
     println!("Snapshot restore and replay matched; counter is back at tick 1.");
     Ok(())
 }
+// #endregion environment
+
+// #region regression
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_repeats_the_same_episode() -> anyhow::Result<()> {
+        let mut env = AgentApp::new(build_app)?;
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            env.reset(ResetOptions {
+                seed: Some(42),
+                ..Default::default()
+            })?;
+            let mut checksums = Vec::new();
+            for expected in 1..=8 {
+                let step = env.step(AgentAction::Noop)?;
+                assert_eq!(step.tick, expected);
+                assert_eq!(env.world().resource::<Counter>().0, expected);
+                checksums.push(step.checksum);
+            }
+            runs.push(checksums);
+        }
+        assert_eq!(runs[0], runs[1]);
+        Ok(())
+    }
+
+    #[test]
+    fn restored_history_repeats_the_next_transition() -> anyhow::Result<()> {
+        let mut env = AgentApp::new(build_app)?;
+        env.reset(ResetOptions::default())?;
+        env.step(AgentAction::Noop)?;
+        let saved = env.snapshot()?;
+        let expected = env.step(AgentAction::Noop)?;
+        env.step(AgentAction::Noop)?;
+
+        env.restore(saved.snapshot_id)?;
+        assert_eq!(env.world().resource::<Counter>().0, 1);
+        let repeated = env.step(AgentAction::Noop)?;
+        assert_eq!(expected.checksum, repeated.checksum);
+
+        env.restore_tick(1)?;
+        assert_eq!(env.world().resource::<Counter>().0, 1);
+        let replayed = env.step(AgentAction::Noop)?;
+        assert_eq!(expected.checksum, replayed.checksum);
+        Ok(())
+    }
+}
+// #endregion regression
