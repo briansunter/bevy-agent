@@ -2,7 +2,7 @@
 
 Start with a counter, not a full game. Each action advances one simulation tick. You will save a snapshot, repeat a step, and verify that replay returns to the same state.
 
-**You need:** Rust 1.91 or newer. These examples use Bevy 0.18.1 and the published experimental release 0.0.1.
+**You need:** Rust 1.91 or newer. These examples use Bevy 0.18.1 and the published experimental release 0.0.2.
 
 ::: tip Prefer to explore first?
 [Run the repository example](#run-the-repository-example) without copying any code. To control a running game from another process, follow [HTTP and the CLI](./guides/remote-control.md).
@@ -26,9 +26,9 @@ rust-version = "1.91"
 
 [dependencies]
 bevy = { version = "=0.18.1", default-features = false, features = ["std", "bevy_log", "bevy_state", "serialize"] }
-bevy_agent_core = "=0.0.1"
-bevy_agent_runner = "=0.0.1"
-bevy_agent_snapshot = "=0.0.1"
+bevy_agent_core = "=0.0.2"
+bevy_agent_runner = "=0.0.2"
+bevy_agent_snapshot = "=0.0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

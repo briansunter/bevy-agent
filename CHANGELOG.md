@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.2 — Unreleased
+## 0.0.2 — 2026-10-03
 
 - Searchable VitePress documentation with a complete getting-started app, interactive control-loop walkthrough, focused guides, and crate/API reference.
 - Self-hosted typography, responsive navigation, dark mode, and manual GitHub Pages deployment.

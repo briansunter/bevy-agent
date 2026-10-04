@@ -12,7 +12,7 @@ import { withBase } from 'vitepress'
           <a class="primary" :href="withBase('/getting-started.html')">Build your first environment</a>
           <a :href="withBase('/guides/remote-control.html')">Connect a client</a>
         </div>
-        <p class="docs-meta"><span>Bevy 0.18.1</span><span>Rust 1.91+</span><span>Experimental 0.0.1</span></p>
+        <p class="docs-meta"><span>Bevy 0.18.1</span><span>Rust 1.91+</span><span>Experimental 0.0.2</span></p>
       </div>
       <CounterDemo />
     </section>

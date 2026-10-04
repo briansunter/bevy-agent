@@ -1,6 +1,8 @@
-# Publishing 0.0.2
+# Publishing a release
 
-The initial `0.0.1` release is published. `0.0.2` is a documentation and metadata update; runtime behavior and wire formats are unchanged. The project remains experimental and pre-1.0. Preparing packages and running dry-runs does not upload them.
+The current published release is **0.0.2**, a documentation and metadata update with unchanged runtime behavior and wire formats. The project remains experimental and pre-1.0. Preparing packages and running dry-runs does not upload them.
+
+The examples below use `0.0.2` to show a complete release sequence. **For a future release, choose an unpublished version** and update the workspace version, exact companion requirements, installation examples, and changelog together before running upload commands. Published versions cannot be overwritten.
 
 ## Release scope
 
