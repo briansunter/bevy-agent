@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.3 — Unreleased
+
+- Correct loopback addresses in CLI and server documentation to `127.0.0.1`.
+- Keep companion crates synchronized for this documentation patch; runtime behavior and wire formats are unchanged.
+
 ## 0.0.2 — 2026-10-03
 
 - Searchable VitePress documentation with a complete getting-started app, interactive control-loop walkthrough, focused guides, and crate/API reference.

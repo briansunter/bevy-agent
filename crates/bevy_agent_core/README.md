@@ -2,11 +2,11 @@
 
 Deterministic simulation primitives for agent-controlled Bevy games.
 
-Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.2** is experimental; pin all companion crates to the same exact version.
+Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.3** is experimental; pin all companion crates to the same exact version.
 
 ```toml
 [dependencies]
-bevy_agent_core = "=0.0.2"
+bevy_agent_core = "=0.0.3"
 ```
 
 ## What this crate provides

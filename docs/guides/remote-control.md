@@ -18,7 +18,7 @@ Clone the repository, then leave this command running:
 ```sh
 git clone https://github.com/briansunter/bevy-agent.git
 cd bevy-agent
-cargo run -p sample_platformer --example remote_http -- 127.0.0.2:4000 --artifact-dir ./artifacts
+cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000 --artifact-dir ./artifacts
 ```
 
 The example includes the game. Installing the CLI alone does not start a server. `sample_platformer` is distributed through Git, not crates.io.
@@ -36,10 +36,10 @@ agentctl step '{"type":"Move","x":1.0,"y":0.0}'
 agentctl observe
 ```
 
-The default endpoint is `http://127.0.0.2:4000/rpc`. Use `--url` for another server:
+The default endpoint is `http://127.0.0.1:4000/rpc`. Use `--url` for another server:
 
 ```sh
-agentctl --url http://127.0.0.2:4001/rpc info
+agentctl --url http://127.0.0.1:4001/rpc info
 ```
 
 Read the returned observation and check terminal state before choosing the next action. Discover supported actions; movement is part of the platformer's contract.
@@ -54,7 +54,7 @@ use bevy_agent_runner::AgentApp;
 
 fn serve(env: &mut AgentApp) -> anyhow::Result<()> {
     let bridge = JsonRpcBridge::new(RemoteSecurity::default())?;
-    HttpRemoteServer::new("127.0.0.2:4000", bridge).serve(env)
+    HttpRemoteServer::new("127.0.0.1:4000", bridge).serve(env)
 }
 ```
 
@@ -63,7 +63,7 @@ This library configuration disables filesystem operations. The sample explicitly
 ## Call JSON-RPC directly
 
 ```sh
-curl -s http://127.0.0.2:4000/rpc   -H 'content-type: application/json'   -d '{"jsonrpc":"2.0","id":1,"method":"agent.info","params":{}}'
+curl -s http://127.0.0.1:4000/rpc   -H 'content-type: application/json'   -d '{"jsonrpc":"2.0","id":1,"method":"agent.info","params":{}}'
 ```
 
 The server also exposes `GET /health` and the WebSocket endpoint `GET /ws`. Always inspect the JSON-RPC body: authentication and capability failures can arrive in an HTTP 200 response.

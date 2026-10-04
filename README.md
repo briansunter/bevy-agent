@@ -72,7 +72,7 @@ There is no umbrella Cargo package: depend directly on the crates you use. `Agen
 Run a local server from the repository:
 
 ```sh
-cargo run -p sample_platformer --example remote_http -- 127.0.0.2:4000 --artifact-dir ./artifacts
+cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000 --artifact-dir ./artifacts
 ```
 
 Leave it running and use another terminal:
@@ -86,14 +86,14 @@ cargo run -p bevy_agent_cli --bin agentctl -- snapshot
 cargo run -p bevy_agent_cli --bin agentctl -- replay-export replay.json
 ```
 
-Install with `cargo install bevy_agent_cli --version 0.0.2 --locked`, then run `agentctl` directly. The default endpoint is `http://127.0.0.2:4000/rpc`; pass `--url` for another server and `--token` or `AGENT_TOKEN` for authentication.
+Install with `cargo install bevy_agent_cli --version 0.0.2 --locked`, then run `agentctl` directly. The default endpoint is `http://127.0.0.1:4000/rpc`; pass `--url` for another server and `--token` or `AGENT_TOKEN` for authentication.
 
 The example grants filesystem access under `./artifacts`: captures land in `artifacts/screenshots/` and the replay in `artifacts/replay.json`. The library default disables filesystem access; replay bundles can also be transferred inline as JSON. Bind to loopback for local use and configure authentication before exposing a listener beyond it.
 
 For a rendered window and primary-window screenshots:
 
 ```sh
-cargo run -p sample_platformer --features visual --example remote_http_visual -- 127.0.0.2:4000 --artifact-dir ./artifacts
+cargo run -p sample_platformer --features visual --example remote_http_visual -- 127.0.0.1:4000 --artifact-dir ./artifacts
 ```
 
 For Python, use the optional standard-library client from the checkout (Python 3.10+):
@@ -105,7 +105,7 @@ PYTHONPATH=python python3
 ```python
 from bevy_agent_client import AgentClient
 
-client = AgentClient("http://127.0.0.2:4000/rpc")
+client = AgentClient("http://127.0.0.1:4000/rpc")
 initial = client.reset(seed=42)
 step = client.step({"type": "Move", "x": 1.0, "y": 0.0})
 saved = client.snapshot()
