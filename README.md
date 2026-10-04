@@ -4,7 +4,7 @@
 
 Built for **Bevy 0.18.1** and **Rust 1.91+**, with headless defaults and optional rendering. HTTP, WebSocket, stdio, CLI, and Python clients share the same JSON-RPC control surface.
 
-> **Release status:** preparing the initial **0.0.1** release. The API is experimental. Cargo version numbers, snapshot/replay format versions, and game schema versions are separate contracts. Pin companion crates to the same exact release; breaking changes may occur before 1.0.
+> **Version 0.0.1** is the initial experimental release. Cargo version numbers, snapshot/replay format versions, and game schema versions are separate contracts. Pin companion crates to the same exact release; breaking changes may occur before 1.0.
 
 ## Try it
 
@@ -21,7 +21,7 @@ The [counter example](crates/bevy_agent_runner/examples/counter.rs) is a small, 
 
 ## Add it to your game
 
-After publication, add the runtime crates you need:
+Add the runtime crates you need:
 
 ```toml
 [dependencies]
@@ -33,7 +33,7 @@ bevy_agent_snapshot = "=0.0.1"
 bevy_agent_remote = "=0.0.1"
 ```
 
-Before publication, use these crates as local path dependencies or run the repository examples. The integration guide explains the additional dependencies needed for serializable game state.
+For local development, use these crates as path dependencies or run the repository examples. The integration guide explains the additional dependencies needed for serializable game state.
 
 Install `AgentControlPlugins::default()`, register authoritative gameplay state, declare the action/observation contract, and supply observation and checksum extractors. Then control the integrated app:
 
@@ -63,7 +63,7 @@ See [Getting started](docs/getting-started.md) for the complete setup and [Makin
 | [`bevy_agent_remote`](crates/bevy_agent_remote) | JSON-RPC over HTTP, WebSocket, and stdio | [docs.rs](https://docs.rs/bevy_agent_remote) |
 | [`bevy_agent_cli`](crates/agentctl) | Installs the `agentctl` command-line client | CLI |
 
-API links become available after the first publication. There is no umbrella Cargo package: depend directly on the crates you use. `AgentControlPlugins` composes core, snapshots, and replay. The runner and remote `visual` features enable Bevy render/window capture support; headless software capture uses a game-supplied renderer.
+There is no umbrella Cargo package: depend directly on the crates you use. `AgentControlPlugins` composes core, snapshots, and replay. The runner and remote `visual` features enable Bevy render/window capture support; headless software capture uses a game-supplied renderer.
 
 ## Drive it remotely
 
@@ -84,7 +84,7 @@ cargo run -p bevy_agent_cli --bin agentctl -- snapshot
 cargo run -p bevy_agent_cli --bin agentctl -- replay-export replay.json
 ```
 
-After publication, install with `cargo install bevy_agent_cli --version 0.0.1 --locked`, then run `agentctl` directly. The default endpoint is `http://127.0.0.1:4000/rpc`; pass `--url` for another server and `--token` or `AGENT_TOKEN` for authentication.
+Install with `cargo install bevy_agent_cli --version 0.0.1 --locked`, then run `agentctl` directly. The default endpoint is `http://127.0.0.1:4000/rpc`; pass `--url` for another server and `--token` or `AGENT_TOKEN` for authentication.
 
 The example grants filesystem access under `./artifacts`: captures land in `artifacts/screenshots/` and the replay in `artifacts/replay.json`. The library default disables filesystem access; replay bundles can also be transferred inline as JSON. Bind to loopback for local use and configure authentication before exposing a listener beyond it.
 

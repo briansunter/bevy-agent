@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.1 — initial release (unreleased)
+## 0.0.1 — 2026-10-03
 
 The first experimental release targets Bevy 0.18.1 and Rust 1.91+. APIs may change before 1.0; use matching exact versions of all companion crates.
 
