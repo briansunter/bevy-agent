@@ -62,6 +62,13 @@ jobs:
 
   visual:
     runs-on: ubuntu-latest
+    env:
+      # Keep source-line backtraces without full Bevy debug symbols, and limit
+      # concurrent links on the hosted runner.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v4
 
@@ -97,6 +104,12 @@ jobs:
         with:
           name: primary-window-capture
           path: ${{ runner.temp }}/primary-window-smoke
+
+      - name: Report visual build storage
+        if: always()
+        run: |
+          df -h .
+          if [ -d target ]; then du -sh target; fi
 
   fuzz:
     runs-on: ubuntu-latest
