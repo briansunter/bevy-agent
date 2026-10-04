@@ -2,14 +2,14 @@
 
 The `agentctl` command-line client for [bevy-agent](https://github.com/briansunter/bevy-agent) JSON-RPC environments.
 
-The Cargo package is named **`bevy_agent_cli`**; the installed executable is **`agentctl`**. Requires **Rust 1.91+**. Version **0.0.1** is experimental.
+The Cargo package is named **`bevy_agent_cli`**; the installed executable is **`agentctl`**. Requires **Rust 1.91+**. Version **0.0.2** is experimental.
 
 [Read the CLI guide](https://briansunter.github.io/bevy-agent/guides/remote-control.html) for installation, a complete server/client workflow, and troubleshooting.
 
 ## Install
 
 ```sh
-cargo install bevy_agent_cli --version 0.0.1 --locked
+cargo install bevy_agent_cli --version 0.0.2 --locked
 ```
 
 For local development, install from a repository checkout:
@@ -20,7 +20,7 @@ cargo install --path crates/agentctl --locked
 
 ## Control a running game
 
-Start a compatible server first. By default the client connects to `http://127.0.0.1:4000/rpc`.
+Start a compatible server first. By default the client connects to `http://127.0.0.2:4000/rpc`.
 
 ```sh
 agentctl info
@@ -35,7 +35,7 @@ agentctl replay-export replay.json
 Actions depend on the game's declared catalog. Discover it with `agentctl action-space`. Captures and file exports require server filesystem permission; paths resolve under the server's artifact root.
 
 ```sh
-agentctl --url http://127.0.0.1:4000/rpc --token secret info
+agentctl --url http://127.0.0.2:4000/rpc --token secret info
 agentctl --retry-key episode-1.tick-1 step '{"type":"Noop"}'
 agentctl operation-status --key episode-1.tick-1
 ```

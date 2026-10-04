@@ -2,12 +2,12 @@
 
 JSON-RPC control for Bevy agent environments over HTTP, WebSocket, and stdio.
 
-Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.1** is experimental; pin all companion crates to the same exact version.
+Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.2** is experimental; pin all companion crates to the same exact version.
 
 ```toml
 [dependencies]
-bevy_agent_remote = "=0.0.1"
-bevy_agent_runner = "=0.0.1"
+bevy_agent_remote = "=0.0.2"
+bevy_agent_runner = "=0.0.2"
 ```
 
 ## Serve a headless environment
@@ -18,7 +18,7 @@ use bevy_agent_runner::AgentApp;
 
 fn serve(env: &mut AgentApp) -> anyhow::Result<()> {
     let bridge = JsonRpcBridge::new(RemoteSecurity::default())?;
-    HttpRemoteServer::new("127.0.0.1:4000", bridge).serve(env)
+    HttpRemoteServer::new("127.0.0.2:4000", bridge).serve(env)
 }
 ```
 

@@ -11,7 +11,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.91"
@@ -36,8 +36,8 @@ sha1 = "0.10.6"
 thiserror = "2.0.17"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 
-bevy_agent_core = { version = "=0.0.1", path = "crates/bevy_agent_core" }
-bevy_agent_snapshot = { version = "=0.0.1", path = "crates/bevy_agent_snapshot" }
-bevy_agent_replay = { version = "=0.0.1", path = "crates/bevy_agent_replay" }
-bevy_agent_runner = { version = "=0.0.1", path = "crates/bevy_agent_runner" }
-bevy_agent_remote = { version = "=0.0.1", path = "crates/bevy_agent_remote" }
+bevy_agent_core = { version = "=0.0.2", path = "crates/bevy_agent_core" }
+bevy_agent_snapshot = { version = "=0.0.2", path = "crates/bevy_agent_snapshot" }
+bevy_agent_replay = { version = "=0.0.2", path = "crates/bevy_agent_replay" }
+bevy_agent_runner = { version = "=0.0.2", path = "crates/bevy_agent_runner" }
+bevy_agent_remote = { version = "=0.0.2", path = "crates/bevy_agent_remote" }

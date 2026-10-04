@@ -2,13 +2,13 @@
 
 Step, inspect, snapshot, restore, and branch a Bevy game through a Rust environment API.
 
-Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.1** is experimental; pin all companion crates to the same exact version.
+Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.2** is experimental; pin all companion crates to the same exact version.
 
 ```toml
 [dependencies]
-bevy_agent_core = "=0.0.1"
-bevy_agent_runner = "=0.0.1"
-bevy_agent_snapshot = "=0.0.1"
+bevy_agent_core = "=0.0.2"
+bevy_agent_runner = "=0.0.2"
+bevy_agent_snapshot = "=0.0.2"
 ```
 
 ## Control an integrated game

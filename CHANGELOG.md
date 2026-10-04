@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.0.2 — Unreleased
 
 - Searchable VitePress documentation with a complete getting-started app, interactive control-loop walkthrough, focused guides, and crate/API reference.
 - Self-hosted typography, responsive navigation, dark mode, and manual GitHub Pages deployment.
-- Cargo homepage/documentation metadata and package READMEs link to the guide; existing published versions require a new release to receive these metadata changes.
+- Cargo homepage/documentation metadata and package READMEs link to the guide; this documentation release updates the registry metadata without changing runtime behavior.
 
 ## 0.0.1 — 2026-10-03
 

@@ -1,10 +1,10 @@
-# Publishing 0.0.1
+# Publishing 0.0.2
 
-This is the initial experimental, pre-1.0 release. Preparing packages and running dry-runs does not upload them. Actual `cargo publish` commands are a separate release step.
+The initial `0.0.1` release is published. `0.0.2` is a documentation and metadata update; runtime behavior and wire formats are unchanged. The project remains experimental and pre-1.0. Preparing packages and running dry-runs does not upload them.
 
 ## Release scope
 
-The shared version lives in `[workspace.package]` in the root `Cargo.toml`. Every member inherits it; internal runtime dependencies use `=0.0.1` plus their local paths. Keep those requirements synchronized whenever the release version changes. During the `0.0.x` series, pin exact versions and expect API changes; there is no 1.0 compatibility guarantee.
+The shared version lives in `[workspace.package]` in the root `Cargo.toml`. Every member inherits it; internal runtime dependencies use `=0.0.2` plus their local paths. Keep those requirements synchronized whenever the release version changes. During the `0.0.x` series, pin exact versions and expect API changes; there is no 1.0 compatibility guarantee.
 
 Publish these packages in dependency order:
 
@@ -15,7 +15,7 @@ Publish these packages in dependency order:
 5. `bevy_agent_remote`
 6. `bevy_agent_cli` (independent of the runtime crates)
 
-`bevy_agent_cli` installs the **`agentctl`** executable. The crates.io name `agentctl` is already used by another project. The runtime package names and `bevy_agent_cli` were unregistered when checked on 2026-10-03; that check does not reserve them. Recheck names and ownership immediately before the release.
+`bevy_agent_cli` installs the **`agentctl`** executable. The crates.io name `agentctl` is already used by another project. All six packages are already registered to this project. Verify ownership and the next version before uploading; published versions cannot be overwritten.
 
 `sample_platformer` has `publish = false`. It remains a repository example and regression suite. The Python client, repository documentation, agent skills, and fuzz harness are also distributed through Git, not through the Rust crate archives. The runner's complete `counter` example is included in its crate archive.
 
@@ -69,7 +69,7 @@ For inspection while changes are uncommitted, append `--allow-dirty`. Final rele
 
 Check each generated `.crate` archive:
 
-- The normalized manifest has version `0.0.1`, a description, repository/homepage, license expression, keywords/categories, and the correct package README.
+- The normalized manifest has version `0.0.2`, a description, repository/homepage, license expression, keywords/categories, and the correct package README.
 - Internal dependencies have registry-compatible exact versions. Normalized manifests do not rely on workspace inheritance or local `path` dependencies.
 - Both `LICENSE-MIT` and `LICENSE-APACHE` are present and match the canonical root licenses.
 - Library archives include their README (also used as crate-level rustdoc), source, and any packaged examples/tests. The runner includes `examples/counter.rs`.
@@ -80,26 +80,26 @@ Explicit `include` rules keep each package scoped. Root license texts are copied
 
 ## Upload only when releasing
 
-Before the first upload, authenticate with a crates.io account that owns or can register these names. Use `cargo login` or the standard credential provider; do not put a token in the repository. Mark `0.0.1` released in `CHANGELOG.md`, update the README release status and installation wording, commit the release changes, and finish the clean-checkout validation above.
+Authenticate with a crates.io account that owns these names. The token needs **publish-update** permission for the six `bevy_agent_*` packages; a **publish-new** token only registers new packages. Use `cargo login` or the standard credential provider; do not put a token in the repository. Mark `0.0.2` released in `CHANGELOG.md`, update the README release status and installation wording, commit the release changes, and finish the clean-checkout validation above.
 
 Dry-run and publish each package in order:
 
 ```sh
 cargo publish -p bevy_agent_core --locked --dry-run
 cargo publish -p bevy_agent_core --locked
-# Wait until bevy_agent_core 0.0.1 appears in the registry index.
+# Wait until bevy_agent_core 0.0.2 appears in the registry index.
 
 cargo publish -p bevy_agent_snapshot --locked --dry-run
 cargo publish -p bevy_agent_snapshot --locked
-# Wait until bevy_agent_snapshot 0.0.1 is indexed.
+# Wait until bevy_agent_snapshot 0.0.2 is indexed.
 
 cargo publish -p bevy_agent_replay --locked --dry-run
 cargo publish -p bevy_agent_replay --locked
-# Wait until bevy_agent_replay 0.0.1 is indexed.
+# Wait until bevy_agent_replay 0.0.2 is indexed.
 
 cargo publish -p bevy_agent_runner --locked --dry-run
 cargo publish -p bevy_agent_runner --locked
-# Wait until bevy_agent_runner 0.0.1 is indexed.
+# Wait until bevy_agent_runner 0.0.2 is indexed.
 
 cargo publish -p bevy_agent_remote --locked --dry-run
 cargo publish -p bevy_agent_remote --locked
@@ -110,8 +110,8 @@ cargo publish -p bevy_agent_cli --locked
 
 Individual downstream dry-runs need their runtime dependencies in the registry. Workspace package verification proves the local release set builds, but it does not prove registry ownership, credential validity, or a successful upload. The independent core and CLI can be dry-run before any internal dependency is published.
 
-After upload, verify each crates.io page and docs.rs build. Test a fresh consumer using only registry dependencies, and run `cargo install bevy_agent_cli --version 0.0.1 --locked` followed by `agentctl --version`. Tag the verified release as `v0.0.1` and link the changelog. A package version cannot be overwritten after publication; any source fix needs a new release version.
+After upload, verify each crates.io page and docs.rs build. Test a fresh consumer using only registry dependencies, and run `cargo install bevy_agent_cli --version 0.0.2 --locked` followed by `agentctl --version`. Tag the verified release as `v0.0.2` and link the changelog. A package version cannot be overwritten after publication; any source fix needs a new release version.
 
 ## Artifact compatibility
 
-Cargo package version `0.0.1` does not reset protocol or file formats. Snapshots, replay manifests, and replay bundles use format version **3**. Stable gameplay type IDs, per-type schema versions, and checksum encoding versions have their own compatibility rules. Older artifacts are rejected; this release does not migrate them.
+Cargo package version `0.0.2` does not reset protocol or file formats. Snapshots, replay manifests, and replay bundles use format version **3**. Stable gameplay type IDs, per-type schema versions, and checksum encoding versions have their own compatibility rules. Older artifacts are rejected; this release does not migrate them.

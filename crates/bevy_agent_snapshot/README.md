@@ -2,11 +2,11 @@
 
 Gameplay snapshots and checked restoration for agent-controlled Bevy simulations.
 
-Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.1** is experimental; pin all companion crates to the same exact version.
+Part of [bevy-agent](https://github.com/briansunter/bevy-agent). Requires **Bevy 0.18.1** and **Rust 1.91+**. Version **0.0.2** is experimental; pin all companion crates to the same exact version.
 
 ```toml
 [dependencies]
-bevy_agent_snapshot = "=0.0.1"
+bevy_agent_snapshot = "=0.0.2"
 ```
 
 ## Register authoritative state
