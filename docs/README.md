@@ -3,6 +3,7 @@
 Read the [Bevy Agent guide](https://briansunter.github.io/bevy-agent/) for searchable, organized documentation.
 
 - [Getting started](./getting-started.md): a complete standalone counter with expected output.
+- [Use with an agent](./agent-skill.md): a portable skill for setup, integration, and runtime control.
 - [Runnable examples](./examples.md): counter, platformer, HTTP, rendering, and stdio.
 - [Testing and reproducibility](./guides/testing.md): executable reset, restore, and replay checks.
 - [Control loop](./concepts.md): actions, ticks, observations, and authoritative state.

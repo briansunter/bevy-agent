@@ -33,6 +33,7 @@ export default defineConfig({
       { text: 'Start here', items: [
         { text: 'Getting started', link: '/getting-started' },
         { text: 'Runnable examples', link: '/examples' },
+        { text: 'Use with an agent', link: '/agent-skill' },
         { text: 'How the control loop works', link: '/concepts' },
         { text: 'Choose your crates', link: '/reference/crates' },
       ] },

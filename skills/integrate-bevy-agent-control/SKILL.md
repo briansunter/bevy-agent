@@ -7,6 +7,8 @@ metadata:
 
 # Integrate Bevy Agent Control
 
+For setup through runtime operation in one portable skill, use [Bevy Agent](../bevy-agent/SKILL.md). This skill remains the focused reference for its specialized workflow.
+
 ## Integration Rule
 
 Make the authoritative simulation controllable by domain actions and deterministic ticks. Rendering, UI, audio, asset loading, debug overlays, and wall-clock effects must stay outside the authoritative gameplay state.

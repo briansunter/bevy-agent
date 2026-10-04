@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bevy Agent"
+  short_description: "Set up, integrate, and operate Bevy agent games"
+  default_prompt: "Use $bevy-agent to set up or integrate this Bevy environment, then control and verify it through its runtime API."

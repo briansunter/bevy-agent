@@ -7,6 +7,8 @@ metadata:
 
 # Control Bevy Agent Game
 
+For setup through runtime operation in one portable skill, use [Bevy Agent](../bevy-agent/SKILL.md). This skill remains the focused reference for its specialized workflow.
+
 ## Operating Rule
 
 Drive the game through its structured simulation API. Do not fake keyboard, mouse, gamepad, or browser input unless the user explicitly asks to test a human-input adapter.

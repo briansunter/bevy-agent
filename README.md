@@ -114,6 +114,17 @@ The Cargo package **`bevy_agent_cli`** installs **`agentctl`**. The CLI connects
 - **Remote mutations need recovery discipline.** HTTP/WebSocket retry keys deduplicate one intended request while its result is retained. A faulted environment requires a successful reset. See [retries and recovery](https://briansunter.github.io/bevy-agent/guides/recovery.html).
 - **File access is explicit.** The library disables it by default. Sample-server files resolve under `./artifacts`. Bind locally or configure authentication for a network listener.
 
+## Agent skill
+
+Use the repository's [Bevy Agent skill](skills/bevy-agent/SKILL.md) to guide an agent through setup, game integration, and runtime operation. It includes a standalone Rust starter, focused integration/runtime references, and recovery guidance.
+
+```text
+Use the skill at skills/bevy-agent/SKILL.md to integrate this game,
+then verify reset, stepping, snapshot restore, and replay through its runtime API.
+```
+
+The whole `skills/bevy-agent/` directory is portable; keep its references and assets together. [Skill guide](https://briansunter.github.io/bevy-agent/agent-skill.html)
+
 ## Contributing
 
 [Development commands](https://briansunter.github.io/bevy-agent/reference/contributing.html) · [Architecture](https://briansunter.github.io/bevy-agent/architecture.html) · [Publishing](https://briansunter.github.io/bevy-agent/publishing.html) · [Report an issue](https://github.com/briansunter/bevy-agent/issues)
