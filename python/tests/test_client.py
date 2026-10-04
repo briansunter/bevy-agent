@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import socket
+import ssl
 import subprocess
 import threading
 import sys
@@ -453,6 +454,12 @@ class StdioClientTests(unittest.TestCase):
     def test_nonreading_child_write_times_out_and_is_reaped(self):
         # Exercise both the nonblocking POSIX writer and daemon fallback with
         # real pipes. A full pipe must consume the call deadline before reading.
+        # Prepare the payload before timing the blocked write so JSON encoding
+        # on a busy runner cannot exhaust the deadline before the pipe is used.
+        payload = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "agent.info",
+            "params": {"large": "x" * (1024 * 1024)},
+        })
         for writer_platform in ["posix", "nt"]:
             with self.subTest(writer_platform=writer_platform):
                 client = StdioAgentClient(
@@ -461,7 +468,9 @@ class StdioClientTests(unittest.TestCase):
                 )
                 started = time.monotonic()
                 try:
-                    with patch("bevy_agent_client.os.name", writer_platform):
+                    with patch("bevy_agent_client.os.name", writer_platform), patch(
+                        "bevy_agent_client._encode_request", return_value=payload
+                    ):
                         with self.assertRaisesRegex(AgentError, "write timed out"):
                             client.call("agent.info", {"large": "x" * (1024 * 1024)})
                     self.assertLess(time.monotonic() - started, 2)
@@ -679,6 +688,14 @@ class OperationStatusTests(unittest.TestCase):
 
 
 class HttpDeadlineAndRetryTests(unittest.TestCase):
+    def setUp(self):
+        # HTTPSHandler is initialized even for these HTTP URLs. Prepare its
+        # trust store before timing network operations on busy runners.
+        context = ssl.create_default_context()
+        context_patch = patch("ssl._create_default_https_context", return_value=context)
+        context_patch.start()
+        self.addCleanup(context_patch.stop)
+
     def test_stalled_dns_lookup_obeys_call_deadline(self):
         release = threading.Event()
         entered = threading.Event()
@@ -711,6 +728,8 @@ class HttpDeadlineAndRetryTests(unittest.TestCase):
             fallback.join()
 
     def test_dns_saturation_bounds_lookup_concurrency_and_caller_waits(self):
+        import bevy_agent_client as client_module
+
         release = threading.Event()
         finished = threading.Event()
         lock = threading.Lock()
@@ -732,10 +751,15 @@ class HttpDeadlineAndRetryTests(unittest.TestCase):
 
         def call():
             try:
-                AgentClient(url="http://127.0.0.1:4000/rpc", timeout=0.15).info()
-            except AgentError as error:
+                # Exercise the resolver directly so HTTP opener/TLS setup
+                # cannot consume the short deadline before DNS is reached.
+                # The stalled-DNS test covers the full AgentClient path.
+                client_module._resolve_http(
+                    ("127.0.0.1", 4000), time.monotonic() + 0.15
+                )
+            except TimeoutError as error:
                 return error
-            self.fail("stalled DNS unexpectedly completed the HTTP request")
+            self.fail("stalled DNS unexpectedly completed the lookup")
 
         fallback = threading.Timer(2, release.set)
         fallback.start()
@@ -790,6 +814,7 @@ class HttpDeadlineAndRetryTests(unittest.TestCase):
                 listener = socket.socket()
                 listener.bind(("127.0.0.1", 0))
                 listener.listen()
+                listener.settimeout(1)
                 url = f"http://127.0.0.1:{listener.getsockname()[1]}/rpc"
                 stopped = threading.Event()
                 def serve():
