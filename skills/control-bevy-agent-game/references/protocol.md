@@ -1,4 +1,4 @@
-# bevy_agent_control Operation Reference
+# bevy-agent Operation Reference
 
 ## Local HTTP Runtime
 
@@ -11,28 +11,28 @@ cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
 Use `agentctl`:
 
 ```sh
-cargo run -p agentctl -- info
-cargo run -p agentctl -- action-space
-cargo run -p agentctl -- observation-space
-cargo run -p agentctl -- schema
-cargo run -p agentctl -- reset --seed 42
-cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
-cargo run -p agentctl -- capture --out-dir screenshots --label tick_1
-cargo run -p agentctl -- fast-forward 30
-cargo run -p agentctl -- snapshot
-cargo run -p agentctl -- snapshots
-cargo run -p agentctl -- restore <snapshot-id>
-cargo run -p agentctl -- restore-tick 10
-cargo run -p agentctl -- branch --from-tick 10 --label alt
-cargo run -p agentctl -- replay-export replay.json
-cargo run -p agentctl -- replay-load replay.json
+cargo run -p bevy_agent_cli --bin agentctl -- info
+cargo run -p bevy_agent_cli --bin agentctl -- action-space
+cargo run -p bevy_agent_cli --bin agentctl -- observation-space
+cargo run -p bevy_agent_cli --bin agentctl -- schema
+cargo run -p bevy_agent_cli --bin agentctl -- reset --seed 42
+cargo run -p bevy_agent_cli --bin agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
+cargo run -p bevy_agent_cli --bin agentctl -- capture --out-dir screenshots --label tick_1
+cargo run -p bevy_agent_cli --bin agentctl -- fast-forward 30
+cargo run -p bevy_agent_cli --bin agentctl -- snapshot
+cargo run -p bevy_agent_cli --bin agentctl -- snapshots
+cargo run -p bevy_agent_cli --bin agentctl -- restore <snapshot-id>
+cargo run -p bevy_agent_cli --bin agentctl -- restore-tick 10
+cargo run -p bevy_agent_cli --bin agentctl -- branch --from-tick 10 --label alt
+cargo run -p bevy_agent_cli --bin agentctl -- replay-export replay.json
+cargo run -p bevy_agent_cli --bin agentctl -- replay-load replay.json
 ```
 
 Use tokened mode when available:
 
 ```sh
 AGENT_TOKEN=secret cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
-cargo run -p agentctl -- --token secret info
+cargo run -p bevy_agent_cli --bin agentctl -- --token secret info
 ```
 
 ## JSON-RPC Methods

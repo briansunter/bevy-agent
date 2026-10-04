@@ -1,8 +1,4 @@
-//! Gameplay snapshot and restore support for Bevy agent simulations.
-//!
-//! Snapshots are intentionally gameplay-focused: only entities marked with
-//! [`SnapshotEntity`](bevy_agent_core::SnapshotEntity) and registered
-//! resources/components are serialized and restored.
+#![doc = include_str!("../README.md")]
 
 mod builtins;
 mod capture;

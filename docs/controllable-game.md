@@ -1,6 +1,6 @@
 # Making a Game Controllable
 
-Use this checklist when adapting a Bevy game to `bevy_agent_control`.
+Use this checklist when adapting a Bevy game to `bevy-agent`.
 
 1. Add `AgentControlPlugins::default()` for control, snapshots, and replay; choose Bevy rendering plugins separately for visual builds.
 2. Move authoritative gameplay into `AgentTick`.

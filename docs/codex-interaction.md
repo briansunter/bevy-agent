@@ -9,22 +9,22 @@ cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
 Inspect it:
 
 ```sh
-cargo run -p agentctl -- info
-cargo run -p agentctl -- schema
+cargo run -p bevy_agent_cli --bin agentctl -- info
+cargo run -p bevy_agent_cli --bin agentctl -- schema
 ```
 
 Reset and step:
 
 ```sh
-cargo run -p agentctl -- reset --seed 42
-cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
-cargo run -p agentctl -- step-many '[{"type":"Move","x":1.0,"y":0.0},{"type":"Jump"}]'
+cargo run -p bevy_agent_cli --bin agentctl -- reset --seed 42
+cargo run -p bevy_agent_cli --bin agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
+cargo run -p bevy_agent_cli --bin agentctl -- step-many '[{"type":"Move","x":1.0,"y":0.0},{"type":"Jump"}]'
 ```
 
 Capture visual state on demand:
 
 ```sh
-cargo run -p agentctl -- capture --out-dir screenshots --label tick_1
+cargo run -p bevy_agent_cli --bin agentctl -- capture --out-dir screenshots --label tick_1
 ```
 
 For low-speed visual play, alternate one `step` command with `capture`, inspect the symbolic response and PNG, then choose the next domain action. The sample platformer can write capture PNGs from the headless HTTP runtime; visual builds can also use Bevy primary-window screenshots.
@@ -32,23 +32,23 @@ For low-speed visual play, alternate one `step` command with `capture`, inspect 
 Snapshot, restore, and branch:
 
 ```sh
-cargo run -p agentctl -- snapshot
-cargo run -p agentctl -- restore <snapshot-id>
-cargo run -p agentctl -- branch --from-tick 3 --label try_jump
+cargo run -p bevy_agent_cli --bin agentctl -- snapshot
+cargo run -p bevy_agent_cli --bin agentctl -- restore <snapshot-id>
+cargo run -p bevy_agent_cli --bin agentctl -- branch --from-tick 3 --label try_jump
 ```
 
 Replay files:
 
 ```sh
-cargo run -p agentctl -- replay-export replay.json
-cargo run -p agentctl -- replay-load replay.json
+cargo run -p bevy_agent_cli --bin agentctl -- replay-export replay.json
+cargo run -p bevy_agent_cli --bin agentctl -- replay-load replay.json
 ```
 
 Security:
 
 ```sh
 AGENT_TOKEN=secret cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
-cargo run -p agentctl -- --token secret info
+cargo run -p bevy_agent_cli --bin agentctl -- --token secret info
 ```
 
 Remote servers may run without a token only on loopback binds. Set `AGENT_TOKEN` before binding to a public interface such as `0.0.0.0`. A missing or wrong token, or a missing capability, is returned as a JSON-RPC error in the HTTP 200 response body rather than as an HTTP 401/403; mutating methods such as `agent.control.pause`/`resume`/`set_mode` require the `CONTROL` capability.
@@ -71,7 +71,7 @@ running operation can still complete. Preserve its opaque string identifier and
 query the outcome before repeating a mutation:
 
 ```sh
-cargo run -p agentctl -- operation-status <operation-id>
+cargo run -p bevy_agent_cli --bin agentctl -- operation-status <operation-id>
 ```
 
 Python exposes `env.operation_status(operation_id)`. Status retrieval uses the
@@ -85,8 +85,8 @@ To survive a disconnect before receiving an operation ID, choose a retry key
 before sending the mutation:
 
 ```sh
-cargo run -p agentctl -- --retry-key episode-1.tick-1 step '{"type":"Noop"}'
-cargo run -p agentctl -- operation-status --key episode-1.tick-1
+cargo run -p bevy_agent_cli --bin agentctl -- --retry-key episode-1.tick-1 step '{"type":"Noop"}'
+cargo run -p bevy_agent_cli --bin agentctl -- operation-status --key episode-1.tick-1
 ```
 
 Python supports `env.step(action, retry_key="episode-1.tick-1")` and

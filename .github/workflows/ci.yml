@@ -48,6 +48,9 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --locked
 
+      - name: Verify publishable packages
+        run: cargo package --workspace --exclude sample_platformer --locked
+
       - name: Python tests
         run: python3 -m unittest discover -s python/tests
 

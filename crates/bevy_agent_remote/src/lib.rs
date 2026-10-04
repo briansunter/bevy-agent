@@ -1,4 +1,4 @@
-//! JSON-RPC, HTTP, WebSocket, and stdio remote-control bridge for agent apps.
+#![doc = include_str!("../README.md")]
 
 /// Maximum complete JSON message size, including a stdio line delimiter.
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;

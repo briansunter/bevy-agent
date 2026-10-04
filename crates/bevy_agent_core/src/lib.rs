@@ -1,8 +1,4 @@
-//! Core Bevy plugin primitives for controllable agent-driven simulations.
-//!
-//! This crate owns the deterministic tick schedules, action queue, input frame,
-//! simulation clock, observation types, reward/episode state, and extension
-//! traits used by the runner, snapshot, replay, and remote crates.
+#![doc = include_str!("../README.md")]
 
 use bevy::ecs::schedule::ScheduleLabel;
 use bevy::prelude::*;

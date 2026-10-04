@@ -3,6 +3,10 @@
 use super::*;
 
 #[derive(Clone, Debug)]
+/// Installs the core control plugin, gameplay snapshots, and replay recording.
+///
+/// This group does not install Bevy rendering or a game's integration contract.
+/// Add those separately before constructing [`AgentApp`].
 pub struct AgentControlPlugins {
     control: AgentControlPlugin,
     snapshots: bool,
@@ -12,18 +16,21 @@ pub struct AgentControlPlugins {
 
 impl AgentControlPlugins {
     #[must_use]
+    /// Omits the snapshot plugin from this group.
     pub fn without_snapshots(mut self) -> Self {
         self.snapshots = false;
         self
     }
 
     #[must_use]
+    /// Omits the replay plugin from this group.
     pub fn without_replay(mut self) -> Self {
         self.replay = false;
         self
     }
 
     #[must_use]
+    /// Overrides snapshot checkpoint and retention policy when snapshots are enabled.
     pub fn with_snapshot_policy(mut self, policy: SnapshotPolicy) -> Self {
         self.snapshot_policy = Some(policy);
         self

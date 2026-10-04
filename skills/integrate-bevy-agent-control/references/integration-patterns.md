@@ -1,4 +1,4 @@
-# bevy_agent_control Integration Patterns
+# bevy-agent Integration Patterns
 
 ## Imports
 

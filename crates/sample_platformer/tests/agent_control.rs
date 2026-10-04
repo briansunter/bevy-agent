@@ -636,7 +636,10 @@ fn remote_misc_methods_cover_info_schema_observe_fast_forward_and_errors() {
     );
     let info: serde_json::Value = serde_json::from_str(&info).unwrap();
     assert_eq!(info["result"]["name"], "sample_platformer");
-    assert_eq!(info["result"]["agent_control_version"], "0.1.0");
+    assert_eq!(
+        info["result"]["agent_control_version"],
+        env!("CARGO_PKG_VERSION")
+    );
 
     let schema = bridge.handle_json(
         &mut env,

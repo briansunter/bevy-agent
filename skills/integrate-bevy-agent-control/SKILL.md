@@ -1,6 +1,6 @@
 ---
 name: integrate-bevy-agent-control
-description: "Integrate bevy_agent_control into a Bevy game so AI agents can control deterministic simulation ticks. Use when Codex is modifying or scaffolding a Bevy game, separating authoritative gameplay from rendering, defining stable agent actions or custom action schemas, converting keyboard/gamepad/network/test input into action frames, moving gameplay systems into AgentTick, using CurrentInputFrame and SimClock, registering snapshot state with macros, writing symbolic observations and stable checksums, exposing visual screenshot capture, exposing localhost JSON-RPC or stdio control, or testing replay/snapshot determinism."
+description: "Integrate bevy-agent into a Bevy game so AI agents can control deterministic simulation ticks. Use when Codex is modifying or scaffolding a Bevy game, separating authoritative gameplay from rendering, defining stable agent actions or custom action schemas, converting keyboard/gamepad/network/test input into action frames, moving gameplay systems into AgentTick, using CurrentInputFrame and SimClock, registering snapshot state with macros, writing symbolic observations and stable checksums, exposing visual screenshot capture, exposing localhost JSON-RPC or stdio control, or testing replay/snapshot determinism."
 metadata:
   short-description: Make Bevy games agent-controllable
 ---

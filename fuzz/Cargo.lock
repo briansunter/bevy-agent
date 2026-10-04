@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_agent_core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bevy",
  "jsonschema",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_agent_remote"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_agent_replay"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bevy",
  "bevy_agent_core",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_agent_runner"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "bevy",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_agent_snapshot"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "bevy",

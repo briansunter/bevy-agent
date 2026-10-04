@@ -3,9 +3,14 @@
 use super::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+/// Episode initialization policy. Defaults to seed zero, hybrid observations,
+/// and an initial snapshot suitable for replay reconstruction.
 pub struct ResetOptions {
+    /// Optional replacement for the simulation's deterministic RNG seed.
     pub seed: Option<u64>,
+    /// A mode supported by the game's observation catalog.
     pub observation_mode: ObservationMode,
+    /// Whether reset retains a snapshot of the initial world.
     pub create_initial_snapshot: bool,
 }
 
@@ -41,10 +46,12 @@ impl AgentApp {
         validate_runner_integration(world)
     }
 
+    /// Builds an app and validates its integration without starting gameplay.
     pub fn new(build_app: impl FnOnce() -> App) -> Result<Self> {
         Self::from_app(build_app())
     }
 
+    /// Finishes plugin setup and validates an existing, not-yet-running app.
     pub fn from_app(mut app: App) -> Result<Self> {
         app.finish();
         app.cleanup();
@@ -115,6 +122,8 @@ impl AgentApp {
         Ok(())
     }
 
+    /// Advances with `Noop` actions, stopping at terminal state and returning
+    /// the last response. Zero ticks are rejected.
     pub fn fast_forward(&mut self, ticks: u64) -> Result<StepResponse<Observation>> {
         if ticks == 0 {
             return Err(anyhow!("fast_forward called with zero ticks"));

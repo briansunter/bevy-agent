@@ -1,11 +1,4 @@
-//! Reference platformer for deterministic `bevy_agent_control` integration.
-//!
-//! The plugin wires together serializable gameplay state (`model`), deterministic
-//! tick systems (`simulation`), read-only observations/checksums (`observation`),
-//! and presentation (`capture`). Headless and visual builders share the same rules.
-//!
-//! Snapshots require the current registry schema, including every required game
-//! resource. Partial or incompatible state is rejected before world mutation.
+#![doc = include_str!("../README.md")]
 
 mod capture;
 mod model;
@@ -117,7 +110,7 @@ pub fn build_visual_app() -> App {
         DefaultPlugins
             .set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "bevy_agent_control sample platformer".to_string(),
+                    title: "bevy-agent sample platformer".to_string(),
                     resolution: WindowResolution::new(960, 540),
                     ..Default::default()
                 }),

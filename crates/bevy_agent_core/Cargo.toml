@@ -1,11 +1,14 @@
 [package]
 name = "bevy_agent_core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Core schedules, actions, observations, deterministic clock, and plugin types for controllable Bevy simulations."
-readme.workspace = true
+readme = "README.md"
+include.workspace = true
+homepage.workspace = true
+publish.workspace = true
 repository.workspace = true
 documentation = "https://docs.rs/bevy_agent_core"
 keywords = ["bevy", "gamedev", "agent", "simulation"]
@@ -21,3 +24,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

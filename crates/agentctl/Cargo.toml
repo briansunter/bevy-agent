@@ -1,16 +1,23 @@
 [package]
-name = "agentctl"
-version = "0.1.0"
+name = "bevy_agent_cli"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Command-line JSON-RPC client for bevy_agent_control environments."
-readme.workspace = true
+description = "Command-line JSON-RPC client for Bevy agent environments."
+readme = "README.md"
+include.workspace = true
+homepage.workspace = true
+publish.workspace = true
 repository.workspace = true
-documentation = "https://docs.rs/agentctl"
+documentation = "https://github.com/briansunter/bevy-agent/tree/master/crates/agentctl"
 keywords = ["bevy", "gamedev", "agent", "json-rpc"]
 categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
+
+[[bin]]
+name = "agentctl"
+path = "src/main.rs"

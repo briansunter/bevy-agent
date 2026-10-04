@@ -1,4 +1,4 @@
-//! Runner API for manually stepping Bevy apps through agent simulation ticks.
+#![doc = include_str!("../README.md")]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -54,27 +54,42 @@ use bevy_agent_replay::TimelineBranch;
 use bundle::validate_bundle_topology;
 use checkpoints::capture_queue_excluded_checksum;
 
+/// A synchronous control loop for an integrated simulation.
+///
+/// Implemented by [`AgentApp`]. Fallible operations validate the game's declared
+/// action, observation, and snapshot contracts. Inspect terminal flags in step
+/// responses before choosing the next action.
 pub trait AgentEnvironment {
+    /// Domain input admitted by the environment.
     type Action;
+    /// State exposed to the controlling client.
     type Observation;
 
+    /// Starts a fresh episode and returns its initial observation.
     fn reset(&mut self, options: ResetOptions) -> Result<Self::Observation>;
 
+    /// Applies an action and advances one controlled simulation tick.
     fn step(&mut self, action: Self::Action) -> Result<StepResponse<Self::Observation>>;
 
+    /// Steps actions in order, stopping when the episode is done or truncated.
     fn step_many(
         &mut self,
         actions: Vec<Self::Action>,
     ) -> Result<Vec<StepResponse<Self::Observation>>>;
 
+    /// Collects a supported observation without advancing the simulation tick.
     fn observe(&mut self, mode: ObservationMode) -> Result<Self::Observation>;
 
+    /// Captures registered gameplay state and returns a retained snapshot ID.
     fn snapshot(&mut self) -> Result<SnapshotCreateResult>;
 
+    /// Restores a retained snapshot through the coordinated world/history path.
     fn restore(&mut self, snapshot: SnapshotId) -> Result<()>;
 
+    /// Reconstructs a recorded tick using retained checkpoints and replay input.
     fn restore_tick(&mut self, tick: u64) -> Result<()>;
 
+    /// Forks history at a recorded tick and activates the new branch.
     fn branch(
         &mut self,
         from_tick: u64,
@@ -82,6 +97,12 @@ pub trait AgentEnvironment {
     ) -> Result<bevy_agent_core::BranchId>;
 }
 
+/// Owns a validated Bevy app, controlled ticks, and coordinated history.
+///
+/// Construct with [`AgentApp::new`] after installing [`AgentControlPlugins`] and
+/// the game's metadata, catalogs, extractors, and snapshot registrations.
+/// [`AgentEnvironment`] exposes the basic control loop; inherent methods provide
+/// batch responses, replay bundles, capture, and lower-level app access.
 pub struct AgentApp {
     app: App,
     started: bool,

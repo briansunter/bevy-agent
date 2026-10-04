@@ -1,8 +1,8 @@
 ---
 name: control-bevy-agent-game
-description: "Operate a Bevy game that exposes the bevy_agent_control protocol. Use when Codex needs to run a controllable Bevy environment, inspect action and observation schemas, drive simulation through JSON-RPC, agentctl, Python, or stdio, step ticks deterministically, capture screenshots on demand, fast-forward, snapshot, restore, branch timelines, export or replay action traces, debug observations/rewards/checksums, or verify agent-game behavior without keyboard or mouse input."
+description: "Operate a Bevy game that exposes the bevy-agent protocol. Use when Codex needs to run a controllable Bevy environment, inspect action and observation schemas, drive simulation through JSON-RPC, agentctl, Python, or stdio, step ticks deterministically, capture screenshots on demand, fast-forward, snapshot, restore, branch timelines, export or replay action traces, debug observations/rewards/checksums, or verify agent-game behavior without keyboard or mouse input."
 metadata:
-  short-description: Drive bevy_agent_control games
+  short-description: Drive bevy-agent games
 ---
 
 # Control Bevy Agent Game
@@ -25,9 +25,9 @@ For the sample platformer:
 
 ```sh
 cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
-cargo run -p agentctl -- info
-cargo run -p agentctl -- schema
-cargo run -p agentctl -- reset --seed 42
+cargo run -p bevy_agent_cli --bin agentctl -- info
+cargo run -p bevy_agent_cli --bin agentctl -- schema
+cargo run -p bevy_agent_cli --bin agentctl -- reset --seed 42
 ```
 
 ## Action Loop
@@ -52,13 +52,13 @@ Example domain actions:
 Example commands:
 
 ```sh
-cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
-cargo run -p agentctl -- step-many '[{"type":"Move","x":1.0,"y":0.0},{"type":"Jump"}]'
-cargo run -p agentctl -- capture --out-dir screenshots --label after_step
-cargo run -p agentctl -- fast-forward 30
-cargo run -p agentctl -- snapshot
-cargo run -p agentctl -- restore-tick 10
-cargo run -p agentctl -- branch --from-tick 10 --label try_jump
+cargo run -p bevy_agent_cli --bin agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
+cargo run -p bevy_agent_cli --bin agentctl -- step-many '[{"type":"Move","x":1.0,"y":0.0},{"type":"Jump"}]'
+cargo run -p bevy_agent_cli --bin agentctl -- capture --out-dir screenshots --label after_step
+cargo run -p bevy_agent_cli --bin agentctl -- fast-forward 30
+cargo run -p bevy_agent_cli --bin agentctl -- snapshot
+cargo run -p bevy_agent_cli --bin agentctl -- restore-tick 10
+cargo run -p bevy_agent_cli --bin agentctl -- branch --from-tick 10 --label try_jump
 ```
 
 ## Observations
@@ -79,8 +79,8 @@ Use `agent.visual.capture` or `agentctl capture` only when visual context is nee
 Example:
 
 ```sh
-cargo run -p agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
-cargo run -p agentctl -- capture --out-dir screenshots --label tick_1
+cargo run -p bevy_agent_cli --bin agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
+cargo run -p bevy_agent_cli --bin agentctl -- capture --out-dir screenshots --label tick_1
 ```
 
 Treat screenshots as supplemental evidence. Report the capture path alongside tick, reward, terminal state, and checksum.
@@ -102,7 +102,7 @@ Use tokened remote mode when `AGENT_TOKEN` is set:
 
 ```sh
 AGENT_TOKEN=secret cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000
-cargo run -p agentctl -- --token secret info
+cargo run -p bevy_agent_cli --bin agentctl -- --token secret info
 ```
 
 Never expose mutation, restore, branch, or replay-load endpoints on a public interface unless the user explicitly asks and the app has authentication/capability checks.

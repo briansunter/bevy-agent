@@ -86,14 +86,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "agentctl"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde_json",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -374,8 +366,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_agent_cli"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "serde_json",
+]
+
+[[package]]
 name = "bevy_agent_core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bevy",
  "jsonschema",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_agent_remote"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_agent_replay"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bevy",
  "bevy_agent_core",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_agent_runner"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "bevy",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_agent_snapshot"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "bevy",
@@ -4631,7 +4631,7 @@ dependencies = [
 
 [[package]]
 name = "sample_platformer"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "bevy",
@@ -4896,9 +4896,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 dependencies = [
  "portable-atomic",
 ]

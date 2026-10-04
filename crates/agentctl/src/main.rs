@@ -7,6 +7,14 @@ use serde_json::Value;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.len() == 1 && matches!(args[0].as_str(), "help" | "--help" | "-h") {
+        commands::print_usage();
+        return Ok(());
+    }
+    if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
+        println!("agentctl {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let options = commands::GlobalOptions::parse(&mut args)?;
     let token = options.token.or_else(|| std::env::var("AGENT_TOKEN").ok());
     if args.is_empty() {

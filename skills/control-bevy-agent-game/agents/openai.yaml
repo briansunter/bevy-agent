@@ -1,4 +1,4 @@
 interface:
   display_name: "Control Bevy Agent Game"
   short_description: "Drive deterministic Bevy agent environments"
-  default_prompt: "Use $control-bevy-agent-game to inspect schemas, step actions, snapshot, restore, replay, and verify a bevy_agent_control game."
+  default_prompt: "Use $control-bevy-agent-game to inspect schemas, step actions, snapshot, restore, replay, and verify a bevy-agent game."

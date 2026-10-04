@@ -1,4 +1,4 @@
-//! Replay logs and timeline branches for deterministic agent-controlled games.
+#![doc = include_str!("../README.md")]
 
 mod log;
 mod model;

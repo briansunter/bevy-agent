@@ -1,5 +1,7 @@
 # Documentation
 
+Start with [`getting-started.md`](getting-started.md) for installation and a complete headless example. The initial release is `0.0.1` (experimental, pre-1.0).
+
 Use the guide that matches the job:
 
 ## Run and control
