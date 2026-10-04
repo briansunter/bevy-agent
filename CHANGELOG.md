@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Searchable VitePress documentation with a complete getting-started app, interactive control-loop walkthrough, focused guides, and crate/API reference.
+- Self-hosted typography, responsive navigation, dark mode, and manual GitHub Pages deployment.
+- Cargo homepage/documentation metadata and package READMEs link to the guide; existing published versions require a new release to receive these metadata changes.
+
 ## 0.0.1 — 2026-10-03
 
 The first experimental release targets Bevy 0.18.1 and Rust 1.91+. APIs may change before 1.0; use matching exact versions of all companion crates.

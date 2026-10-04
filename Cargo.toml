@@ -16,7 +16,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.91"
 repository = "https://github.com/briansunter/bevy-agent"
-homepage = "https://github.com/briansunter/bevy-agent"
+homepage = "https://briansunter.github.io/bevy-agent/"
 publish = ["crates-io"]
 include = ["src/**", "examples/**", "tests/**", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 

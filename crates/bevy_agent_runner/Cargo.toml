@@ -10,7 +10,7 @@ include.workspace = true
 homepage.workspace = true
 publish.workspace = true
 repository.workspace = true
-documentation = "https://docs.rs/bevy_agent_runner"
+documentation = "https://briansunter.github.io/bevy-agent/getting-started.html"
 keywords = ["bevy", "gamedev", "agent", "runner"]
 categories = ["game-development", "simulation"]
 

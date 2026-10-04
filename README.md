@@ -6,6 +6,8 @@ Built for **Bevy 0.18.1** and **Rust 1.91+**, with headless defaults and optiona
 
 > **Version 0.0.1** is the initial experimental release. Cargo version numbers, snapshot/replay format versions, and game schema versions are separate contracts. Pin companion crates to the same exact release; breaking changes may occur before 1.0.
 
+**[Read the documentation](https://briansunter.github.io/bevy-agent/)** · [Getting started](https://briansunter.github.io/bevy-agent/getting-started.html) · [Crates and API](https://briansunter.github.io/bevy-agent/reference/crates.html)
+
 ## Try it
 
 Clone the repository and run a complete environment:

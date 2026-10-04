@@ -4,15 +4,15 @@ The `agentctl` command-line client for [bevy-agent](https://github.com/briansunt
 
 The Cargo package is named **`bevy_agent_cli`**; the installed executable is **`agentctl`**. Requires **Rust 1.91+**. Version **0.0.1** is experimental.
 
-## Install
+[Read the CLI guide](https://briansunter.github.io/bevy-agent/guides/remote-control.html) for installation, a complete server/client workflow, and troubleshooting.
 
-After the initial release is published:
+## Install
 
 ```sh
 cargo install bevy_agent_cli --version 0.0.1 --locked
 ```
 
-Before publication, install from a repository checkout:
+For local development, install from a repository checkout:
 
 ```sh
 cargo install --path crates/agentctl --locked
@@ -42,6 +42,6 @@ agentctl operation-status --key episode-1.tick-1
 
 You can also set `AGENT_TOKEN`; use `--url` to select the server. Run `agentctl help` for all commands. The CLI does not start a server or include a game.
 
-[Full interaction guide](https://github.com/briansunter/bevy-agent/blob/master/docs/codex-interaction.md)
+[Full interaction guide](https://briansunter.github.io/bevy-agent/guides/remote-control.html)
 
 Licensed under **MIT OR Apache-2.0**, at your option.

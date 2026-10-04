@@ -10,7 +10,7 @@ include.workspace = true
 homepage.workspace = true
 publish.workspace = true
 repository.workspace = true
-documentation = "https://github.com/briansunter/bevy-agent/tree/master/crates/agentctl"
+documentation = "https://briansunter.github.io/bevy-agent/guides/remote-control.html"
 keywords = ["bevy", "gamedev", "agent", "json-rpc"]
 categories = ["command-line-utilities", "game-development"]
 

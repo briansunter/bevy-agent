@@ -1,32 +1,31 @@
-# Getting started
+# Build your first environment
 
-bevy-agent turns a Bevy app into a controlled environment. The game defines what an action means, what state an agent can observe, and which gameplay state belongs in a snapshot. The runtime owns controlled ticks and coordinates history.
+Start with a counter, not a full game. Each action advances one simulation tick. You will save a snapshot, repeat a step, and verify that replay returns to the same state.
 
-The initial release is **0.0.1**, targeting **Bevy 0.18.1** and **Rust 1.91+**. It is experimental and has no 1.0 compatibility guarantee. The crates.io installation commands below apply after publication.
+**You need:** Rust 1.91 or newer. These examples use Bevy 0.18.1 and the published experimental release 0.0.1.
 
-## Start with a complete example
+::: tip Prefer to explore first?
+[Run the repository example](#run-the-repository-example) without copying any code. To control a running game from another process, follow [HTTP and the CLI](./guides/remote-control.md).
+:::
 
-```sh
-git clone https://github.com/briansunter/bevy-agent.git
-cd bevy-agent
-cargo run -p bevy_agent_runner --example counter
-```
-
-The packaged [counter example](../crates/bevy_agent_runner/examples/counter.rs) creates a complete headless environment. It registers a serializable resource, defines a domain observation and its JSON schema, installs a checksum extractor, resets the counter, and increments it on controlled ticks. It verifies that restoring a snapshot and repeating an action produces the same checksum, then restores an earlier tick.
-
-Use this example as the smallest integration. For gameplay entities, movement, collisions, rewards, terminal checks, and capture, study [`PlatformerPlugin`](../crates/sample_platformer/src/lib.rs) and run:
+## 1. Create a small Rust project
 
 ```sh
-cargo run -p sample_platformer --example agent_play
+cargo new my-agent-game
+cd my-agent-game
 ```
 
-## Depend on the runtime
-
-For a headless application, use:
+Replace `Cargo.toml` with:
 
 ```toml
+[package]
+name = "my-agent-game"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
 [dependencies]
-bevy = { version = "0.18.1", default-features = false, features = ["std"] }
+bevy = { version = "=0.18.1", default-features = false, features = ["std", "bevy_log", "bevy_state", "serialize"] }
 bevy_agent_core = "=0.0.1"
 bevy_agent_runner = "=0.0.1"
 bevy_agent_snapshot = "=0.0.1"
@@ -35,41 +34,60 @@ serde_json = "1"
 anyhow = "1"
 ```
 
-Copy the counter example into `src/main.rs` to run a standalone application with this manifest. Before publication, use a `path` to each corresponding `crates/` directory. Keep all companion versions synchronized.
+There is no umbrella `bevy_agent` package. The runner composes core, snapshots, and replay; the other dependencies expose types you use directly. Keep companion crate versions pinned to the same exact release.
 
-Add `bevy_agent_remote = "=0.0.1"` to expose JSON-RPC. Add `bevy_agent_replay = "=0.0.1"` only when your application directly uses its recording or timeline types. Enable the runner/remote `visual` feature for Bevy primary-window capture; choose your game's rendering plugins separately.
+## 2. Add the complete environment
 
-## Integrate your own game
+Replace `src/main.rs` with this example. It is the same source shipped with `bevy_agent_runner`, so the guide and runnable example stay together.
 
-1. Install Bevy plugins and `AgentControlPlugins::default()`.
-2. Declare environment metadata, supported actions, and supported observation modes.
-3. Install observation and checksum extractors; validate the complete serialized observation with a schema when needed.
-4. Register gameplay components/resources with `SnapshotAppExt`. Use stable type IDs, schema versions, and entity IDs.
-5. Add a reset system to `AgentReset` in `AgentResetSet::Game`.
-6. Move gameplay systems into `AgentTick` with explicit ordering. Read `SimClock` and `CurrentInputFrame`.
-7. Construct `AgentApp`, call `reset`, then `step` with supported actions.
+<<< ../crates/bevy_agent_runner/examples/counter.rs
 
-Constructing `AgentApp` checks the integration before gameplay begins. Handle returned errors; unsupported input or invalid observations must not be treated as successful ticks. Check `done` and `truncated` before selecting the next action.
+The setup has four responsibilities:
 
-[Making a game controllable](controllable-game.md) covers schema registration, reset policy, snapshot coverage, ordering, visual capture, and replay portability.
+- **State:** `Counter` is the authoritative gameplay resource. Its stable `SnapshotType` identity makes it serializable and restorable.
+- **Input:** the environment declares `Noop` as a supported action. This simple game increments the counter on every controlled tick.
+- **Output:** the observation exposes the counter value; the checksum covers both core state and the counter.
+- **Schedules:** reset initializes the episode, and `AgentTick` changes gameplay. Ordinary render frames do not advance this counter.
 
-## Connect a client
-
-Start the platformer HTTP example in one terminal:
+## 3. Run it
 
 ```sh
-cargo run -p sample_platformer --example remote_http -- 127.0.0.1:4000 --artifact-dir ./artifacts
+cargo run
 ```
 
-In another terminal:
+Expected output:
+
+```text
+Snapshot restore and replay matched; counter is back at tick 1.
+```
+
+The assertions prove that restoring a snapshot and repeating the same action produces the same checksum, then `restore_tick(1)` reconstructs the earlier state. A checksum is a consistency check over your declared state; it does not prove arbitrary games deterministic across platforms.
+
+## Run the repository example
+
+If you want the example without creating a new project:
 
 ```sh
-cargo run -p bevy_agent_cli --bin agentctl -- info
-cargo run -p bevy_agent_cli --bin agentctl -- action-space
-cargo run -p bevy_agent_cli --bin agentctl -- reset --seed 42
-cargo run -p bevy_agent_cli --bin agentctl -- step '{"type":"Move","x":1.0,"y":0.0}'
+git clone https://github.com/briansunter/bevy-agent.git
+cd bevy-agent
+cargo run -p bevy_agent_runner --example counter --locked
 ```
 
-After publication, `cargo install bevy_agent_cli --version 0.0.1 --locked` installs the same executable as `agentctl`. The package name differs because the crates.io name `agentctl` belongs to another project.
+The repository also contains a complete platformer with movement, collisions, coins, rewards, terminal conditions, and capture:
 
-The [interaction guide](codex-interaction.md) has Python, WebSocket, stdio, capture, replay, authentication, and retry examples. Discover a game's actions and observation modes before sending commands; the platformer's contract is an example, not a universal game API.
+```sh
+cargo run -p sample_platformer --example agent_play --locked
+```
+
+`sample_platformer` stays in the repository. It is not a crates.io package.
+
+## Where to go next
+
+- [Understand actions, ticks, and observations](./concepts.md) before adapting frame-driven gameplay.
+- [Integrate your own game](./controllable-game.md) to register state, define schemas, and order simulation systems.
+- [Connect the CLI](./guides/remote-control.md) or [Python](./guides/python.md) to a running environment.
+- [Choose your crates](./reference/crates.md) when you need remote control, rendering, or replay types.
+
+::: info Personal Mac mini builds
+On the pinned personal Mac mini, run `build-storage-check` before native builds and use `cargo-storage` from the canonical worktree, as described in the [contributing guide](./reference/contributing.md#personal-mac-mini). Other hosts use ordinary Cargo commands.
+:::

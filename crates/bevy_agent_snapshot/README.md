@@ -21,8 +21,10 @@ Use the coordinated `AgentApp::snapshot` and `restore` APIs in `bevy_agent_runne
 
 ## Next steps
 
-- [Snapshot integration](https://github.com/briansunter/bevy-agent/blob/master/docs/controllable-game.md#stable-snapshot-types)
-- [Architecture and invariants](https://github.com/briansunter/bevy-agent/blob/master/docs/architecture.md)
+[Read the guide](https://briansunter.github.io/bevy-agent/guides/snapshots-replay.html) for an organized walkthrough, examples, and troubleshooting.
+
+- [Snapshot integration](https://briansunter.github.io/bevy-agent/controllable-game.html#stable-snapshot-types)
+- [Architecture and invariants](https://briansunter.github.io/bevy-agent/architecture.html)
 - [API reference](https://docs.rs/bevy_agent_snapshot)
 
 Licensed under **MIT OR Apache-2.0**, at your option.

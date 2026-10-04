@@ -34,8 +34,10 @@ Timed-out mutations return an operation ID. Retrieve the retained result with `a
 
 ## Next steps
 
-- [Protocol and client guide](https://github.com/briansunter/bevy-agent/blob/master/docs/codex-interaction.md)
-- [JSON-RPC operation reference](https://github.com/briansunter/bevy-agent/blob/master/skills/control-bevy-agent-game/references/protocol.md)
+[Read the guide](https://briansunter.github.io/bevy-agent/guides/remote-control.html) for an organized walkthrough, examples, and troubleshooting.
+
+- [Protocol and client guide](https://briansunter.github.io/bevy-agent/guides/remote-control.html)
+- [JSON-RPC operation reference](https://briansunter.github.io/bevy-agent/reference/protocol.html)
 - [API reference](https://docs.rs/bevy_agent_remote)
 
 Licensed under **MIT OR Apache-2.0**, at your option.

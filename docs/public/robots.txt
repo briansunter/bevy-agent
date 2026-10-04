@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /bevy-agent/
+Sitemap: https://briansunter.github.io/bevy-agent/sitemap.xml

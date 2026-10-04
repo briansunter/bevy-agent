@@ -19,8 +19,10 @@ Replay correctness depends on deterministic gameplay, a complete snapshot regist
 
 ## Next steps
 
-- [Getting started](https://github.com/briansunter/bevy-agent/blob/master/docs/getting-started.md)
-- [Replay portability](https://github.com/briansunter/bevy-agent/blob/master/docs/controllable-game.md#replay-portability)
+[Read the guide](https://briansunter.github.io/bevy-agent/guides/snapshots-replay.html) for an organized walkthrough, examples, and troubleshooting.
+
+- [Getting started](https://briansunter.github.io/bevy-agent/getting-started.html)
+- [Replay portability](https://briansunter.github.io/bevy-agent/controllable-game.html#replay-portability)
 - [API reference](https://docs.rs/bevy_agent_replay)
 
 Licensed under **MIT OR Apache-2.0**, at your option.

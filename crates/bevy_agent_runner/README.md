@@ -51,8 +51,10 @@ Run that command from the repository or this crate's unpacked source. [Read the 
 
 ## Next steps
 
-- [Getting started](https://github.com/briansunter/bevy-agent/blob/master/docs/getting-started.md)
-- [Game integration guide](https://github.com/briansunter/bevy-agent/blob/master/docs/controllable-game.md)
+[Read the guide](https://briansunter.github.io/bevy-agent/getting-started.html) for an organized walkthrough, examples, and troubleshooting.
+
+- [Getting started](https://briansunter.github.io/bevy-agent/getting-started.html)
+- [Game integration guide](https://briansunter.github.io/bevy-agent/controllable-game.html)
 - [API reference](https://docs.rs/bevy_agent_runner)
 
 Licensed under **MIT OR Apache-2.0**, at your option.
